@@ -37,6 +37,9 @@ func writeHeader(buf *bytes.Buffer, w func(string, ...any), pkg, sourceFile, exp
 	w("\t\"encoding/json/jsontext\"\n")
 	w("\tjsonv2 \"encoding/json/v2\"\n")
 	w("\t\"fmt\"\n")
+	if plan.NeedsSlices() {
+		w("\t\"slices\"\n")
+	}
 	if plan.NeedsRuntime() {
 		w("\n\t\"github.com/gcossani/ssfbff/runtime\"\n")
 	}
@@ -80,6 +83,7 @@ func writeOutputStruct(buf *bytes.Buffer, w func(string, ...any), plan *QueryPla
 func writeTransformFunc(buf *bytes.Buffer, w func(string, ...any), plan *QueryPlan) {
 	elemType := unexportedName(plan.RootField) + "Element"
 	outType := plan.OutputName
+	hasSort := len(plan.SortTerms) > 0
 
 	w("func %s(data []byte) ([]%s, error) {\n", plan.FuncName, outType)
 	w("\tdec := jsontext.NewDecoder(bytes.NewReader(data))\n\n")
@@ -118,12 +122,51 @@ func writeTransformFunc(buf *bytes.Buffer, w func(string, ...any), plan *QueryPl
 	w("\t\t\treturn nil, fmt.Errorf(\"expected array for %s, got %%v\", arrTok.Kind())\n", plan.RootField)
 	w("\t\t}\n\n")
 
-	// Process each element in the array.
-	w("\t\tfor dec.PeekKind() != ']' {\n")
-	w("\t\t\tvar elem %s\n", elemType)
-	w("\t\t\tif err := jsonv2.UnmarshalDecode(dec, &elem); err != nil {\n")
-	w("\t\t\t\treturn nil, fmt.Errorf(\"reading element: %%w\", err)\n")
-	w("\t\t\t}\n\n")
+	if hasSort {
+		// Sort mode: buffer all elements, sort, then filter+project.
+		w("\t\tvar allElems []%s\n", elemType)
+		w("\t\tfor dec.PeekKind() != ']' {\n")
+		w("\t\t\tvar elem %s\n", elemType)
+		w("\t\t\tif err := jsonv2.UnmarshalDecode(dec, &elem); err != nil {\n")
+		w("\t\t\t\treturn nil, fmt.Errorf(\"reading element: %%w\", err)\n")
+		w("\t\t\t}\n")
+		w("\t\t\tallElems = append(allElems, elem)\n")
+		w("\t\t}\n")
+		w("\t\tif _, err := dec.ReadToken(); err != nil {\n")
+		w("\t\t\treturn nil, fmt.Errorf(\"reading array end: %%w\", err)\n")
+		w("\t\t}\n\n")
+
+		// Emit sort.
+		w("\t\tslices.SortFunc(allElems, func(a, b %s) int {\n", elemType)
+		for _, st := range plan.SortTerms {
+			if st.Descending {
+				w("\t\t\tif a.%s > b.%s { return -1 }\n", st.GoName, st.GoName)
+				w("\t\t\tif a.%s < b.%s { return 1 }\n", st.GoName, st.GoName)
+			} else {
+				w("\t\t\tif a.%s < b.%s { return -1 }\n", st.GoName, st.GoName)
+				w("\t\t\tif a.%s > b.%s { return 1 }\n", st.GoName, st.GoName)
+			}
+		}
+		w("\t\t\treturn 0\n")
+		w("\t\t})\n\n")
+
+		// Iterate sorted elements.
+		if plan.HasIndexFilter {
+			w("\t\tfor elemIdx, elem := range allElems {\n")
+		} else {
+			w("\t\tfor _, elem := range allElems {\n")
+		}
+	} else {
+		// Streaming mode: process each element as it's decoded.
+		if plan.HasIndexFilter {
+			w("\t\telemIdx := 0\n")
+		}
+		w("\t\tfor dec.PeekKind() != ']' {\n")
+		w("\t\t\tvar elem %s\n", elemType)
+		w("\t\t\tif err := jsonv2.UnmarshalDecode(dec, &elem); err != nil {\n")
+		w("\t\t\t\treturn nil, fmt.Errorf(\"reading element: %%w\", err)\n")
+		w("\t\t\t}\n\n")
+	}
 
 	em := &exprEmitter{w: w, indent: "\t\t\t", elemVar: "elem"}
 
@@ -136,6 +179,9 @@ func writeTransformFunc(buf *bytes.Buffer, w func(string, ...any), plan *QueryPl
 		allConditions := strings.Join(conditions, " && ")
 		w("\t\t\tpassesFilter := %s\n", allConditions)
 		w("\t\t\tif !passesFilter {\n")
+		if !hasSort && plan.HasIndexFilter {
+			w("\t\t\t\telemIdx++\n")
+		}
 		w("\t\t\t\tcontinue\n")
 		w("\t\t\t}\n\n")
 	}
@@ -160,12 +206,17 @@ func writeTransformFunc(buf *bytes.Buffer, w func(string, ...any), plan *QueryPl
 		w("\t\t\t\t%s: %s,\n", out.GoName, outputExprs[i])
 	}
 	w("\t\t\t})\n")
+	if !hasSort && plan.HasIndexFilter {
+		w("\t\t\telemIdx++\n")
+	}
 	w("\t\t}\n\n")
 
-	// Consume ']'.
-	w("\t\tif _, err := dec.ReadToken(); err != nil {\n")
-	w("\t\t\treturn nil, fmt.Errorf(\"reading array end: %%w\", err)\n")
-	w("\t\t}\n")
+	if !hasSort {
+		// Consume ']'.
+		w("\t\tif _, err := dec.ReadToken(); err != nil {\n")
+		w("\t\t\treturn nil, fmt.Errorf(\"reading array end: %%w\", err)\n")
+		w("\t\t}\n")
+	}
 	w("\t}\n\n")
 
 	w("\treturn results, nil\n")
@@ -220,6 +271,19 @@ func (em *exprEmitter) emit(e *Expr) string {
 
 	case "varRef":
 		return "jsonataVar_" + e.VarName
+
+	case "array":
+		items := make([]string, len(e.FuncArgs))
+		for i, item := range e.FuncArgs {
+			items[i] = em.emit(item)
+		}
+		return fmt.Sprintf("[]any{%s}", strings.Join(items, ", "))
+
+	case "rootRef":
+		return "data"
+
+	case "elemIndex":
+		return "elemIdx"
 
 	default:
 		return "nil"
@@ -347,6 +411,14 @@ func (em *exprEmitter) mapFuncCall(name string, args []string) string {
 		return fmt.Sprintf("runtime.Not(%s)", all)
 	case "exists":
 		return fmt.Sprintf("runtime.Exists(%s)", all)
+
+	// Internal functions (mapped from special syntax)
+	case "_range":
+		return fmt.Sprintf("runtime.Range(%s)", all)
+	case "_in":
+		return fmt.Sprintf("runtime.In(%s)", all)
+	case "_wildcard":
+		return fmt.Sprintf("runtime.WildcardValues(%s)", all)
 
 	// Array/object functions
 	case "sort":

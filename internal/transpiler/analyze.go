@@ -11,14 +11,23 @@ import (
 // QueryPlan is the intermediate representation extracted from a JSONata AST.
 // It captures everything needed to generate Go code: which field to stream to,
 // what to filter, and how to project the output.
+// SortTerm describes one sort key for ^() order-by.
+type SortTerm struct {
+	FieldJSON  string // JSON field name (e.g., "price")
+	GoName     string // Go struct field name (e.g., "Price")
+	Descending bool   // true for >field (descending)
+}
+
 type QueryPlan struct {
-	RootField    string        // top-level JSON field to navigate to (e.g., "orders")
-	InputFields  []StructField // fields to deserialize from each array element
-	Filters      []*Expr       // each entry is a predicate expression; all ANDed
-	Bindings     []*Expr       // variable assignments ($x := expr) before the projection
-	OutputName   string        // Go type name for output struct
-	OutputFields []OutputField // fields in the output struct
-	FuncName     string        // generated Go function name
+	RootField      string        // top-level JSON field to navigate to (e.g., "orders")
+	InputFields    []StructField // fields to deserialize from each array element
+	Filters        []*Expr       // each entry is a predicate expression; all ANDed
+	Bindings       []*Expr       // variable assignments ($x := expr) before the projection
+	HasIndexFilter bool          // true if any filter is a numeric index ([0], [1], …)
+	SortTerms      []SortTerm    // ^(field) order-by terms (empty = no sort)
+	OutputName     string        // Go type name for output struct
+	OutputFields   []OutputField // fields in the output struct
+	FuncName       string        // generated Go function name
 }
 
 // StructField describes a field in the generated input struct.
@@ -90,9 +99,49 @@ func Analyze(root jparse.Node) (*QueryPlan, error) {
 		return nil, fmt.Errorf("expected at least 2 path steps (source + projection), got %d", len(path.Steps))
 	}
 
-	pred, ok := path.Steps[0].(*jparse.PredicateNode)
-	if !ok {
-		return nil, fmt.Errorf("expected first step to be a predicate (array[filter]), got %T", path.Steps[0])
+	// The first step can be a PredicateNode (items[filter]) or a SortNode
+	// wrapping a PredicateNode (items[filter]^(price) or items^(price)[filter]).
+	var pred *jparse.PredicateNode
+	var sortTerms []SortTerm
+
+	switch step := path.Steps[0].(type) {
+	case *jparse.PredicateNode:
+		// Check if the predicate wraps a SortNode: items^(price)[filter].
+		if sn, ok := step.Expr.(*jparse.SortNode); ok {
+			pred = &jparse.PredicateNode{Expr: sn.Expr, Filters: step.Filters}
+			for _, t := range sn.Terms {
+				st, err := extractSortTerm(t)
+				if err != nil {
+					return nil, fmt.Errorf("sort term: %w", err)
+				}
+				sortTerms = append(sortTerms, st)
+			}
+		} else {
+			pred = step
+		}
+	case *jparse.SortNode:
+		// items[filter]^(price) — sort wraps predicate.
+		inner, ok := step.Expr.(*jparse.PathNode)
+		if !ok {
+			return nil, fmt.Errorf("expected path inside sort, got %T", step.Expr)
+		}
+		if len(inner.Steps) != 1 {
+			return nil, fmt.Errorf("expected single step inside sort path, got %d", len(inner.Steps))
+		}
+		innerPred, ok := inner.Steps[0].(*jparse.PredicateNode)
+		if !ok {
+			return nil, fmt.Errorf("expected predicate inside sort, got %T", inner.Steps[0])
+		}
+		pred = innerPred
+		for _, t := range step.Terms {
+			st, err := extractSortTerm(t)
+			if err != nil {
+				return nil, fmt.Errorf("sort term: %w", err)
+			}
+			sortTerms = append(sortTerms, st)
+		}
+	default:
+		return nil, fmt.Errorf("expected first step to be a predicate (array[filter]) or sort, got %T", path.Steps[0])
 	}
 
 	// The projection step is usually an ObjectNode, but may be wrapped in a
@@ -128,12 +177,34 @@ func Analyze(root jparse.Node) (*QueryPlan, error) {
 
 	// --- Filters ---
 	var filters []*Expr
+	hasIndexFilter := false
 	for _, f := range pred.Filters {
+		// Numeric filter [0], [1], … → index access instead of boolean predicate.
+		if numNode, ok := f.(*jparse.NumberNode); ok {
+			idx := int(numNode.Value)
+			if idx < 0 {
+				return nil, fmt.Errorf("negative array index [%d] not supported", idx)
+			}
+			hasIndexFilter = true
+			filters = append(filters, &Expr{
+				Kind:   "binary",
+				Op:     "==",
+				Left:   &Expr{Kind: "elemIndex", GoType: "int"},
+				Right:  &Expr{Kind: "literal", LiteralValue: fmt.Sprintf("%d", idx), GoType: "int"},
+				GoType: "bool",
+			})
+			continue
+		}
 		filter, err := analyzeExpr(f, fields)
 		if err != nil {
 			return nil, fmt.Errorf("analyzing filter: %w", err)
 		}
 		filters = append(filters, filter)
+	}
+
+	// Register sort fields as numeric input fields so the struct has them.
+	for _, st := range sortTerms {
+		fields.addField(st.FieldJSON, true)
 	}
 
 	// --- Variable bindings ---
@@ -175,13 +246,15 @@ func Analyze(root jparse.Node) (*QueryPlan, error) {
 	funcName := "Transform" + exportedName(rootField)
 
 	return &QueryPlan{
-		RootField:    rootField,
-		InputFields:  inputFields,
-		Filters:      filters,
-		Bindings:     bindings,
-		OutputName:   exportedName(rootField) + "Result",
-		OutputFields: outputFields,
-		FuncName:     funcName,
+		RootField:      rootField,
+		InputFields:    inputFields,
+		Filters:        filters,
+		Bindings:       bindings,
+		HasIndexFilter: hasIndexFilter,
+		SortTerms:      sortTerms,
+		OutputName:     exportedName(rootField) + "Result",
+		OutputFields:   outputFields,
+		FuncName:       funcName,
 	}, nil
 }
 
@@ -220,6 +293,26 @@ func analyzeExpr(node jparse.Node, fc *fieldCollector) (*Expr, error) {
 		// Multi-step path: if exactly 2 steps and both are names, treat as
 		// a field.subfield reference (used in $sum(items.price) arguments).
 		if len(n.Steps) == 2 {
+			// field.* — wildcard: all values of an object field.
+			if _, isWild := n.Steps[1].(*jparse.WildcardNode); isWild {
+				name, err := extractName(n.Steps[0])
+				if err != nil {
+					return nil, fmt.Errorf("wildcard path: %w", err)
+				}
+				fc.addField(name, false)
+				return &Expr{
+					Kind:     "funcCall",
+					FuncName: "_wildcard",
+					FuncArgs: []*Expr{{
+						Kind:      "field",
+						FieldName: exportedName(name),
+						FieldJSON: name,
+						GoType:    "any",
+					}},
+					GoType: "any",
+				}, nil
+			}
+
 			name1, err1 := extractName(n.Steps[0])
 			name2, err2 := extractName(n.Steps[1])
 			if err1 == nil && err2 == nil {
@@ -287,11 +380,80 @@ func analyzeExpr(node jparse.Node, fc *fieldCollector) (*Expr, error) {
 		return &Expr{Kind: "assign", VarName: n.Name, Left: value, GoType: value.GoType}, nil
 
 	case *jparse.VariableNode:
+		// $ bare variable = root context reference.
+		if n.Name == "" {
+			return &Expr{Kind: "rootRef", GoType: "any"}, nil
+		}
 		goType, ok := fc.varTypes[n.Name]
 		if !ok {
 			return nil, fmt.Errorf("undefined variable $%s", n.Name)
 		}
 		return &Expr{Kind: "varRef", VarName: n.Name, GoType: goType}, nil
+
+	case *jparse.ArrayNode:
+		// [start..end] — jparse wraps a RangeNode in a single-item ArrayNode.
+		// Unwrap so we don't double-nest the result.
+		if len(n.Items) == 1 {
+			if _, isRange := n.Items[0].(*jparse.RangeNode); isRange {
+				return analyzeExpr(n.Items[0], fc)
+			}
+		}
+		items := make([]*Expr, len(n.Items))
+		for i, item := range n.Items {
+			analyzed, err := analyzeExpr(item, fc)
+			if err != nil {
+				return nil, fmt.Errorf("array item %d: %w", i, err)
+			}
+			items[i] = analyzed
+		}
+		return &Expr{Kind: "array", FuncArgs: items, GoType: "any"}, nil
+
+	case *jparse.RangeNode:
+		left, err := analyzeExpr(n.LHS, fc)
+		if err != nil {
+			return nil, fmt.Errorf("range LHS: %w", err)
+		}
+		right, err := analyzeExpr(n.RHS, fc)
+		if err != nil {
+			return nil, fmt.Errorf("range RHS: %w", err)
+		}
+		return &Expr{Kind: "funcCall", FuncName: "_range", FuncArgs: []*Expr{left, right}, GoType: "any"}, nil
+
+	case *jparse.FunctionApplicationNode:
+		lhs, err := analyzeExpr(n.LHS, fc)
+		if err != nil {
+			return nil, fmt.Errorf("chain LHS: %w", err)
+		}
+		// x ~> $func  →  $func(x)
+		// x ~> $func(extra)  →  $func(x, extra)
+		switch rhs := n.RHS.(type) {
+		case *jparse.VariableNode:
+			return &Expr{
+				Kind:     "funcCall",
+				FuncName: rhs.Name,
+				FuncArgs: []*Expr{lhs},
+				GoType:   inferFuncReturnType(rhs.Name),
+			}, nil
+		case *jparse.FunctionCallNode:
+			fname, err := extractVariableName(rhs.Func)
+			if err != nil {
+				return nil, fmt.Errorf("chain function name: %w", err)
+			}
+			args := []*Expr{lhs}
+			for _, a := range rhs.Args {
+				arg, err := analyzeExpr(a, fc)
+				if err != nil {
+					return nil, fmt.Errorf("chain $%s argument: %w", fname, err)
+				}
+				args = append(args, arg)
+			}
+			return &Expr{Kind: "funcCall", FuncName: fname, FuncArgs: args, GoType: inferFuncReturnType(fname)}, nil
+		default:
+			return nil, fmt.Errorf("unsupported ~> RHS type %T", n.RHS)
+		}
+
+	case *jparse.WildcardNode:
+		return nil, fmt.Errorf("wildcard (*) must appear as a path step, not standalone")
 
 	case *jparse.BlockNode:
 		// Parenthesized expression: (expr). Unwrap the single child.
@@ -308,6 +470,15 @@ func analyzeExpr(node jparse.Node, fc *fieldCollector) (*Expr, error) {
 		right, err := analyzeExpr(n.RHS, fc)
 		if err != nil {
 			return nil, fmt.Errorf("comparison RHS: %w", err)
+		}
+		// "in" membership is not a binary Go operator — map to runtime.In().
+		if n.Type == jparse.ComparisonIn {
+			return &Expr{
+				Kind:     "funcCall",
+				FuncName: "_in",
+				FuncArgs: []*Expr{left, right},
+				GoType:   "bool",
+			}, nil
 		}
 		// When the RHS is numeric, mark the LHS field as numeric so the
 		// generated struct uses float64 and comparisons like > compile.
@@ -584,6 +755,11 @@ func (plan *QueryPlan) NeedsRuntime() bool {
 		}
 	}
 	return false
+}
+
+// NeedsSlices returns true if the plan uses slices.SortFunc (for ^() order-by).
+func (plan *QueryPlan) NeedsSlices() bool {
+	return len(plan.SortTerms) > 0
 }
 
 // NeedsMath returns true if the plan uses math.* functions.
@@ -1310,6 +1486,29 @@ func extractVariableName(node jparse.Node) (string, error) {
 		return "", fmt.Errorf("expected a variable ($name), got %T", node)
 	}
 	return v.Name, nil
+}
+
+func extractSortTerm(t jparse.SortTerm) (SortTerm, error) {
+	// The term expr is usually a PathNode wrapping a single NameNode.
+	var fieldJSON string
+	if p, ok := t.Expr.(*jparse.PathNode); ok && len(p.Steps) == 1 {
+		name, err := extractName(p.Steps[0])
+		if err != nil {
+			return SortTerm{}, err
+		}
+		fieldJSON = name
+	} else {
+		name, err := extractName(t.Expr)
+		if err != nil {
+			return SortTerm{}, fmt.Errorf("sort term must be a simple field name: %w", err)
+		}
+		fieldJSON = name
+	}
+	return SortTerm{
+		FieldJSON:  fieldJSON,
+		GoName:     exportedName(fieldJSON),
+		Descending: t.Dir == jparse.SortDescending,
+	}, nil
 }
 
 func comparisonOpToGo(op jparse.ComparisonOperator) string {

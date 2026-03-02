@@ -578,3 +578,82 @@ func TypeJSON(data []byte) string {
 		return "number"
 	}
 }
+
+// Range returns a slice of float64 values from start to end (inclusive),
+// implementing the JSONata [start..end] range operator.
+func Range(start, end float64) []float64 {
+	s := int(start)
+	e := int(end)
+	if s > e {
+		return nil
+	}
+	result := make([]float64, 0, e-s+1)
+	for i := s; i <= e; i++ {
+		result = append(result, float64(i))
+	}
+	return result
+}
+
+// In checks if value is contained in set, implementing the JSONata "in" operator.
+// The set can be a []any, []float64, []string, or similar slice.
+func In(value any, set any) bool {
+	switch s := set.(type) {
+	case []any:
+		for _, item := range s {
+			if fmt.Sprintf("%v", value) == fmt.Sprintf("%v", item) {
+				return true
+			}
+		}
+	case []float64:
+		v, ok := toFloat(value)
+		if !ok {
+			return false
+		}
+		for _, item := range s {
+			if v == item {
+				return true
+			}
+		}
+	case []string:
+		vs := fmt.Sprintf("%v", value)
+		for _, item := range s {
+			if vs == item {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func toFloat(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	default:
+		return 0, false
+	}
+}
+
+// WildcardValues returns all values of a map (object), implementing the
+// JSONata wildcard operator (obj.*).
+func WildcardValues(v any) []any {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil
+	}
+	// Collect values in sorted key order for deterministic output.
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	vals := make([]any, len(keys))
+	for i, k := range keys {
+		vals[i] = m[k]
+	}
+	return vals
+}

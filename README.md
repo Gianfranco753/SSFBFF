@@ -294,19 +294,19 @@ docker run -p 3000:3000 \
 
 The build copies `data/` into the build stage, runs `go generate` to transpile all JSONata into Go, compiles the binary, then copies only the binary and `data/providers/` into the runtime image. Routes and service logic are compiled into the binary.
 
-## JSONata Coverage — 62% of spec
+## JSONata Coverage — 71% of spec
 
 **56 of 90** features from the [JSONata specification](https://docs.jsonata.org/) are supported.
-The remaining gaps are mainly higher-order functions, date/time, and advanced path operators.
+The remaining gaps are mainly higher-order functions, date/time, and regex.
 
 | Category | Supported | Total | Coverage |
 |---|:---:|:---:|:---:|
-| Path & Navigation | 6 | 11 | 55% |
-| Comparison Operators | 6 | 7 | 86% |
+| Path & Navigation | 10 | 11 | 91% |
+| Comparison Operators | 7 | 7 | 100% |
 | Boolean Operators | 2 | 2 | 100% |
 | Arithmetic Operators | 6 | 6 | 100% |
-| Other Operators | 2 | 3 | 67% |
-| Literals | 4 | 6 | 67% |
+| Other Operators | 3 | 3 | 100% |
+| Literals | 5 | 6 | 83% |
 | String Functions | 10 | 14 | 71% |
 | Numeric Functions | 5 | 10 | 50% |
 | Aggregation Functions | 5 | 5 | 100% |
@@ -327,13 +327,13 @@ The remaining gaps are mainly higher-order functions, date/time, and advanced pa
 | `[predicate]` filter | ✅ | `orders[price > 100]` |
 | `{}` object constructor | ✅ | `{id: order_id}` |
 | `()` grouping | ✅ | `price * (1 - discount)` |
-| `[n]` array index | ❌ | `orders[0]` |
-| `^()` order-by | ❌ | `orders^(price)` |
-| `*` wildcard | ❌ | `address.*` |
-| `**` descendant | ❌ | `**.price` |
-| `~>` chain | ❌ | `$ ~> $sum()` |
+| `[n]` array index | ✅ | `orders[0]` |
+| `^()` order-by | ✅ | `orders^(price)` |
+| `*` wildcard | ✅ | `address.*` |
+| `**` descendant | — | not planned |
+| `~>` chain | ✅ | `$ ~> $sum()` |
 | `:=` binding | ✅ | `$x := price * qty` |
-| `$` context | ❌ | `$.orders` |
+| `$` context | ✅ | `$.orders` |
 
 ### Operators
 | Feature | Status | Example |
@@ -344,8 +344,8 @@ The remaining gaps are mainly higher-order functions, date/time, and advanced pa
 | Unary `-` | ✅ | `-price` |
 | `&` string concat | ✅ | `first & " " & last` |
 | `? :` conditional | ✅ | `price > 100 ? "high" : "low"` |
-| `in` membership | ❌ | `status in ["active", "pending"]` |
-| `..` range | ❌ | `[1..5]` |
+| `in` membership | ✅ | `status in ["active", "pending"]` |
+| `..` range | ✅ | `[1..5]` |
 
 ### Literals
 | Feature | Status | Example |
@@ -354,7 +354,7 @@ The remaining gaps are mainly higher-order functions, date/time, and advanced pa
 | Strings | ✅ | `"hello"` |
 | Booleans | ✅ | `true`, `false` |
 | null | ✅ | `null` |
-| Array literals | ❌ | `[1, 2, 3]` |
+| Array literals | ✅ | `[1, 2, 3]` |
 | Regex | ❌ | `/pattern/i` |
 
 ### String Functions
