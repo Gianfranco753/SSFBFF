@@ -1,0 +1,59 @@
+openapi: "3.0.3"
+info:
+  title: SSFBFF - Backend for Frontend
+  version: "1.0.0"
+  description: >
+    BFF endpoints that aggregate and transform data from downstream services.
+    Each operation uses x-service-name to map to a pre-compiled JSONata transform function.
+
+servers:
+  - url: http://localhost:3000
+
+paths:
+  /api/v1/orders:
+    get:
+      operationId: getOrders
+      x-service-name: orders
+      summary: Get filtered and projected orders
+      description: >
+        Fetches raw order data from the orders service, applies the compiled
+        JSONata transform (orders[price > 100].{id: order_id, total: $sum(items.price)}),
+        and returns the shaped result.
+      responses:
+        "200":
+          description: Transformed order list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                    total:
+                      type: number
+
+  /api/v1/products:
+    get:
+      operationId: getProducts
+      x-service-name: products
+      summary: Get filtered and projected products
+      description: >
+        Fetches raw product data from the products service, applies the compiled
+        JSONata transform (products[price > 50].{name: product_name, total: $sum(reviews.rating)}),
+        and returns the shaped result.
+      responses:
+        "200":
+          description: Transformed product list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    name:
+                      type: string
+                    total:
+                      type: number
