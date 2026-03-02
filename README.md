@@ -294,14 +294,14 @@ docker run -p 3000:3000 \
 
 The build copies `data/` into the build stage, runs `go generate` to transpile all JSONata into Go, compiles the binary, then copies only the binary and `data/providers/` into the runtime image. Routes and service logic are compiled into the binary.
 
-## JSONata Coverage — 61% of spec
+## JSONata Coverage — 62% of spec
 
-**55 of 90** features from the [JSONata specification](https://docs.jsonata.org/) are supported.
+**56 of 90** features from the [JSONata specification](https://docs.jsonata.org/) are supported.
 The remaining gaps are mainly higher-order functions, date/time, and advanced path operators.
 
 | Category | Supported | Total | Coverage |
 |---|:---:|:---:|:---:|
-| Path & Navigation | 5 | 11 | 45% |
+| Path & Navigation | 6 | 11 | 55% |
 | Comparison Operators | 6 | 7 | 86% |
 | Boolean Operators | 2 | 2 | 100% |
 | Arithmetic Operators | 6 | 6 | 100% |
@@ -332,7 +332,7 @@ The remaining gaps are mainly higher-order functions, date/time, and advanced pa
 | `*` wildcard | ❌ | `address.*` |
 | `**` descendant | ❌ | `**.price` |
 | `~>` chain | ❌ | `$ ~> $sum()` |
-| `:=` binding | ❌ | `$x := 5` |
+| `:=` binding | ✅ | `$x := price * qty` |
 | `$` context | ❌ | `$.orders` |
 
 ### Operators

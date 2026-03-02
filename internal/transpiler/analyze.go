@@ -15,6 +15,7 @@ type QueryPlan struct {
 	RootField    string        // top-level JSON field to navigate to (e.g., "orders")
 	InputFields  []StructField // fields to deserialize from each array element
 	Filters      []*Expr       // each entry is a predicate expression; all ANDed
+	Bindings     []*Expr       // variable assignments ($x := expr) before the projection
 	OutputName   string        // Go type name for output struct
 	OutputFields []OutputField // fields in the output struct
 	FuncName     string        // generated Go function name
@@ -39,9 +40,10 @@ type OutputField struct {
 
 // Expr represents a value expression in the filter-mode pipeline.
 // It is a recursive tree that models field access, literals, function calls,
-// arithmetic, comparisons, boolean logic, string concatenation, and conditionals.
+// arithmetic, comparisons, boolean logic, string concatenation, conditionals,
+// and variable bindings.
 type Expr struct {
-	Kind   string // "field","arrayField","literal","funcCall","binary","unary","conditional"
+	Kind   string // "field","arrayField","literal","funcCall","binary","unary","conditional","assign","varRef"
 	GoType string // inferred Go type: "float64","string","bool","any"
 
 	// Kind="field": reference to an input struct field.
@@ -70,6 +72,10 @@ type Expr struct {
 	Cond *Expr
 	Then *Expr
 	Else *Expr
+
+	// Kind="assign": variable binding ($x := expr).
+	// Kind="varRef": variable reference ($x).
+	VarName string // variable name (without $ prefix)
 }
 
 // Analyze walks a parsed JSONata AST and produces a QueryPlan.
@@ -89,8 +95,25 @@ func Analyze(root jparse.Node) (*QueryPlan, error) {
 		return nil, fmt.Errorf("expected first step to be a predicate (array[filter]), got %T", path.Steps[0])
 	}
 
-	obj, ok := path.Steps[1].(*jparse.ObjectNode)
-	if !ok {
+	// The projection step is usually an ObjectNode, but may be wrapped in a
+	// BlockNode when variables are defined: items[filter].($x := expr; {output}).
+	var obj *jparse.ObjectNode
+	var bindingNodes []jparse.Node
+
+	switch step := path.Steps[1].(type) {
+	case *jparse.ObjectNode:
+		obj = step
+	case *jparse.BlockNode:
+		if len(step.Exprs) < 1 {
+			return nil, fmt.Errorf("empty block in projection")
+		}
+		last, ok := step.Exprs[len(step.Exprs)-1].(*jparse.ObjectNode)
+		if !ok {
+			return nil, fmt.Errorf("last expression in projection block must be an object ({...}), got %T", step.Exprs[len(step.Exprs)-1])
+		}
+		obj = last
+		bindingNodes = step.Exprs[:len(step.Exprs)-1]
+	default:
 		return nil, fmt.Errorf("expected second step to be an object projection ({...}), got %T", path.Steps[1])
 	}
 
@@ -101,7 +124,7 @@ func Analyze(root jparse.Node) (*QueryPlan, error) {
 
 	// Collect all fields referenced anywhere in the expression.
 	// We track which fields are numeric (used in comparisons or aggregations).
-	fields := &fieldCollector{numeric: map[string]bool{}}
+	fields := &fieldCollector{numeric: map[string]bool{}, varTypes: map[string]string{}}
 
 	// --- Filters ---
 	var filters []*Expr
@@ -111,6 +134,19 @@ func Analyze(root jparse.Node) (*QueryPlan, error) {
 			return nil, fmt.Errorf("analyzing filter: %w", err)
 		}
 		filters = append(filters, filter)
+	}
+
+	// --- Variable bindings ---
+	var bindings []*Expr
+	for _, bNode := range bindingNodes {
+		binding, err := analyzeExpr(bNode, fields)
+		if err != nil {
+			return nil, fmt.Errorf("analyzing variable binding: %w", err)
+		}
+		if binding.Kind != "assign" {
+			return nil, fmt.Errorf("expected variable binding (:=) in projection block, got %s", binding.Kind)
+		}
+		bindings = append(bindings, binding)
 	}
 
 	// --- Projections ---
@@ -127,6 +163,9 @@ func Analyze(root jparse.Node) (*QueryPlan, error) {
 	for _, f := range filters {
 		resolveFieldTypes(f, fields)
 	}
+	for _, b := range bindings {
+		resolveFieldTypes(b, fields)
+	}
 	for i := range outputFields {
 		resolveFieldTypes(outputFields[i].Value, fields)
 		outputFields[i].GoType = outputFields[i].Value.GoType
@@ -139,6 +178,7 @@ func Analyze(root jparse.Node) (*QueryPlan, error) {
 		RootField:    rootField,
 		InputFields:  inputFields,
 		Filters:      filters,
+		Bindings:     bindings,
 		OutputName:   exportedName(rootField) + "Result",
 		OutputFields: outputFields,
 		FuncName:     funcName,
@@ -234,6 +274,24 @@ func analyzeExpr(node jparse.Node, fc *fieldCollector) (*Expr, error) {
 			LiteralValue: "nil",
 			GoType:       "any",
 		}, nil
+
+	case *jparse.AssignmentNode:
+		if _, exists := fc.varTypes[n.Name]; exists {
+			return nil, fmt.Errorf("variable $%s already defined in this block", n.Name)
+		}
+		value, err := analyzeExpr(n.Value, fc)
+		if err != nil {
+			return nil, fmt.Errorf("assignment $%s: %w", n.Name, err)
+		}
+		fc.varTypes[n.Name] = value.GoType
+		return &Expr{Kind: "assign", VarName: n.Name, Left: value, GoType: value.GoType}, nil
+
+	case *jparse.VariableNode:
+		goType, ok := fc.varTypes[n.Name]
+		if !ok {
+			return nil, fmt.Errorf("undefined variable $%s", n.Name)
+		}
+		return &Expr{Kind: "varRef", VarName: n.Name, GoType: goType}, nil
 
 	case *jparse.BlockNode:
 		// Parenthesized expression: (expr). Unwrap the single child.
@@ -436,8 +494,17 @@ func resolveFieldTypes(e *Expr, fc *fieldCollector) {
 	if e == nil {
 		return
 	}
-	if e.Kind == "field" {
+	switch e.Kind {
+	case "field":
 		e.GoType = fc.typeOf(e.FieldJSON)
+	case "varRef":
+		if goType, ok := fc.varTypes[e.VarName]; ok {
+			e.GoType = goType
+		}
+	case "assign":
+		resolveFieldTypes(e.Left, fc)
+		e.GoType = e.Left.GoType
+		fc.varTypes[e.VarName] = e.GoType
 	}
 	resolveFieldTypes(e.Left, fc)
 	resolveFieldTypes(e.Right, fc)
@@ -506,6 +573,11 @@ func (plan *QueryPlan) NeedsRuntime() bool {
 			return true
 		}
 	}
+	for _, b := range plan.Bindings {
+		if exprNeedsRuntime(b) {
+			return true
+		}
+	}
 	for _, of := range plan.OutputFields {
 		if exprNeedsRuntime(of.Value) {
 			return true
@@ -518,6 +590,11 @@ func (plan *QueryPlan) NeedsRuntime() bool {
 func (plan *QueryPlan) NeedsMath() bool {
 	for _, f := range plan.Filters {
 		if exprNeedsMath(f) {
+			return true
+		}
+	}
+	for _, b := range plan.Bindings {
+		if exprNeedsMath(b) {
 			return true
 		}
 	}
@@ -591,8 +668,9 @@ func anyExprNeedsMath(args []*Expr) bool {
 // Tracks all fields accessed from each array element and their inferred types.
 
 type fieldCollector struct {
-	fields  []collectedField
-	numeric map[string]bool // jsonName -> whether it's used in numeric context
+	fields   []collectedField
+	numeric  map[string]bool   // jsonName -> whether it's used in numeric context
+	varTypes map[string]string // variable name -> Go type (for := bindings)
 }
 
 type collectedField struct {

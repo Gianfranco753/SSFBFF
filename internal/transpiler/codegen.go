@@ -140,6 +140,14 @@ func writeTransformFunc(buf *bytes.Buffer, w func(string, ...any), plan *QueryPl
 		w("\t\t\t}\n\n")
 	}
 
+	// Emit variable bindings ($x := expr) before the output struct.
+	for _, b := range plan.Bindings {
+		em.emit(b)
+	}
+	if len(plan.Bindings) > 0 {
+		w("\n")
+	}
+
 	// Pre-compute output field values (aggregates need for loops emitted first).
 	outputExprs := make([]string, len(plan.OutputFields))
 	for i, out := range plan.OutputFields {
@@ -203,6 +211,15 @@ func (em *exprEmitter) emit(e *Expr) string {
 
 	case "funcCall":
 		return em.emitFuncCall(e)
+
+	case "assign":
+		val := em.emit(e.Left)
+		varName := "jsonataVar_" + e.VarName
+		em.w("%s%s := %s\n", em.indent, varName, val)
+		return varName
+
+	case "varRef":
+		return "jsonataVar_" + e.VarName
 
 	default:
 		return "nil"

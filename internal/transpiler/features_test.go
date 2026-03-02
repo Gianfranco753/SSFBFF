@@ -523,6 +523,271 @@ func main() {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Variable binding tests
+// ---------------------------------------------------------------------------
+
+// TestVariableParsing verifies that variable expressions parse and analyze
+// without errors, and that the generated code is non-empty.
+func TestVariableParsing(t *testing.T) {
+	tests := []struct {
+		name string
+		expr string
+	}{
+		{"simple binding", `items[price > 0].($total := price * quantity; {id: id, total: $total})`},
+		{"multi binding", `items[price > 0].($t := price * quantity; $d := $t * 0.9; {total: $t, discounted: $d})`},
+		{"var in conditional", `items[price > 0].($t := price * quantity; {label: $t > 100 ? "big" : "small"})`},
+		{"var from function", `items[price > 0].($u := $uppercase(name); {upper: $u})`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ast, err := jparse.Parse(tt.expr)
+			if err != nil {
+				t.Fatalf("parse error: %v", err)
+			}
+			plan, err := transpiler.Analyze(ast)
+			if err != nil {
+				t.Fatalf("analyze error: %v", err)
+			}
+			src, err := transpiler.Generate(plan, "test", "", tt.expr)
+			if err != nil {
+				t.Fatalf("generate error: %v", err)
+			}
+			if len(src) == 0 {
+				t.Fatal("generated code is empty")
+			}
+		})
+	}
+}
+
+// TestVariableValidation verifies that the analyzer rejects invalid variable usage.
+func TestVariableValidation(t *testing.T) {
+	t.Run("redefined variable", func(t *testing.T) {
+		ast, err := jparse.Parse(`items[price > 0].($x := 1; $x := 2; {val: $x})`)
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		_, err = transpiler.Analyze(ast)
+		if err == nil {
+			t.Fatal("expected error for redefined variable, got nil")
+		}
+		if !strings.Contains(err.Error(), "already defined") {
+			t.Fatalf("expected 'already defined' error, got: %v", err)
+		}
+	})
+
+	t.Run("undefined variable", func(t *testing.T) {
+		ast, err := jparse.Parse(`items[price > 0].{val: $x}`)
+		if err != nil {
+			t.Fatalf("parse error: %v", err)
+		}
+		_, err = transpiler.Analyze(ast)
+		if err == nil {
+			t.Fatal("expected error for undefined variable, got nil")
+		}
+		if !strings.Contains(err.Error(), "undefined variable") {
+			t.Fatalf("expected 'undefined variable' error, got: %v", err)
+		}
+	})
+}
+
+// TestVariableExprTree verifies the Expr tree structure for variable bindings.
+func TestVariableExprTree(t *testing.T) {
+	ast, _ := jparse.Parse(`items[price > 0].($total := price * quantity; {id: id, total: $total})`)
+	plan, err := transpiler.Analyze(ast)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(plan.Bindings) != 1 {
+		t.Fatalf("expected 1 binding, got %d", len(plan.Bindings))
+	}
+
+	b := plan.Bindings[0]
+	if b.Kind != "assign" {
+		t.Fatalf("expected binding kind='assign', got %q", b.Kind)
+	}
+	if b.VarName != "total" {
+		t.Fatalf("expected VarName='total', got %q", b.VarName)
+	}
+	if b.GoType != "float64" {
+		t.Fatalf("expected GoType='float64', got %q", b.GoType)
+	}
+
+	// The "total" output field should reference the variable.
+	totalField := plan.OutputFields[1]
+	if totalField.Value.Kind != "varRef" {
+		t.Fatalf("expected output 'total' value kind='varRef', got %q", totalField.Value.Kind)
+	}
+	if totalField.Value.VarName != "total" {
+		t.Fatalf("expected VarName='total', got %q", totalField.Value.VarName)
+	}
+}
+
+// TestVariableCodegen verifies the generated code contains the expected patterns.
+func TestVariableCodegen(t *testing.T) {
+	tests := []struct {
+		name     string
+		expr     string
+		contains []string
+	}{
+		{
+			name: "single variable",
+			expr: `items[price > 0].($total := price * quantity; {total: $total})`,
+			contains: []string{
+				"jsonataVar_total :=",
+				"(elem.Price * elem.Quantity)",
+				"Total: jsonataVar_total",
+			},
+		},
+		{
+			name: "multiple variables",
+			expr: `items[price > 0].($t := price * quantity; $d := $t * 0.9; {total: $t, discounted: $d})`,
+			contains: []string{
+				"jsonataVar_t :=",
+				"jsonataVar_d :=",
+				"jsonataVar_t * 0.9",
+				"jsonataVar_t,",
+				"jsonataVar_d,",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ast, err := jparse.Parse(tt.expr)
+			if err != nil {
+				t.Fatalf("parse error: %v", err)
+			}
+			plan, err := transpiler.Analyze(ast)
+			if err != nil {
+				t.Fatalf("analyze error: %v", err)
+			}
+			src, err := transpiler.Generate(plan, "test", "", tt.expr)
+			if err != nil {
+				t.Fatalf("generate error: %v", err)
+			}
+			code := string(src)
+			for _, want := range tt.contains {
+				if !strings.Contains(code, want) {
+					t.Errorf("generated code missing %q\n\nGenerated:\n%s", want, code)
+				}
+			}
+		})
+	}
+}
+
+// TestVariableEndToEnd compiles and runs generated code with variable bindings.
+func TestVariableEndToEnd(t *testing.T) {
+	tests := []struct {
+		name     string
+		expr     string
+		input    string
+		expected string
+	}{
+		{
+			name:  "single variable avoids duplication",
+			expr:  `items[price > 0].($total := price * quantity; {id: id, total: $total, discounted: $total * 0.9})`,
+			input: `{"items":[{"id":"A","price":100,"quantity":2},{"id":"B","price":50,"quantity":3}]}`,
+			// A: total=200, discounted=180; B: total=150, discounted=135
+			expected: `[{"id":"A","total":200,"discounted":180},{"id":"B","total":150,"discounted":135}]`,
+		},
+		{
+			name:  "variable referencing another variable",
+			expr:  `items[price > 0].($t := price * quantity; $d := $t * 0.5; {total: $t, half: $d})`,
+			input: `{"items":[{"id":"X","price":10,"quantity":4}]}`,
+			// t=40, d=20
+			expected: `[{"total":40,"half":20}]`,
+		},
+		{
+			name:  "variable in conditional",
+			expr:  `items[price > 0].($t := price * quantity; {label: $t > 100 ? "big" : "small", total: $t})`,
+			input: `{"items":[{"id":"A","price":10,"quantity":5},{"id":"B","price":50,"quantity":3}]}`,
+			// A: t=50 → "small"; B: t=150 → "big"
+			expected: `[{"label":"small","total":50},{"label":"big","total":150}]`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ast, err := jparse.Parse(tt.expr)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			plan, err := transpiler.Analyze(ast)
+			if err != nil {
+				t.Fatalf("analyze: %v", err)
+			}
+			src, err := transpiler.Generate(plan, "main", "", tt.expr)
+			if err != nil {
+				t.Fatalf("generate: %v", err)
+			}
+
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "transform_gen.go"), src, 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			mainSrc := `//go:build goexperiment.jsonv2
+package main
+
+import (
+	"fmt"
+	"encoding/json"
+	"os"
+)
+
+func main() {
+	data, _ := os.ReadFile(os.Args[1])
+	results, err := ` + plan.FuncName + `(data)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "transform error: %v\n", err)
+		os.Exit(1)
+	}
+	out, _ := json.Marshal(results)
+	fmt.Print(string(out))
+}
+`
+			if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(mainSrc), 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			goMod := "module testharness\n\ngo 1.25.0\n"
+			if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(goMod), 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			copyRuntimePackage(t, dir)
+			fixImports(t, filepath.Join(dir, "transform_gen.go"))
+
+			inputFile := filepath.Join(dir, "input.json")
+			if err := os.WriteFile(inputFile, []byte(tt.input), 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			buildCmd := exec.Command("go", "build", "-o", filepath.Join(dir, "test"), ".")
+			buildCmd.Dir = dir
+			buildCmd.Env = append(os.Environ(), "GOEXPERIMENT=jsonv2")
+			if out, err := buildCmd.CombinedOutput(); err != nil {
+				t.Fatalf("build failed: %v\n%s\n\nGenerated code:\n%s", err, out, string(src))
+			}
+
+			runCmd := exec.Command(filepath.Join(dir, "test"), inputFile)
+			runCmd.Dir = dir
+			output, err := runCmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("run failed: %v\n%s", err, output)
+			}
+
+			got := strings.TrimSpace(string(output))
+			if got != tt.expected {
+				t.Errorf("output mismatch:\n  got:  %s\n  want: %s", got, tt.expected)
+			}
+		})
+	}
+}
+
 // projectRoot and copyRuntimePackage are defined in transpiler_test.go.
 
 // fixImports rewrites github.com/gcossani/ssfbff/* imports to testharness/*
