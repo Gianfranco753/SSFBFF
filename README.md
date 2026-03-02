@@ -267,6 +267,21 @@ go run ./cmd/apigen --routes=<routes.yaml> --jsonata-dir=<dir> --output=<file.go
 | `PORT` | Server listen port | `3000` |
 | `DATA_DIR` | Path to the data directory | `data` |
 | `UPSTREAM_<PROVIDER>_URL` | Override base URL for a provider | — |
+| `HTTP_PROXY` | HTTP proxy URL | — |
+| `HTTPS_PROXY` | HTTPS proxy URL | — |
+| `NO_PROXY` | Comma-separated list of hosts to bypass proxy | — |
+
+## Tracing & Observability
+
+The BFF server is fully traceable and supports standard HTTP proxy environment variables:
+
+- **HTTP Proxy Support**: All upstream HTTP requests respect `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` environment variables, making the BFF work seamlessly behind corporate proxies or in cloud environments with proxy gateways.
+
+- **Request Context Propagation**: Request headers, cookies, and other context are extracted only when needed (based on JSONata expression analysis), minimizing memory allocation.
+
+- **Error Propagation**: All upstream failures are logged with context (provider name, endpoint, HTTP status codes) for easy debugging.
+
+- **Performance Metrics**: The compiled nature means zero runtime JSONata interpretation overhead, making the BFF suitable for high-throughput tracing scenarios.
 
 ## Running Tests
 

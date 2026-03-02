@@ -101,6 +101,22 @@ func TestListenAddr(t *testing.T) {
 	}
 }
 
+// --- sharedHTTPClient tests ---
+
+func TestSharedHTTPClientProxySupport(t *testing.T) {
+	// The sharedHTTPClient should have ProxyFromEnvironment set
+	if sharedHTTPClient.Transport == nil {
+		t.Fatal("sharedHTTPClient.Transport is nil")
+	}
+	transport, ok := sharedHTTPClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("expected *http.Transport, got %T", sharedHTTPClient.Transport)
+	}
+	if transport.Proxy == nil {
+		t.Error("sharedHTTPClient.Transport.Proxy should be set to ProxyFromEnvironment")
+	}
+}
+
 // --- fetch.go tests ---
 
 func TestDefaultFetch(t *testing.T) {

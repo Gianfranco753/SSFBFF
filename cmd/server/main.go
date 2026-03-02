@@ -37,9 +37,12 @@ import (
 // sharedHTTPClient is a single *http.Client used by both filter-mode fetchers
 // and the aggregator. A single transport means one connection pool for all
 // upstream calls, with sensible limits to prevent connection storms.
+// It respects HTTP_PROXY, HTTPS_PROXY, and NO_PROXY environment variables
+// for full traceability through proxy gateways.
 var sharedHTTPClient = &http.Client{
 	Timeout: 30 * time.Second,
 	Transport: &http.Transport{
+		Proxy:               http.ProxyFromEnvironment,
 		MaxIdleConnsPerHost: 64,
 		MaxConnsPerHost:     128,
 		IdleConnTimeout:     90 * time.Second,
