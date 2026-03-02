@@ -13,14 +13,14 @@ A two-stage code generation pipeline that turns JSONata expressions into a high-
 There are two code generators that run at build time:
 
 1. **`cmd/transpiler`** reads a `.jsonata` file and produces a Go function that evaluates the expression using `jsontext` streaming.
-2. **`cmd/apigen`** reads a `config.yaml` (or OpenAPI spec) and produces Fiber route registration code. It auto-detects whether each route uses `$fetch()` calls (multi-provider aggregation) or array filtering (single upstream).
+2. **`cmd/apigen`** reads `data/routes.yaml` (or an OpenAPI spec) and produces Fiber route registration code. It auto-detects whether each route uses `$fetch()` calls (multi-provider aggregation) or array filtering (single upstream).
 
 ```
-config.yaml       --> cmd/apigen    --> cmd/server/routes_gen.go
-dashboard.jsonata  --> cmd/transpiler --> internal/generated/dashboard_gen.go
-get_user.jsonata   --> cmd/transpiler --> internal/generated/get_user_gen.go
-orders.jsonata     --> cmd/transpiler --> internal/generated/orders_gen.go
-products.jsonata   --> cmd/transpiler --> internal/generated/products_gen.go
+data/routes.yaml              --> cmd/apigen    --> cmd/server/routes_gen.go
+data/services/dashboard.jsonata --> cmd/transpiler --> internal/generated/dashboard_gen.go
+data/services/get_user.jsonata  --> cmd/transpiler --> internal/generated/get_user_gen.go
+data/services/orders.jsonata    --> cmd/transpiler --> internal/generated/orders_gen.go
+data/services/products.jsonata  --> cmd/transpiler --> internal/generated/products_gen.go
 ```
 
 At runtime, each request either fans out to multiple upstream services in parallel (via the aggregator), composes sub-service pipelines (via `$service()`), or fetches from a single upstream — then passes the raw bytes through the compiled transform and returns the shaped result.
@@ -133,7 +133,7 @@ This is a flat, two-phase model. Sequential provider calls are achieved by compo
 
 ### Optional providers
 
-Providers can be marked as `optional: true` in `config.yaml`. When an optional provider fails (timeout, connection error, etc.), the pipeline continues with `null` instead of aborting:
+Providers can be marked as `optional: true` in their YAML file under `data/providers/`. When an optional provider fails (timeout, connection error, etc.), the pipeline continues with `null` instead of aborting:
 
 ```yaml
 providers:
@@ -165,11 +165,21 @@ In JSONata, `$name` is variable syntax - variables can be assigned with `:=` and
 SSFBFF/
 +-- Dockerfile                       # Multi-stage: generate + compile -> distroless
 +-- .dockerignore
-+-- config.yaml                      # Providers + routes (single source of truth)
-+-- api/
++-- data/                            # All BFF customization lives here
+|   +-- routes.yaml                  # Path-to-service mapping
 |   +-- openapi.yaml                 # Legacy: BFF endpoints with x-service-name
+|   +-- providers/                   # One YAML per upstream service
+|   |   +-- user_service.yaml
+|   |   +-- bank_service.yaml
+|   |   +-- orders_service.yaml
+|   |   +-- products_service.yaml
+|   +-- services/                    # JSONata expressions
+|       +-- dashboard.jsonata        # $fetch() + $service() expression
+|       +-- get_user.jsonata         # Reusable service (called via $service("get_user"))
+|       +-- orders.jsonata           # Filter mode expression
+|       +-- products.jsonata         # Filter mode expression
 +-- cmd/
-|   +-- apigen/main.go               # config.yaml -> Fiber routes generator
+|   +-- apigen/main.go               # routes.yaml -> Fiber routes generator
 |   +-- server/
 |   |   +-- main.go                  # Fiber v3 server entry point
 |   |   +-- fetch.go                 # HTTP fetcher with sync.Pool
@@ -185,14 +195,7 @@ SSFBFF/
 |   |   +-- aggregator.go            # Parallel upstream fetcher (errgroup)
 |   +-- generated/
 |   |   +-- generate.go              # go:generate directives
-|   |   +-- dashboard.jsonata        # $fetch() + $service() expression
-|   |   +-- dashboard_gen.go         # Generated: transform + execute (with service composition)
-|   |   +-- get_user.jsonata         # Reusable service (called via $service("get_user"))
-|   |   +-- get_user_gen.go          # Generated: transform + execute for get_user
-|   |   +-- orders.jsonata           # Filter mode expression
-|   |   +-- orders_gen.go            # Generated filter transform
-|   |   +-- products.jsonata         # Filter mode expression
-|   |   +-- products_gen.go          # Generated filter transform
+|   |   +-- *_gen.go                 # Generated transform functions
 |   +-- transpiler/
 |       +-- analyze.go               # AST -> QueryPlan / ProviderPlan
 |       +-- codegen.go               # Plan -> Go source
@@ -236,27 +239,13 @@ curl http://localhost:3000/health
 
 ## Configuration
 
-### `config.yaml`
+All BFF configuration lives in the `data/` folder. To customize the BFF, modify the files inside `data/` and rebuild.
 
-The single source of truth for providers and routes:
+### `data/routes.yaml`
+
+Maps HTTP paths to JSONata service files:
 
 ```yaml
-providers:
-  user_service:
-    base_url: http://user-svc:8080
-    timeout: 5s
-    endpoints:
-      profile: /api/profile
-  bank_service:
-    base_url: http://bank-svc:8080
-    timeout: 3s
-    endpoints:
-      accounts: /api/accounts
-  rec_service:
-    base_url: http://rec-svc:8080
-    timeout: 2s
-    optional: true                  # failure stores null, pipeline continues
-
 routes:
   - path: /dashboard
     method: GET
@@ -269,9 +258,38 @@ routes:
     jsonata: products.jsonata
 ```
 
+### `data/providers/`
+
+One YAML file per upstream service. The filename (minus `.yaml`) is the provider name:
+
+```yaml
+# data/providers/user_service.yaml
+base_url: http://user-svc:8080
+timeout: 5s
+endpoints:
+  profile: /api/profile
+```
+
+```yaml
+# data/providers/bank_service.yaml
+base_url: http://bank-svc:8080
+timeout: 3s
+optional: true              # failure stores null, pipeline continues
+endpoints:
+  accounts: /api/accounts
+```
+
 Provider base URLs can be overridden at runtime via `UPSTREAM_<PROVIDER>_URL` environment variables.
 
 The `optional: true` flag makes a provider non-critical. If the call fails (timeout, connection error, HTTP error), the result is stored as `null` and the pipeline continues. Fields that depend on an optional provider will resolve to `null` in the output.
+
+### `data/services/`
+
+JSONata expressions — one file per service. These are transpiled into native Go at build time.
+
+### `data/openapi.yaml`
+
+Optional OpenAPI spec for the legacy `--spec` mode.
 
 ## Adding a New Endpoint
 
@@ -280,16 +298,16 @@ The `optional: true` flag makes a provider non-critical. If the call fails (time
 **Step 1.** Write the JSONata expression:
 
 ```bash
-echo 'users[active = 1].{name: full_name, email: email_address}' > internal/generated/users.jsonata
+echo 'users[active = 1].{name: full_name, email: email_address}' > data/services/users.jsonata
 ```
 
 **Step 2.** Add a `go:generate` directive in `internal/generated/generate.go`:
 
 ```go
-//go:generate go run ../../cmd/transpiler --input=users.jsonata --output=users_gen.go --package=generated
+//go:generate go run ../../cmd/transpiler --input=../../data/services/users.jsonata --output=users_gen.go --package=generated
 ```
 
-**Step 3.** Add the route to `config.yaml`:
+**Step 3.** Add the route to `data/routes.yaml`:
 
 ```yaml
 routes:
@@ -310,26 +328,26 @@ UPSTREAM_USERS_URL=http://users-svc:8080/data GOEXPERIMENT=jsonv2 go run ./cmd/s
 **Step 1.** Write the JSONata expression using `$fetch()`:
 
 ```bash
-cat > internal/generated/account_summary.jsonata << 'EOF'
+cat > data/services/account_summary.jsonata << 'EOF'
 {"owner": $fetch("user_service", "profile").name, "total": $fetch("bank_service", "accounts").amount}
 EOF
 ```
 
-**Step 2.** Define the providers in `config.yaml` (if not already defined):
+**Step 2.** Define the providers in `data/providers/` (if not already defined):
 
-```yaml
-providers:
-  user_service:
-    base_url: http://user-svc:8080
-    timeout: 5s
-    endpoints:
-      profile: /api/profile
+```bash
+cat > data/providers/user_service.yaml << 'EOF'
+base_url: http://user-svc:8080
+timeout: 5s
+endpoints:
+  profile: /api/profile
+EOF
 ```
 
 **Step 3.** Add a `go:generate` directive and route (same as filter mode):
 
 ```go
-//go:generate go run ../../cmd/transpiler --input=account_summary.jsonata --output=account_summary_gen.go --package=generated
+//go:generate go run ../../cmd/transpiler --input=../../data/services/account_summary.jsonata --output=account_summary_gen.go --package=generated
 ```
 
 ```yaml
@@ -348,7 +366,7 @@ Build complex orchestrations by composing simple services. Each service is a sep
 **Step 1.** Create a reusable inner service:
 
 ```bash
-cat > internal/generated/get_user.jsonata << 'EOF'
+cat > data/services/get_user.jsonata << 'EOF'
 {"id": $fetch("user_service", "profile", {"headers": {"Authorization": $request().headers.Authorization}}).id, "name": $fetch("user_service", "profile", {"headers": {"Authorization": $request().headers.Authorization}}).name}
 EOF
 ```
@@ -356,7 +374,7 @@ EOF
 **Step 2.** Create the outer service that calls the inner one:
 
 ```bash
-cat > internal/generated/dashboard.jsonata << 'EOF'
+cat > data/services/dashboard.jsonata << 'EOF'
 {"user": $service("get_user").name, "balance": $fetch("bank_service", "accounts").amount, "auth": $request().headers.Authorization}
 EOF
 ```
@@ -364,11 +382,11 @@ EOF
 **Step 3.** Add `go:generate` directives for both:
 
 ```go
-//go:generate go run ../../cmd/transpiler --input=get_user.jsonata --output=get_user_gen.go --package=generated
-//go:generate go run ../../cmd/transpiler --input=dashboard.jsonata --output=dashboard_gen.go --package=generated
+//go:generate go run ../../cmd/transpiler --input=../../data/services/get_user.jsonata --output=get_user_gen.go --package=generated
+//go:generate go run ../../cmd/transpiler --input=../../data/services/dashboard.jsonata --output=dashboard_gen.go --package=generated
 ```
 
-**Step 4.** Add the route to `config.yaml`:
+**Step 4.** Add the route to `data/routes.yaml`:
 
 ```yaml
 routes:
@@ -556,15 +574,15 @@ The transpiler auto-detects the mode:
 - If the expression contains `$fetch()` or `$service()` calls -> generates a multi-provider transform with `Deps` metadata and an `ExecuteXxx` orchestration function
 - Otherwise -> generates a streaming filter+projection transform
 
-### `cmd/apigen` - Config/OpenAPI to Fiber Routes
+### `cmd/apigen` - Routes/OpenAPI to Fiber Routes
 
 ```
-go run ./cmd/apigen --config=<config.yaml> --jsonata-dir=<dir> --output=<routes.go> --package=<pkg> --generated-pkg=<import>
+go run ./cmd/apigen --routes=<routes.yaml> --jsonata-dir=<dir> --output=<routes.go> --package=<pkg> --generated-pkg=<import>
 ```
 
 | Flag | Description | Default |
 |---|---|---|
-| `--config` | Path to `config.yaml` | - |
+| `--routes` | Path to `routes.yaml` | - |
 | `--spec` | Path to OpenAPI YAML file (legacy) | - |
 | `--jsonata-dir` | Directory containing `.jsonata` files | - |
 | `--output` | Path for the generated `.go` file | **(required)** |
@@ -576,7 +594,8 @@ go run ./cmd/apigen --config=<config.yaml> --jsonata-dir=<dir> --output=<routes.
 | Variable | Description |
 |---|---|
 | `PORT` | Server listen port (default `3000`) |
-| `UPSTREAM_<PROVIDER>_URL` | Override base URL for a provider defined in `config.yaml` |
+| `DATA_DIR` | Path to the data directory (default `data`) |
+| `UPSTREAM_<PROVIDER>_URL` | Override base URL for a provider defined in `data/providers/` |
 | `UPSTREAM_<NAME>_URL` | Base URL for filter-mode upstream services |
 
 ## Running Tests
@@ -587,7 +606,7 @@ GOEXPERIMENT=jsonv2 go test ./internal/transpiler/ -v
 
 ## Docker
 
-The Dockerfile uses a multi-stage build that performs all code generation at build time. The final image is a distroless container with only the compiled binary and `config.yaml` -- no Go toolchain, no source code, no `.jsonata` files.
+The Dockerfile uses a multi-stage build that performs all code generation at build time. The final image is a distroless container with only the compiled binary and `data/providers/` -- no Go toolchain, no source code, no `.jsonata` files.
 
 ### Build the image
 
@@ -597,9 +616,9 @@ docker build -t bff-app .
 
 What happens during the build:
 1. Dependencies are downloaded and cached (`go mod download`)
-2. `go generate` compiles the transpiler, converts all `.jsonata` files into native Go code, and generates route wiring
+2. `go generate` reads `.jsonata` files from `data/services/` and routes from `data/routes.yaml`, transpiles them into native Go code, and generates route wiring
 3. The server is compiled into a single static binary
-4. The binary and `config.yaml` are copied into a minimal distroless image
+4. The binary and `data/providers/` are copied into a minimal distroless image (routes and services are compiled in)
 
 ### Run with Docker Compose (recommended)
 
@@ -650,7 +669,7 @@ docker run -p 3000:3000 \
 
 ### Image size
 
-The runtime image is typically under 15 MB since it contains only the compiled binary and a YAML file on top of the distroless base.
+The runtime image is typically under 15 MB since it contains only the compiled binary and provider YAML files on top of the distroless base.
 
 ## Supported JSONata Subset
 

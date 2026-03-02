@@ -8,8 +8,8 @@
 //	GOEXPERIMENT=jsonv2 go generate ./internal/generated/
 package generated
 
-//go:generate go run ../../cmd/transpiler --input=orders.jsonata --output=orders_gen.go --package=generated
-//go:generate go run ../../cmd/transpiler --input=products.jsonata --output=products_gen.go --package=generated
-//go:generate go run ../../cmd/transpiler --input=get_user.jsonata --output=get_user_gen.go --package=generated
-//go:generate go run ../../cmd/transpiler --input=dashboard.jsonata --output=dashboard_gen.go --package=generated
-//go:generate go run ../../cmd/apigen --config=../../config.yaml --jsonata-dir=. --output=../../cmd/server/routes_gen.go --package=main --generated-pkg=github.com/gcossani/ssfbff/internal/generated
+//go:generate go run ../../cmd/transpiler --input=../../data/services/orders.jsonata --output=orders_gen.go --package=generated
+//go:generate go run ../../cmd/transpiler --input=../../data/services/products.jsonata --output=products_gen.go --package=generated
+//go:generate go run ../../cmd/transpiler --input=../../data/services/get_user.jsonata --output=get_user_gen.go --package=generated
+//go:generate go run ../../cmd/transpiler --input=../../data/services/dashboard.jsonata --output=dashboard_gen.go --package=generated
+//go:generate go run ../../cmd/apigen --routes=../../data/routes.yaml --jsonata-dir=../../data/services --output=../../cmd/server/routes_gen.go --package=main --generated-pkg=github.com/gcossani/ssfbff/internal/generated

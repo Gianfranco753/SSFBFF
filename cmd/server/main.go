@@ -1,10 +1,12 @@
 //go:build goexperiment.jsonv2
 
-// Command server runs the BFF web server. Routes are generated from config.yaml
+// Command server runs the BFF web server. Routes are generated from data/routes.yaml
 // via cmd/apigen. Each route either fetches from a single upstream (filter mode)
 // or fans out to multiple providers via the aggregator (provider mode).
 //
-// Provider base URLs default to config.yaml but can be overridden at runtime:
+// Providers are loaded from data/providers/*.yaml at startup.
+// The data directory defaults to "data" but can be overridden with DATA_DIR env var.
+// Provider base URLs can be overridden at runtime:
 //
 //	UPSTREAM_USER_SERVICE_URL=http://user-svc:8080
 //	UPSTREAM_ORDERS_URL=http://orders-svc:8080/data
@@ -20,6 +22,8 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -29,9 +33,14 @@ import (
 )
 
 func main() {
-	providers, err := loadProviders("config.yaml")
+	dataDir := os.Getenv("DATA_DIR")
+	if dataDir == "" {
+		dataDir = "data"
+	}
+
+	providers, err := loadProviders(filepath.Join(dataDir, "providers"))
 	if err != nil {
-		log.Fatalf("loading config: %v", err)
+		log.Fatalf("loading providers: %v", err)
 	}
 
 	agg := aggregator.New(providers)
@@ -71,22 +80,33 @@ func main() {
 	log.Println("server stopped")
 }
 
-// loadProviders reads the providers section from config.yaml.
-func loadProviders(path string) (map[string]aggregator.ProviderConfig, error) {
-	data, err := os.ReadFile(path)
+// loadProviders reads all .yaml files from a directory.
+// Each file represents one provider — the filename (minus extension) is the provider name.
+func loadProviders(dir string) (map[string]aggregator.ProviderConfig, error) {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("reading providers dir %s: %w", dir, err)
 	}
 
-	var cfg struct {
-		Providers map[string]aggregator.ProviderConfig `yaml:"providers"`
-	}
+	providers := make(map[string]aggregator.ProviderConfig, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".yaml") {
+			continue
+		}
 
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("parsing config: %w", err)
-	}
+		name := strings.TrimSuffix(entry.Name(), ".yaml")
+		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			return nil, err
+		}
 
-	return cfg.Providers, nil
+		var pc aggregator.ProviderConfig
+		if err := yaml.Unmarshal(data, &pc); err != nil {
+			return nil, fmt.Errorf("parsing %s: %w", entry.Name(), err)
+		}
+		providers[name] = pc
+	}
+	return providers, nil
 }
 
 func listenAddr() string {

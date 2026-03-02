@@ -1,0 +1,4 @@
+base_url: http://user-svc:8080
+timeout: 5s
+endpoints:
+  profile: /api/profile
