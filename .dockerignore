@@ -1,0 +1,15 @@
+.git/
+.gitignore
+.cursor/
+.vscode/
+.idea/
+
+testdata/
+examples/
+
+*.test
+*.out
+*.exe
+
+# Stale build artifacts
+apigen

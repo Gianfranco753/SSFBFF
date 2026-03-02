@@ -163,6 +163,8 @@ In JSONata, `$name` is variable syntax - variables can be assigned with `:=` and
 
 ```
 SSFBFF/
++-- Dockerfile                       # Multi-stage: generate + compile -> distroless
++-- .dockerignore
 +-- config.yaml                      # Providers + routes (single source of truth)
 +-- api/
 |   +-- openapi.yaml                 # Legacy: BFF endpoints with x-service-name
@@ -173,6 +175,11 @@ SSFBFF/
 |   |   +-- fetch.go                 # HTTP fetcher with sync.Pool
 |   |   +-- routes_gen.go            # Generated route wiring
 |   +-- transpiler/main.go           # JSONata -> Go generator
++-- examples/
+|   +-- docker-compose.yaml          # Full-stack demo: BFF + mock upstreams
+|   +-- mockserver/
+|       +-- main.go                  # Canned JSON responses for all upstreams
+|       +-- Dockerfile
 +-- internal/
 |   +-- aggregator/
 |   |   +-- aggregator.go            # Parallel upstream fetcher (errgroup)
@@ -577,6 +584,73 @@ go run ./cmd/apigen --config=<config.yaml> --jsonata-dir=<dir> --output=<routes.
 ```bash
 GOEXPERIMENT=jsonv2 go test ./internal/transpiler/ -v
 ```
+
+## Docker
+
+The Dockerfile uses a multi-stage build that performs all code generation at build time. The final image is a distroless container with only the compiled binary and `config.yaml` -- no Go toolchain, no source code, no `.jsonata` files.
+
+### Build the image
+
+```bash
+docker build -t bff-app .
+```
+
+What happens during the build:
+1. Dependencies are downloaded and cached (`go mod download`)
+2. `go generate` compiles the transpiler, converts all `.jsonata` files into native Go code, and generates route wiring
+3. The server is compiled into a single static binary
+4. The binary and `config.yaml` are copied into a minimal distroless image
+
+### Run with Docker Compose (recommended)
+
+The `examples/` directory includes a Docker Compose setup with mock upstream services so you can test the full pipeline without any external dependencies:
+
+```bash
+docker compose -f examples/docker-compose.yaml up --build
+```
+
+Then test the endpoints:
+
+```bash
+# Health check
+curl http://localhost:3000/health
+
+# Multi-provider aggregation with service composition
+curl http://localhost:3000/dashboard
+
+# Single-upstream filtering
+curl http://localhost:3000/api/v1/orders
+curl http://localhost:3000/api/v1/products
+```
+
+Expected responses:
+
+```bash
+# /dashboard — aggregates user_service + bank_service via $service() + $fetch()
+{"user":"Alice","balance":42500.75,"auth":""}
+
+# /api/v1/orders — filters orders where price > 100, sums item prices
+[{"id":"ORD-002","total":120},{"id":"ORD-003","total":100}]
+
+# /api/v1/products — filters products where price > 50, sums review ratings
+[{"name":"Gadget","total":12},{"name":"Gizmo","total":2}]
+```
+
+### Run standalone
+
+```bash
+docker build -t bff-app .
+docker run -p 3000:3000 \
+  -e UPSTREAM_USER_SERVICE_URL=http://host.docker.internal:9999 \
+  -e UPSTREAM_BANK_SERVICE_URL=http://host.docker.internal:9999 \
+  -e UPSTREAM_ORDERS_URL=http://host.docker.internal:9999/data \
+  -e UPSTREAM_PRODUCTS_URL=http://host.docker.internal:9999/data/products \
+  bff-app
+```
+
+### Image size
+
+The runtime image is typically under 15 MB since it contains only the compiled binary and a YAML file on top of the distroless base.
 
 ## Supported JSONata Subset
 
