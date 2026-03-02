@@ -76,9 +76,14 @@ func main() {
 		}
 	}()
 
-	// Wrap baseTransport with otelhttp so all upstream HTTP calls become
-	// child spans of the active trace, propagating W3C trace context headers.
-	sharedHTTPClient.Transport = otelhttp.NewTransport(baseTransport)
+	// Wrap baseTransport with otelhttp so all upstream HTTP calls become child
+	// spans of the active trace. upstreamPropagator() controls whether
+	// traceparent/tracestate headers are injected into those outgoing requests
+	// (OTEL_PROPAGATE_UPSTREAM, default: true).
+	sharedHTTPClient.Transport = otelhttp.NewTransport(
+		baseTransport,
+		otelhttp.WithPropagators(upstreamPropagator()),
+	)
 
 	dataDir := os.Getenv("DATA_DIR")
 	if dataDir == "" {
@@ -101,9 +106,14 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	})
 
-	// Instrument all incoming requests: creates a server span, extracts
-	// W3C TraceContext/Baggage from request headers, and records HTTP metrics.
-	app.Use(otelfiber.Middleware())
+	// Instrument all incoming requests: creates a server span, always extracts
+	// W3C TraceContext/Baggage from incoming request headers (so the BFF can
+	// join an existing trace), and records HTTP metrics.
+	// downstreamPropagator() controls whether traceparent/tracestate are also
+	// written into the BFF's HTTP response (OTEL_PROPAGATE_DOWNSTREAM, default: true).
+	app.Use(otelfiber.Middleware(
+		otelfiber.WithPropagators(downstreamPropagator()),
+	))
 
 	RegisterRoutes(app, defaultFetch, agg)
 

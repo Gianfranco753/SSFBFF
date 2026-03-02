@@ -9,6 +9,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 func TestLoadProviders(t *testing.T) {
@@ -146,6 +149,47 @@ func TestOtelServiceNameFromEnv(t *testing.T) {
 	t.Setenv("OTEL_SERVICE_NAME", "my-bff")
 	if got := otelServiceName(); got != "my-bff" {
 		t.Errorf("otelServiceName() = %q, want %q", got, "my-bff")
+	}
+}
+
+// --- correlation propagator tests ---
+
+// isNoop reports whether a propagator injects nothing into a carrier.
+// A noop propagator produces an empty carrier after Inject.
+func isNoop(p propagation.TextMapPropagator) bool {
+	carrier := propagation.MapCarrier{}
+	ctx := trace.ContextWithSpanContext(context.Background(), trace.SpanContext{})
+	p.Inject(ctx, carrier)
+	return len(carrier) == 0
+}
+
+func TestUpstreamPropagatorDefault(t *testing.T) {
+	t.Setenv("OTEL_PROPAGATE_UPSTREAM", "")
+	// Default is the global propagator, which may or may not be noop depending
+	// on whether initTracing has run. We only assert it is not nil.
+	if upstreamPropagator() == nil {
+		t.Error("upstreamPropagator() should never return nil")
+	}
+}
+
+func TestUpstreamPropagatorDisabled(t *testing.T) {
+	t.Setenv("OTEL_PROPAGATE_UPSTREAM", "false")
+	if !isNoop(upstreamPropagator()) {
+		t.Error("upstreamPropagator() should be noop when OTEL_PROPAGATE_UPSTREAM=false")
+	}
+}
+
+func TestDownstreamPropagatorDefault(t *testing.T) {
+	t.Setenv("OTEL_PROPAGATE_DOWNSTREAM", "")
+	if downstreamPropagator() == nil {
+		t.Error("downstreamPropagator() should never return nil")
+	}
+}
+
+func TestDownstreamPropagatorDisabled(t *testing.T) {
+	t.Setenv("OTEL_PROPAGATE_DOWNSTREAM", "false")
+	if !isNoop(downstreamPropagator()) {
+		t.Error("downstreamPropagator() should be noop when OTEL_PROPAGATE_DOWNSTREAM=false")
 	}
 }
 

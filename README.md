@@ -294,14 +294,21 @@ Tracing is configured entirely via standard [OTEL environment variables](https:/
 | `OTEL_EXPORTER_OTLP_HEADERS` | Auth headers, e.g. `Authorization=Bearer <token>` | — |
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Traces-specific endpoint override | — |
 | `OTEL_EXPORTER_OTLP_TRACES_HEADERS` | Traces-specific header override | — |
+| `OTEL_PROPAGATE_UPSTREAM` | Inject `traceparent`/`tracestate` into requests sent to upstream microservices | `true` |
+| `OTEL_PROPAGATE_DOWNSTREAM` | Inject `traceparent`/`tracestate` into HTTP responses sent back to clients | `true` |
 
 ## Tracing & Observability
 
 The server is fully OpenTelemetry compatible out of the box:
 
-- **Incoming requests** — the [Fiber OTel middleware](https://github.com/gofiber/contrib/tree/main/v3/otel) (`github.com/gofiber/contrib/v3/otel`) creates a server span for every request, records HTTP metrics, and extracts W3C TraceContext + Baggage headers for distributed tracing.
+- **Incoming requests** — the [Fiber OTel middleware](https://github.com/gofiber/contrib/tree/main/v3/otel) (`github.com/gofiber/contrib/v3/otel`) creates a server span for every request, records HTTP metrics, and extracts W3C TraceContext + Baggage headers from the incoming request so the BFF can join an existing distributed trace.
 
-- **Upstream calls** — every provider/upstream fetch is a child span of the active request trace, created by `otelhttp.NewTransport`. Trace context is automatically propagated to upstream services via the `traceparent` header.
+- **Upstream calls** — every provider/upstream fetch becomes a child span of the active request trace via `otelhttp.NewTransport`. Span creation always happens (so the BFF records the call duration and status), while header propagation to the microservice is controlled separately (see below).
+
+- **Correlation header propagation** — two env vars independently control whether W3C `traceparent`/`tracestate` headers are forwarded:
+  - `OTEL_PROPAGATE_UPSTREAM=false` — **disable** header injection into outgoing requests to upstream microservices. Useful when upstream services do not support OTel and you want to avoid unexpected header overhead. Spans are still recorded on the BFF side.
+  - `OTEL_PROPAGATE_DOWNSTREAM=false` — **disable** header injection into HTTP responses back to clients. Useful when you don't want clients to observe internal trace IDs. Spans are still recorded on the BFF side.
+  - Both default to `true` (propagation enabled).
 
 - **Proxy support** — `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` are respected by all upstream calls, making the BFF compatible with corporate proxies and cloud egress gateways.
 
