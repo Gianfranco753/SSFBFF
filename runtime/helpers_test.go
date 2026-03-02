@@ -63,19 +63,19 @@ func TestExtractPath(t *testing.T) {
 			want: `null`,
 		},
 		{
-			name: "missing field",
+			name:    "missing field",
 			data:    []byte(`{"name": "Alice"}`),
 			path:    []string{"missing"},
 			wantErr: true,
 		},
 		{
-			name: "nested missing field",
+			name:    "nested missing field",
 			data:    []byte(`{"user": {"name": "Alice"}}`),
 			path:    []string{"user", "missing"},
 			wantErr: true,
 		},
 		{
-			name: "non-object at path",
+			name:    "non-object at path",
 			data:    []byte(`{"name": "Alice"}`),
 			path:    []string{"name", "sub"},
 			wantErr: true,
