@@ -1,1 +1,0 @@
-orders[price > 100].{id: order_id, total: $sum(items.price)}

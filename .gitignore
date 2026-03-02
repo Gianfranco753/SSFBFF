@@ -1,7 +1,4 @@
-# If you prefer the allow list template instead of the deny list, see community template:
-# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
-#
-# Binaries for programs and plugins
+# Binaries
 *.exe
 *.exe~
 *.dll
@@ -13,13 +10,17 @@ mockserver
 # Test binary, built with `go test -c`
 *.test
 
-# Code coverage profiles and other test artifacts
+# Code coverage
 *.out
 coverage.*
 *.coverprofile
 profile.cov
 
-# Dependency directories (remove the comment below to include it)
+# Generated files — recreated by: GOEXPERIMENT=jsonv2 go generate ./internal/generated/
+internal/generated/*_gen.go
+cmd/server/routes_gen.go
+
+# Dependency directories
 # vendor/
 
 # Go workspace file
