@@ -78,7 +78,7 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 			reqCtx, cancel := context.WithTimeout(gctx, timeout)
 			defer cancel()
 
-			body, err := a.doGet(reqCtx, url)
+			body, err := a.doRequest(reqCtx, dep, url)
 			if err != nil {
 				return fmt.Errorf("%s/%s: %w", dep.Provider, dep.Endpoint, err)
 			}
@@ -125,10 +125,26 @@ func (a *Aggregator) resolveURL(dep runtime.ProviderDep) (string, time.Duration,
 	return url, timeout, nil
 }
 
-func (a *Aggregator) doGet(ctx context.Context, url string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+// doRequest makes an HTTP request respecting dep.Method, dep.Headers, and
+// dep.Body. If Method is empty it defaults to GET.
+func (a *Aggregator) doRequest(ctx context.Context, dep runtime.ProviderDep, url string) ([]byte, error) {
+	method := dep.Method
+	if method == "" {
+		method = http.MethodGet
+	}
+
+	var bodyReader io.Reader
+	if len(dep.Body) > 0 {
+		bodyReader = bytes.NewReader(dep.Body)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
 	if err != nil {
 		return nil, fmt.Errorf("building request: %w", err)
+	}
+
+	for k, v := range dep.Headers {
+		req.Header.Set(k, v)
 	}
 
 	resp, err := a.client.Do(req)

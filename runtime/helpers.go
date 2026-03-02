@@ -14,12 +14,30 @@ import (
 	"fmt"
 )
 
+// RequestContext holds data from the incoming HTTP request, populated by the
+// Fiber handler before calling the generated transform functions. Generated
+// code accesses specific keys — e.g. req.Headers["Authorization"] — so the
+// maps only need to contain the entries that the JSONata expression references.
+type RequestContext struct {
+	Cookies map[string]string
+	Headers map[string]string
+	Query   map[string]string
+	Params  map[string]string
+	Path    string
+	Method  string
+	Body    []byte
+}
+
 // ProviderDep identifies an upstream service endpoint that must be fetched
 // before a transform function can run. The aggregator uses this to build
-// the fan-out plan.
+// the fan-out plan. Method/Headers/Body are optional and allow $fetch()
+// configs to shape the outgoing request (e.g. POST with a custom body).
 type ProviderDep struct {
 	Provider string // e.g. "user_service"
 	Endpoint string // e.g. "profile"
+	Method   string            // HTTP method (default "GET")
+	Headers  map[string]string // custom headers for this upstream call
+	Body     []byte            // request body (pre-serialized JSON)
 }
 
 // Key returns the map key used to store/retrieve fetched data for this dep.

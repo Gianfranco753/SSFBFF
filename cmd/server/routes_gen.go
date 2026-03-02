@@ -10,6 +10,7 @@ import (
 
 	"github.com/gcossani/ssfbff/internal/aggregator"
 	generated "github.com/gcossani/ssfbff/internal/generated"
+	"github.com/gcossani/ssfbff/runtime"
 	"github.com/gofiber/fiber/v3"
 )
 
@@ -17,12 +18,39 @@ type FetchFunc func(ctx context.Context, url string) ([]byte, error)
 
 func RegisterRoutes(app *fiber.App, fetch FetchFunc, agg *aggregator.Aggregator) {
 	app.Get("/dashboard", func(c fiber.Ctx) error {
-		fetched, err := agg.Fetch(c.Context(), generated.TransformDashboardDeps)
+		reqCtx := runtime.RequestContext{
+			Path:   c.Path(),
+			Method: c.Method(),
+			Body:   c.Body(),
+		}
+		c.Request().Header.VisitAll(func(key, val []byte) {
+			if reqCtx.Headers == nil {
+				reqCtx.Headers = map[string]string{}
+			}
+			reqCtx.Headers[string(key)] = string(val)
+		})
+		c.Request().Header.VisitAllCookie(func(key, val []byte) {
+			if reqCtx.Cookies == nil {
+				reqCtx.Cookies = map[string]string{}
+			}
+			reqCtx.Cookies[string(key)] = string(val)
+		})
+		reqCtx.Query = c.Queries()
+
+		if routeParams := c.Route().Params; len(routeParams) > 0 {
+			reqCtx.Params = make(map[string]string, len(routeParams))
+			for _, p := range routeParams {
+				reqCtx.Params[p] = c.Params(p)
+			}
+		}
+
+		deps := generated.TransformDashboardDeps(reqCtx)
+		fetched, err := agg.Fetch(c.Context(), deps)
 		if err != nil {
 			return fiber.NewError(fiber.StatusBadGateway, err.Error())
 		}
 
-		result, err := generated.TransformDashboard(fetched)
+		result, err := generated.TransformDashboard(fetched, reqCtx)
 		if err != nil {
 			return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 		}

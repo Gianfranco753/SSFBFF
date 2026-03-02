@@ -36,11 +36,65 @@ orders[price > 100].{id: order_id, total: $sum(items.price)}
 
 ### Fetch mode - multiple upstreams, parallel aggregation
 
-Uses the `$fetch("provider", "endpoint")` convention to declare dependencies on upstream services. At build time the transpiler extracts these as metadata; at runtime the aggregator fans out all requests in parallel.
+Uses the `$fetch("provider", "endpoint")` convention to declare dependencies on upstream services. At build time the transpiler extracts these as metadata; at runtime the aggregator fans out all requests in parallel. Can include `$request()` paths and extended `$fetch()` config.
 
 ```jsonata
-{"user": $fetch("user_service", "profile").name, "balance": $fetch("bank_service", "accounts").amount}
+{"user": $fetch("user_service", "profile", {
+  "headers": {"Authorization": $request().headers.Authorization}
+}).name,
+"balance": $fetch("bank_service", "accounts").amount,
+"request_path": $request().path}
 ```
+
+### `$request()` - access incoming HTTP request data
+
+Expressions can read data from the incoming HTTP request using `$request()` with dot-path navigation. One function, consistent pattern:
+
+| Path | Returns | Example |
+|---|---|---|
+| `$request().headers.Name` | Value of the specified HTTP header | `$request().headers.Authorization` |
+| `$request().cookies.Name` | Value of the specified cookie | `$request().cookies.session` |
+| `$request().query.Name` | Value of a query parameter | `$request().query.page` |
+| `$request().params.Name` | Value of a route parameter | `$request().params.id` |
+| `$request().path` | The request path | `$request().path` |
+| `$request().method` | The HTTP method (GET, POST, etc.) | `$request().method` |
+| `$request().body` | The entire request body (raw JSON) | `$request().body` |
+| `$request().body.field` | A field from the request body | `$request().body.user.name` |
+
+These can be used in output fields alongside `$fetch()`:
+
+```jsonata
+{
+  "data": $fetch("svc", "ep").value,
+  "auth": $request().headers.Authorization,
+  "url": $request().path
+}
+```
+
+### Extended `$fetch()` - shaping outgoing requests
+
+`$fetch()` accepts an optional 3rd argument — an object that configures the outgoing HTTP request to the upstream provider. Values inside this config can use `$request()` paths, allowing you to forward or transform request data:
+
+```jsonata
+{
+  "result": $fetch("payment_service", "charge", {
+    "method": "POST",
+    "headers": {
+      "Authorization": $request().headers.Authorization,
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "user": $request().cookies.user_id,
+      "amount": "100"
+    }
+  }).status
+}
+```
+
+The config object supports three keys:
+- `method` — HTTP method string (default: `"GET"`)
+- `headers` — object mapping header names to values (static strings or `$request()` paths)
+- `body` — object whose fields become a JSON body (values can be static strings or `$request()` paths)
 
 #### Why `$fetch()` instead of `$providers.x.y`?
 
@@ -249,18 +303,26 @@ func TransformOrders(data []byte) ([]OrdersResult, error) {
 }
 ```
 
-### Fetch mode
+### Fetch mode (with `$request()` and fetch config)
 
-Given `{"user": $fetch("user_service", "profile").name, "balance": $fetch("bank_service", "accounts").amount}`, the transpiler generates:
+Given `{"user": $fetch("user_service", "profile", {"headers": {"Authorization": $request().headers.Authorization}}).name, "balance": $fetch("bank_service", "accounts").amount, "request_path": $request().path}`, the transpiler generates:
 
 ```go
-// Dependencies for the aggregator to fan-out fetch.
-var TransformDashboardDeps = []runtime.ProviderDep{
-    {Provider: "user_service", Endpoint: "profile"},
-    {Provider: "bank_service", Endpoint: "accounts"},
+// Deps is a function now — it builds the fan-out plan using request context.
+func TransformDashboardDeps(req runtime.RequestContext) []runtime.ProviderDep {
+    return []runtime.ProviderDep{
+        {
+            Provider: "user_service",
+            Endpoint: "profile",
+            Headers: map[string]string{
+                "Authorization": req.Headers["Authorization"],
+            },
+        },
+        {Provider: "bank_service", Endpoint: "accounts"},
+    }
 }
 
-func TransformDashboard(results map[string][]byte) ([]byte, error) {
+func TransformDashboard(results map[string][]byte, req runtime.RequestContext) ([]byte, error) {
     var buf bytes.Buffer
     enc := jsontext.NewEncoder(&buf)
 
@@ -274,19 +336,30 @@ func TransformDashboard(results map[string][]byte) ([]byte, error) {
     val, _ = runtime.ExtractPath(results["bank_service.accounts"], "amount")
     enc.WriteValue(val)
 
+    enc.WriteToken(jsontext.String("request_path"))
+    enc.WriteToken(jsontext.String(req.Path))
+
     enc.WriteToken(jsontext.EndObject)
     return buf.Bytes(), nil
 }
 ```
 
-The generated route handler fans out the fetches in parallel via the aggregator, then passes the results to the transform:
+The generated route handler builds a `RequestContext` from the Fiber `Ctx`, computes deps, fans out in parallel, and transforms:
 
 ```go
 app.Get("/dashboard", func(c fiber.Ctx) error {
-    fetched, err := agg.Fetch(c.Context(), generated.TransformDashboardDeps)
+    reqCtx := runtime.RequestContext{
+        Path:   c.Path(),
+        Method: c.Method(),
+        Body:   c.Body(),
+    }
+    // ... headers, cookies, query, params populated from c ...
+
+    deps := generated.TransformDashboardDeps(reqCtx)
+    fetched, err := agg.Fetch(c.Context(), deps)
     if err != nil { return fiber.NewError(502, err.Error()) }
 
-    result, err := generated.TransformDashboard(fetched)
+    result, err := generated.TransformDashboard(fetched, reqCtx)
     if err != nil { return fiber.NewError(500, err.Error()) }
 
     c.Set("Content-Type", "application/json")
@@ -331,10 +404,10 @@ Given upstream responses:
 A `GET /dashboard` returns:
 
 ```json
-{"user": "Alice", "balance": 42500.75}
+{"user": "Alice", "balance": 42500.75, "request_path": "/dashboard"}
 ```
 
-Both upstream calls happen in parallel via `errgroup`.
+Both upstream calls happen in parallel via `errgroup`. The `request_path` field is populated from the incoming HTTP request.
 
 ## CLI Reference
 
@@ -394,3 +467,12 @@ GOEXPERIMENT=jsonv2 go test ./internal/transpiler/ -v
 | `$sum` | `$sum(path)` | `$sum(items.price)` |
 | `$count` | `$count(path)` | `$count(items)` |
 | `$fetch` | `$fetch("provider", "endpoint").path` | `$fetch("user_service", "profile").name` |
+| `$fetch` with config | `$fetch("p", "e", {config}).path` | `$fetch("svc", "ep", {"method": "POST", "headers": {...}}).val` |
+| `$request()` | `$request().category.key` | `$request().headers.Authorization` |
+| Request headers | `$request().headers.Name` | `$request().headers.Authorization` |
+| Request cookies | `$request().cookies.Name` | `$request().cookies.session` |
+| Request query | `$request().query.Name` | `$request().query.page` |
+| Request params | `$request().params.Name` | `$request().params.id` |
+| Request path | `$request().path` | `$request().path` |
+| Request method | `$request().method` | `$request().method` |
+| Request body | `$request().body.path` | `$request().body.user.name` |

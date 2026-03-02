@@ -288,29 +288,71 @@ func (fc *fieldCollector) build() []StructField {
 	return result
 }
 
-// --- Fetch-mode analysis ---
-// Used for expressions like: {"user": $fetch("user_service", "profile").name}
+// --- Fetch-mode / request-context analysis ---
 //
-// The $fetch() function is a custom JSONata convention that declares upstream
-// data dependencies. It is NOT a JSONata variable — it uses function-call syntax
-// so the AST is unambiguous (FunctionCallNode, not VariableNode) and cannot be
-// accidentally shadowed by $name := ... variable assignments.
+// Supports two kinds of custom function calls in JSONata expressions:
+//
+// 1. $fetch("provider", "endpoint") — declares an upstream data dependency.
+//    Optional 3rd arg is a config object: {"method": "POST", "headers": {...}, "body": {...}}
+//
+// 2. $request() — reads data from the incoming HTTP request via dot-path navigation:
+//    $request().headers.Authorization, $request().cookies.session,
+//    $request().query.page, $request().params.id,
+//    $request().path, $request().method, $request().body.field
 
 // ProviderPlan is the intermediate representation for expressions that use
-// $fetch() calls. Instead of filtering arrays, these expressions build an output
-// object by pulling values from multiple pre-fetched upstream responses.
+// $fetch() calls and/or request functions.
 type ProviderPlan struct {
-	FuncName string             // e.g. "TransformDashboard"
-	Fields   []ProviderField    // output fields in order
-	Deps     []ProviderDepEntry // unique provider+endpoint pairs needed
+	FuncName     string             // e.g. "TransformDashboard"
+	Fields       []ProviderField    // output fields in order
+	Deps         []ProviderDepEntry // unique provider+endpoint pairs needed
+	NeedsRequest bool               // true if any field or fetch config uses request functions
 }
 
-// ProviderField describes one key in the output JSON object.
+// ProviderField describes one key in the output JSON object. Kind determines
+// which group of fields is populated — readers only need to look at Kind and
+// the corresponding group.
 type ProviderField struct {
-	OutputKey string   // JSON key in the output (e.g. "user")
-	Provider  string   // upstream provider name (e.g. "user_service")
-	Endpoint  string   // endpoint on that provider (e.g. "profile")
-	JSONPath  []string // remaining path segments to extract (e.g. ["name"])
+	OutputKey string
+	Kind      string // "fetch", "header", "cookie", "query", "param", "path", "method", "body", "static"
+
+	// Kind="fetch": value comes from a pre-fetched upstream response.
+	Provider    string
+	Endpoint    string
+	JSONPath    []string
+	FetchConfig *FetchConfig // nil when $fetch() has only 2 args
+
+	// Kind="header"/"cookie"/"query"/"param": value from $request().headers.X etc.
+	Arg string
+
+	// Kind="body": value extracted from $request().body via path navigation.
+	BodyPath []string // empty = entire body
+
+	// Kind="static": a literal string value.
+	StaticValue string
+}
+
+// FetchConfig describes the optional 3rd argument to $fetch() — an object
+// that shapes the outgoing HTTP request to the upstream provider.
+type FetchConfig struct {
+	Method  string        // HTTP method (empty = default GET)
+	Headers []ConfigEntry // custom headers
+	Body    []ConfigEntry // JSON body fields
+}
+
+// ConfigEntry is a key-value pair inside a FetchConfig.
+type ConfigEntry struct {
+	Key   string
+	Value ConfigValue
+}
+
+// ConfigValue is a simple expression used inside a FetchConfig. It's either
+// a static string or a $request() path (e.g. $request().headers.Authorization).
+type ConfigValue struct {
+	Kind   string   // "static", "header", "cookie", "query", "param", "path", "method", "body"
+	Arg    string   // for header/cookie/query/param: the key name from the path
+	Path   []string // for body: path segments after $request().body
+	Static string   // for static: the literal value
 }
 
 // ProviderDepEntry is a unique provider+endpoint pair.
@@ -319,13 +361,22 @@ type ProviderDepEntry struct {
 	Endpoint string
 }
 
-// AnalyzeFetchCalls walks a JSONata AST that uses $fetch() calls and produces a
-// ProviderPlan. It expects an ObjectNode at the root (or inside a PathNode
-// wrapper) where each value is a path starting with $fetch("provider", "endpoint").
+// AnalyzeFetchCalls walks a JSONata AST that uses $fetch() and/or $request()
+// calls, producing a ProviderPlan. It expects an ObjectNode at the root
+// where each value is one of:
+//   - $fetch("provider", "endpoint").path             → Kind="fetch"
+//   - $fetch("provider", "endpoint", {config}).path   → Kind="fetch" + FetchConfig
+//   - $request().headers.Name                         → Kind="header"
+//   - $request().cookies.Name                         → Kind="cookie"
+//   - $request().query.Name                           → Kind="query"
+//   - $request().params.Name                          → Kind="param"
+//   - $request().path                                 → Kind="path"
+//   - $request().method                               → Kind="method"
+//   - $request().body.field                            → Kind="body"
 func AnalyzeFetchCalls(root jparse.Node, funcName string) (*ProviderPlan, error) {
 	obj := unwrapObject(root)
 	if obj == nil {
-		return nil, fmt.Errorf("$fetch expression must be an object literal, got %T", root)
+		return nil, fmt.Errorf("expression must be an object literal, got %T", root)
 	}
 
 	plan := &ProviderPlan{FuncName: funcName}
@@ -337,29 +388,40 @@ func AnalyzeFetchCalls(root jparse.Node, funcName string) (*ProviderPlan, error)
 			return nil, fmt.Errorf("object key: %w", err)
 		}
 
-		field, err := extractFetchCall(pair[1])
+		field, err := analyzeValueNode(pair[1])
 		if err != nil {
 			return nil, fmt.Errorf("field %q: %w", keyName, err)
 		}
 		field.OutputKey = keyName
 
+		// Track whether request context is needed.
+		if field.Kind != "fetch" && field.Kind != "static" {
+			plan.NeedsRequest = true
+		}
+		if field.FetchConfig != nil && fetchConfigNeedsRequest(field.FetchConfig) {
+			plan.NeedsRequest = true
+		}
+
 		plan.Fields = append(plan.Fields, field)
 
-		depKey := field.Provider + "." + field.Endpoint
-		if !seen[depKey] {
-			seen[depKey] = true
-			plan.Deps = append(plan.Deps, ProviderDepEntry{
-				Provider: field.Provider,
-				Endpoint: field.Endpoint,
-			})
+		// Register unique fetch deps.
+		if field.Kind == "fetch" {
+			depKey := field.Provider + "." + field.Endpoint
+			if !seen[depKey] {
+				seen[depKey] = true
+				plan.Deps = append(plan.Deps, ProviderDepEntry{
+					Provider: field.Provider,
+					Endpoint: field.Endpoint,
+				})
+			}
 		}
 	}
 
 	return plan, nil
 }
 
-// HasFetchCalls returns true if the AST contains $fetch() function calls.
-// Used by the transpiler to auto-detect which codegen path to take.
+// HasFetchCalls returns true if the AST contains $fetch() or $request() calls.
+// Used to auto-detect which codegen path the transpiler should take.
 func HasFetchCalls(root jparse.Node) bool {
 	switch n := root.(type) {
 	case *jparse.PathNode:
@@ -375,8 +437,10 @@ func HasFetchCalls(root jparse.Node) bool {
 			}
 		}
 	case *jparse.FunctionCallNode:
-		if v, ok := n.Func.(*jparse.VariableNode); ok && v.Name == "fetch" {
-			return true
+		if v, ok := n.Func.(*jparse.VariableNode); ok {
+			if v.Name == "fetch" || v.Name == "request" {
+				return true
+			}
 		}
 	}
 	return false
@@ -396,14 +460,23 @@ func unwrapObject(root jparse.Node) *jparse.ObjectNode {
 	return nil
 }
 
-// extractFetchCall parses a value node that should be a $fetch() call,
-// optionally followed by path segments for JSON extraction.
-//
-// AST shape: PathNode → [FunctionCallNode($fetch, "svc", "ep"), NameNode("field"), ...]
-func extractFetchCall(node jparse.Node) (ProviderField, error) {
+// analyzeValueNode determines the kind of a value expression and extracts its
+// metadata. It handles $fetch(), request functions, and string literals.
+func analyzeValueNode(node jparse.Node) (ProviderField, error) {
+	// A bare FunctionCallNode (no path after it) — e.g. $path() or $method().
+	if fnCall, ok := node.(*jparse.FunctionCallNode); ok {
+		return analyzeFunctionCall(fnCall, nil)
+	}
+
+	// A StringNode — static literal value.
+	if str, ok := node.(*jparse.StringNode); ok {
+		return ProviderField{Kind: "static", StaticValue: str.Value}, nil
+	}
+
+	// A PathNode — could be $fetch(...).field, $body().field, $header("X"), etc.
 	path, ok := node.(*jparse.PathNode)
 	if !ok {
-		return ProviderField{}, fmt.Errorf("expected a path expression, got %T", node)
+		return ProviderField{}, fmt.Errorf("unsupported value expression %T", node)
 	}
 	if len(path.Steps) < 1 {
 		return ProviderField{}, fmt.Errorf("empty path")
@@ -411,16 +484,90 @@ func extractFetchCall(node jparse.Node) (ProviderField, error) {
 
 	fnCall, ok := path.Steps[0].(*jparse.FunctionCallNode)
 	if !ok {
-		return ProviderField{}, fmt.Errorf("expected $fetch() call, got %T", path.Steps[0])
+		return ProviderField{}, fmt.Errorf("expected a function call at start of path, got %T", path.Steps[0])
 	}
 
+	// Collect trailing path segments (NameNodes after the function call).
+	var trailingPath []string
+	for _, step := range path.Steps[1:] {
+		name, ok := step.(*jparse.NameNode)
+		if !ok {
+			return ProviderField{}, fmt.Errorf("expected name in path after function call, got %T", step)
+		}
+		trailingPath = append(trailingPath, name.Value)
+	}
+
+	return analyzeFunctionCall(fnCall, trailingPath)
+}
+
+// analyzeFunctionCall parses a FunctionCallNode and its trailing path segments
+// into a ProviderField. It handles $fetch() and $request().
+func analyzeFunctionCall(fnCall *jparse.FunctionCallNode, trailingPath []string) (ProviderField, error) {
 	fnVar, ok := fnCall.Func.(*jparse.VariableNode)
-	if !ok || fnVar.Name != "fetch" {
-		return ProviderField{}, fmt.Errorf("expected $fetch, got $%v", fnCall.Func)
+	if !ok {
+		return ProviderField{}, fmt.Errorf("expected a named function, got %T", fnCall.Func)
 	}
 
-	if len(fnCall.Args) != 2 {
-		return ProviderField{}, fmt.Errorf("$fetch() requires exactly 2 arguments (provider, endpoint), got %d", len(fnCall.Args))
+	switch fnVar.Name {
+	case "fetch":
+		return analyzeFetchFn(fnCall, trailingPath)
+
+	case "request":
+		if len(fnCall.Args) != 0 {
+			return ProviderField{}, fmt.Errorf("$request() takes no arguments, got %d", len(fnCall.Args))
+		}
+		return analyzeRequestPath(trailingPath)
+
+	default:
+		return ProviderField{}, fmt.Errorf("unsupported function $%s", fnVar.Name)
+	}
+}
+
+// analyzeRequestPath maps $request() trailing path segments to a ProviderField.
+// e.g. ["headers", "Authorization"] → Kind="header", Arg="Authorization"
+//      ["path"]                     → Kind="path"
+//      ["body", "user", "name"]     → Kind="body", BodyPath=["user","name"]
+func analyzeRequestPath(path []string) (ProviderField, error) {
+	if len(path) == 0 {
+		return ProviderField{}, fmt.Errorf("$request() requires a category (e.g. $request().headers.Name)")
+	}
+
+	category := path[0]
+
+	switch category {
+	case "headers", "cookies", "query", "params":
+		if len(path) < 2 {
+			return ProviderField{}, fmt.Errorf("$request().%s requires a key name (e.g. $request().%s.Name)", category, category)
+		}
+		kind := categoryToKind[category]
+		return ProviderField{Kind: kind, Arg: path[1]}, nil
+
+	case "path":
+		return ProviderField{Kind: "path"}, nil
+
+	case "method":
+		return ProviderField{Kind: "method"}, nil
+
+	case "body":
+		return ProviderField{Kind: "body", BodyPath: path[1:]}, nil
+
+	default:
+		return ProviderField{}, fmt.Errorf("$request().%s is not a valid category (use headers/cookies/query/params/path/method/body)", category)
+	}
+}
+
+// categoryToKind maps $request() path segments to internal Kind values.
+var categoryToKind = map[string]string{
+	"headers": "header",
+	"cookies": "cookie",
+	"query":   "query",
+	"params":  "param",
+}
+
+// analyzeFetchFn parses a $fetch() call with 2 or 3 arguments.
+func analyzeFetchFn(fnCall *jparse.FunctionCallNode, trailingPath []string) (ProviderField, error) {
+	if len(fnCall.Args) < 2 || len(fnCall.Args) > 3 {
+		return ProviderField{}, fmt.Errorf("$fetch() requires 2 or 3 arguments, got %d", len(fnCall.Args))
 	}
 
 	providerArg, ok := fnCall.Args[0].(*jparse.StringNode)
@@ -432,21 +579,188 @@ func extractFetchCall(node jparse.Node) (ProviderField, error) {
 		return ProviderField{}, fmt.Errorf("$fetch() second argument must be a string literal, got %T", fnCall.Args[1])
 	}
 
-	// Remaining path steps after $fetch() are the JSON path to extract.
-	var jsonPath []string
-	for _, step := range path.Steps[1:] {
-		name, ok := step.(*jparse.NameNode)
-		if !ok {
-			return ProviderField{}, fmt.Errorf("expected name in path after $fetch(), got %T", step)
-		}
-		jsonPath = append(jsonPath, name.Value)
-	}
-
-	return ProviderField{
+	field := ProviderField{
+		Kind:     "fetch",
 		Provider: providerArg.Value,
 		Endpoint: endpointArg.Value,
-		JSONPath: jsonPath,
-	}, nil
+		JSONPath: trailingPath,
+	}
+
+	// Optional 3rd arg: request config object.
+	if len(fnCall.Args) == 3 {
+		cfg, err := analyzeFetchConfig(fnCall.Args[2])
+		if err != nil {
+			return ProviderField{}, fmt.Errorf("$fetch() config: %w", err)
+		}
+		field.FetchConfig = cfg
+	}
+
+	return field, nil
+}
+
+// analyzeFetchConfig parses the 3rd argument of $fetch() — an ObjectNode with
+// optional "method", "headers", and "body" keys.
+func analyzeFetchConfig(node jparse.Node) (*FetchConfig, error) {
+	obj := unwrapObject(node)
+	if obj == nil {
+		return nil, fmt.Errorf("expected an object literal, got %T", node)
+	}
+
+	cfg := &FetchConfig{}
+
+	for _, pair := range obj.Pairs {
+		key, err := extractSingleName(pair[0])
+		if err != nil {
+			return nil, fmt.Errorf("config key: %w", err)
+		}
+
+		switch key {
+		case "method":
+			str, ok := pair[1].(*jparse.StringNode)
+			if !ok {
+				return nil, fmt.Errorf("\"method\" must be a string literal, got %T", pair[1])
+			}
+			cfg.Method = str.Value
+
+		case "headers":
+			entries, err := analyzeConfigObject(pair[1], "headers")
+			if err != nil {
+				return nil, err
+			}
+			cfg.Headers = entries
+
+		case "body":
+			entries, err := analyzeConfigObject(pair[1], "body")
+			if err != nil {
+				return nil, err
+			}
+			cfg.Body = entries
+
+		default:
+			return nil, fmt.Errorf("unknown config key %q (expected method/headers/body)", key)
+		}
+	}
+
+	return cfg, nil
+}
+
+// analyzeConfigObject parses an object whose values are either string literals
+// or $request() path expressions (e.g. $request().headers.Authorization).
+func analyzeConfigObject(node jparse.Node, label string) ([]ConfigEntry, error) {
+	obj := unwrapObject(node)
+	if obj == nil {
+		return nil, fmt.Errorf("%q must be an object literal, got %T", label, node)
+	}
+
+	var entries []ConfigEntry
+	for _, pair := range obj.Pairs {
+		key, err := extractSingleName(pair[0])
+		if err != nil {
+			return nil, fmt.Errorf("%s key: %w", label, err)
+		}
+
+		val, err := analyzeConfigValue(pair[1])
+		if err != nil {
+			return nil, fmt.Errorf("%s[%q]: %w", label, key, err)
+		}
+
+		entries = append(entries, ConfigEntry{Key: key, Value: val})
+	}
+	return entries, nil
+}
+
+// analyzeConfigValue parses a single value inside a fetch config — either a
+// static string or a $request() path expression.
+func analyzeConfigValue(node jparse.Node) (ConfigValue, error) {
+	// Static string literal.
+	if str, ok := node.(*jparse.StringNode); ok {
+		return ConfigValue{Kind: "static", Static: str.Value}, nil
+	}
+
+	// Bare function call: $path(), $method(), $header("X"), etc.
+	if fnCall, ok := node.(*jparse.FunctionCallNode); ok {
+		return analyzeConfigFuncCall(fnCall, nil)
+	}
+
+	// Path starting with function call: $body().field
+	if path, ok := node.(*jparse.PathNode); ok && len(path.Steps) >= 1 {
+		if fnCall, ok := path.Steps[0].(*jparse.FunctionCallNode); ok {
+			var trailing []string
+			for _, step := range path.Steps[1:] {
+				name, ok := step.(*jparse.NameNode)
+				if !ok {
+					return ConfigValue{}, fmt.Errorf("expected name in path, got %T", step)
+				}
+				trailing = append(trailing, name.Value)
+			}
+			return analyzeConfigFuncCall(fnCall, trailing)
+		}
+	}
+
+	return ConfigValue{}, fmt.Errorf("expected a string literal or request function, got %T", node)
+}
+
+func analyzeConfigFuncCall(fnCall *jparse.FunctionCallNode, trailing []string) (ConfigValue, error) {
+	fnVar, ok := fnCall.Func.(*jparse.VariableNode)
+	if !ok {
+		return ConfigValue{}, fmt.Errorf("expected a named function, got %T", fnCall.Func)
+	}
+
+	if fnVar.Name != "request" {
+		return ConfigValue{}, fmt.Errorf("unsupported function $%s in config (use $request())", fnVar.Name)
+	}
+
+	if len(fnCall.Args) != 0 {
+		return ConfigValue{}, fmt.Errorf("$request() takes no arguments, got %d", len(fnCall.Args))
+	}
+
+	return analyzeConfigRequestPath(trailing)
+}
+
+// analyzeConfigRequestPath maps $request() trailing path segments to a ConfigValue.
+func analyzeConfigRequestPath(path []string) (ConfigValue, error) {
+	if len(path) == 0 {
+		return ConfigValue{}, fmt.Errorf("$request() requires a category in config context")
+	}
+
+	category := path[0]
+
+	switch category {
+	case "headers", "cookies", "query", "params":
+		if len(path) < 2 {
+			return ConfigValue{}, fmt.Errorf("$request().%s requires a key name", category)
+		}
+		kind := categoryToKind[category]
+		return ConfigValue{Kind: kind, Arg: path[1]}, nil
+
+	case "path":
+		return ConfigValue{Kind: "path"}, nil
+
+	case "method":
+		return ConfigValue{Kind: "method"}, nil
+
+	case "body":
+		return ConfigValue{Kind: "body", Path: path[1:]}, nil
+
+	default:
+		return ConfigValue{}, fmt.Errorf("$request().%s is not a valid category in config", category)
+	}
+}
+
+// fetchConfigNeedsRequest returns true if any value in the config references
+// request data (anything other than "static").
+func fetchConfigNeedsRequest(cfg *FetchConfig) bool {
+	for _, e := range cfg.Headers {
+		if e.Value.Kind != "static" {
+			return true
+		}
+	}
+	for _, e := range cfg.Body {
+		if e.Value.Kind != "static" {
+			return true
+		}
+	}
+	return false
 }
 
 // --- Helpers ---

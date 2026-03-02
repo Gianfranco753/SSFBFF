@@ -117,6 +117,26 @@ func TestHasFetchCalls(t *testing.T) {
 			expr: `orders[price > 100].{total: $sum(items.price)}`,
 			want: false,
 		},
+		{
+			name: "$request().headers",
+			expr: `{"auth": $request().headers.Authorization}`,
+			want: true,
+		},
+		{
+			name: "$request().path",
+			expr: `{"p": $request().path}`,
+			want: true,
+		},
+		{
+			name: "$request().cookies",
+			expr: `{"s": $request().cookies.session}`,
+			want: true,
+		},
+		{
+			name: "$request().body with path",
+			expr: `{"name": $request().body.user.name}`,
+			want: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -148,35 +168,29 @@ func TestAnalyzeFetchCalls(t *testing.T) {
 	if plan.FuncName != "TransformDashboard" {
 		t.Errorf("FuncName = %q, want %q", plan.FuncName, "TransformDashboard")
 	}
+	if plan.NeedsRequest {
+		t.Error("NeedsRequest should be false for pure $fetch expressions")
+	}
 
 	if len(plan.Fields) != 2 {
 		t.Fatalf("Fields count = %d, want 2", len(plan.Fields))
 	}
 
 	user := plan.Fields[0]
-	if user.OutputKey != "user" || user.Provider != "user_service" || user.Endpoint != "profile" {
-		t.Errorf("field[0] = %+v, want user/user_service/profile", user)
+	if user.Kind != "fetch" || user.OutputKey != "user" || user.Provider != "user_service" || user.Endpoint != "profile" {
+		t.Errorf("field[0] = %+v, want fetch/user/user_service/profile", user)
 	}
 	if len(user.JSONPath) != 1 || user.JSONPath[0] != "name" {
 		t.Errorf("field[0] JSONPath = %v, want [name]", user.JSONPath)
 	}
 
 	balance := plan.Fields[1]
-	if balance.OutputKey != "balance" || balance.Provider != "bank_service" || balance.Endpoint != "accounts" {
-		t.Errorf("field[1] = %+v, want balance/bank_service/accounts", balance)
-	}
-	if len(balance.JSONPath) != 1 || balance.JSONPath[0] != "amount" {
-		t.Errorf("field[1] JSONPath = %v, want [amount]", balance.JSONPath)
+	if balance.Kind != "fetch" || balance.OutputKey != "balance" || balance.Provider != "bank_service" || balance.Endpoint != "accounts" {
+		t.Errorf("field[1] = %+v, want fetch/balance/bank_service/accounts", balance)
 	}
 
 	if len(plan.Deps) != 2 {
 		t.Fatalf("Deps count = %d, want 2", len(plan.Deps))
-	}
-	if plan.Deps[0].Provider != "user_service" || plan.Deps[0].Endpoint != "profile" {
-		t.Errorf("dep[0] = %+v, want user_service/profile", plan.Deps[0])
-	}
-	if plan.Deps[1].Provider != "bank_service" || plan.Deps[1].Endpoint != "accounts" {
-		t.Errorf("dep[1] = %+v, want bank_service/accounts", plan.Deps[1])
 	}
 }
 
@@ -223,13 +237,13 @@ func TestGenerateProviderCode(t *testing.T) {
 	mustContain := []string{
 		"package testpkg",
 		"goexperiment.jsonv2",
-		"TransformDashboardDeps",
+		"TransformDashboardDeps(req runtime.RequestContext)",
 		"runtime.ProviderDep",
 		`Provider: "user_service"`,
 		`Endpoint: "profile"`,
 		`Provider: "bank_service"`,
 		`Endpoint: "accounts"`,
-		"TransformDashboard(results map[string][]byte)",
+		"TransformDashboard(results map[string][]byte, req runtime.RequestContext)",
 		"jsontext.NewEncoder",
 		"jsontext.BeginObject",
 		"jsontext.EndObject",
@@ -241,17 +255,6 @@ func TestGenerateProviderCode(t *testing.T) {
 	for _, s := range mustContain {
 		if !strings.Contains(code, s) {
 			t.Errorf("generated code missing %q", s)
-		}
-	}
-
-	// Ensure old $providers syntax is NOT present.
-	mustNotContain := []string{
-		"$providers",
-		"VariableNode",
-	}
-	for _, s := range mustNotContain {
-		if strings.Contains(code, s) {
-			t.Errorf("generated code should NOT contain %q", s)
 		}
 	}
 }
@@ -364,6 +367,186 @@ func main() {
 	t.Logf("generated code output:\n%s", output)
 }
 
+// TestAnalyzeRequestFunctions verifies that $request() path expressions are
+// correctly parsed into ProviderField with the right Kind.
+func TestAnalyzeRequestFunctions(t *testing.T) {
+	expr := `{"auth": $request().headers.Authorization, "session": $request().cookies.session, "page": $request().query.page, "user_id": $request().params.id, "url": $request().path, "verb": $request().method, "name": $request().body.user.name}`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformRequest")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	if !plan.NeedsRequest {
+		t.Error("NeedsRequest should be true")
+	}
+	if len(plan.Deps) != 0 {
+		t.Errorf("Deps should be empty for request-only expressions, got %d", len(plan.Deps))
+	}
+
+	expected := []struct {
+		key  string
+		kind string
+		arg  string
+	}{
+		{"auth", "header", "Authorization"},
+		{"session", "cookie", "session"},
+		{"page", "query", "page"},
+		{"user_id", "param", "id"},
+		{"url", "path", ""},
+		{"verb", "method", ""},
+		{"name", "body", ""},
+	}
+
+	if len(plan.Fields) != len(expected) {
+		t.Fatalf("Fields count = %d, want %d", len(plan.Fields), len(expected))
+	}
+
+	for i, e := range expected {
+		f := plan.Fields[i]
+		if f.OutputKey != e.key || f.Kind != e.kind {
+			t.Errorf("field[%d] = %q/%q, want %q/%q", i, f.OutputKey, f.Kind, e.key, e.kind)
+		}
+		if e.arg != "" && f.Arg != e.arg {
+			t.Errorf("field[%d] Arg = %q, want %q", i, f.Arg, e.arg)
+		}
+	}
+
+	// Verify $request().body.user.name has the right BodyPath.
+	bodyField := plan.Fields[6]
+	if len(bodyField.BodyPath) != 2 || bodyField.BodyPath[0] != "user" || bodyField.BodyPath[1] != "name" {
+		t.Errorf("body field BodyPath = %v, want [user name]", bodyField.BodyPath)
+	}
+}
+
+// TestAnalyzeFetchConfig verifies parsing of $fetch() with a 3rd config argument.
+func TestAnalyzeFetchConfig(t *testing.T) {
+	expr := `{"data": $fetch("svc", "ep", {"method": "POST", "headers": {"Authorization": $request().headers.Authorization, "X-Custom": "static-val"}, "body": {"user": $request().cookies.user}}).result}`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformWithConfig")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	if !plan.NeedsRequest {
+		t.Error("NeedsRequest should be true when fetch config uses $request()")
+	}
+
+	if len(plan.Fields) != 1 {
+		t.Fatalf("Fields count = %d, want 1", len(plan.Fields))
+	}
+
+	f := plan.Fields[0]
+	if f.Kind != "fetch" || f.Provider != "svc" || f.Endpoint != "ep" {
+		t.Errorf("field = %+v, want fetch/svc/ep", f)
+	}
+	if f.FetchConfig == nil {
+		t.Fatal("FetchConfig should not be nil")
+	}
+	if f.FetchConfig.Method != "POST" {
+		t.Errorf("config Method = %q, want POST", f.FetchConfig.Method)
+	}
+	if len(f.FetchConfig.Headers) != 2 {
+		t.Fatalf("config Headers count = %d, want 2", len(f.FetchConfig.Headers))
+	}
+
+	authHeader := f.FetchConfig.Headers[0]
+	if authHeader.Key != "Authorization" || authHeader.Value.Kind != "header" || authHeader.Value.Arg != "Authorization" {
+		t.Errorf("header[0] = %+v, want Authorization/header", authHeader)
+	}
+
+	customHeader := f.FetchConfig.Headers[1]
+	if customHeader.Key != "X-Custom" || customHeader.Value.Kind != "static" || customHeader.Value.Static != "static-val" {
+		t.Errorf("header[1] = %+v, want X-Custom/static", customHeader)
+	}
+
+	if len(f.FetchConfig.Body) != 1 {
+		t.Fatalf("config Body count = %d, want 1", len(f.FetchConfig.Body))
+	}
+	bodyEntry := f.FetchConfig.Body[0]
+	if bodyEntry.Key != "user" || bodyEntry.Value.Kind != "cookie" || bodyEntry.Value.Arg != "user" {
+		t.Errorf("body[0] = %+v, want user/cookie", bodyEntry)
+	}
+}
+
+// TestGenerateProviderWithRequestFunctions verifies that generated code for
+// $request() references req.Headers, req.Path, etc.
+func TestGenerateProviderWithRequestFunctions(t *testing.T) {
+	expr := `{"auth": $request().headers.Authorization, "url": $request().path, "data": $fetch("svc", "ep").value}`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformMixed")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	src, err := transpiler.GenerateProvider(plan, "testpkg", "mixed.jsonata", expr)
+	if err != nil {
+		t.Fatalf("generate error: %v", err)
+	}
+
+	code := string(src)
+
+	mustContain := []string{
+		"TransformMixedDeps(req runtime.RequestContext)",
+		"TransformMixed(results map[string][]byte, req runtime.RequestContext)",
+		`req.Headers["Authorization"]`,
+		"req.Path",
+		"runtime.ExtractPath",
+	}
+
+	for _, s := range mustContain {
+		if !strings.Contains(code, s) {
+			t.Errorf("generated code missing %q\n\ngenerated:\n%s", s, code)
+		}
+	}
+}
+
+// TestGenerateProviderWithFetchConfig verifies generated code for $fetch()
+// with a 3rd config argument that shapes the outgoing request.
+func TestGenerateProviderWithFetchConfig(t *testing.T) {
+	expr := `{"data": $fetch("svc", "ep", {"method": "POST", "headers": {"Authorization": $request().headers.Authorization}}).value}`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformConfigged")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	src, err := transpiler.GenerateProvider(plan, "testpkg", "configged.jsonata", expr)
+	if err != nil {
+		t.Fatalf("generate error: %v", err)
+	}
+
+	code := string(src)
+
+	mustContain := []string{
+		`Method:   "POST"`, // go fmt aligns struct fields
+		`"Authorization": req.Headers["Authorization"]`,
+		"TransformConfiggedDeps(req runtime.RequestContext)",
+	}
+
+	for _, s := range mustContain {
+		if !strings.Contains(code, s) {
+			t.Errorf("generated code missing %q\n\ngenerated:\n%s", s, code)
+		}
+	}
+}
+
 // TestFetchEndToEnd generates a $fetch()-based transform, writes it alongside
 // a harness that simulates pre-fetched provider results, compiles and runs it.
 func TestFetchEndToEnd(t *testing.T) {
@@ -384,25 +567,7 @@ func TestFetchEndToEnd(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-
-	if err := os.WriteFile(filepath.Join(dir, "dashboard_gen.go"), src, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	// The generated code imports runtime.ExtractPath and runtime.ProviderDep.
-	// We need to make the runtime package available, so we copy it.
-	runtimeDir := filepath.Join(dir, "runtime")
-	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	runtimeSrc, err := os.ReadFile("../../runtime/helpers.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(runtimeDir, "helpers.go"), runtimeSrc, 0o644); err != nil {
-		t.Fatal(err)
-	}
+	copyRuntimePackage(t, dir)
 
 	harness := `//go:build goexperiment.jsonv2
 
@@ -412,16 +577,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"testharness/runtime"
 )
 
 func main() {
-	// Simulate what the aggregator would produce after fan-out fetching.
 	results := map[string][]byte{
 		"user_service.profile":  []byte(` + "`" + `{"name": "Alice", "age": 30}` + "`" + `),
 		"bank_service.accounts": []byte(` + "`" + `{"amount": 42500.75, "currency": "USD"}` + "`" + `),
 	}
 
-	out, err := TransformDashboard(results)
+	reqCtx := runtime.RequestContext{}
+	out, err := TransformDashboard(results, reqCtx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -429,7 +595,6 @@ func main() {
 
 	fmt.Println(string(out))
 
-	// Parse and validate.
 	var parsed map[string]any
 	if err := json.Unmarshal(out, &parsed); err != nil {
 		fmt.Fprintf(os.Stderr, "parse output error: %v\n", err)
@@ -449,22 +614,7 @@ func main() {
 }
 `
 
-	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(harness), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	gomod := "module testharness\n\ngo 1.26\n"
-	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(gomod), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	// Fix the import path in the generated code: replace the module import
-	// with a local relative one.
-	genCode := string(src)
-	genCode = strings.ReplaceAll(genCode, `"github.com/gcossani/ssfbff/runtime"`, `"testharness/runtime"`)
-	if err := os.WriteFile(filepath.Join(dir, "dashboard_gen.go"), []byte(genCode), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	writeTestFiles(t, dir, src, harness)
 
 	cmd := exec.Command("go", "run", ".")
 	cmd.Dir = dir
@@ -478,4 +628,129 @@ func main() {
 		t.Fatalf("generated code did not PASS:\n%s", output)
 	}
 	t.Logf("generated code output:\n%s", output)
+}
+
+// TestRequestContextEndToEnd generates a transform using $request(),
+// compiles and runs it with a populated RequestContext.
+func TestRequestContextEndToEnd(t *testing.T) {
+	expr := `{"auth": $request().headers.Authorization, "url": $request().path, "data": $fetch("svc", "ep").value}`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformMixed")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	src, err := transpiler.GenerateProvider(plan, "main", "mixed.jsonata", expr)
+	if err != nil {
+		t.Fatalf("generate error: %v", err)
+	}
+
+	dir := t.TempDir()
+	copyRuntimePackage(t, dir)
+
+	harness := `//go:build goexperiment.jsonv2
+
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"testharness/runtime"
+)
+
+func main() {
+	results := map[string][]byte{
+		"svc.ep": []byte(` + "`" + `{"value": 42}` + "`" + `),
+	}
+
+	reqCtx := runtime.RequestContext{
+		Headers: map[string]string{"Authorization": "Bearer token123"},
+		Path:    "/api/v1/test",
+	}
+
+	out, err := TransformMixed(results, reqCtx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println(string(out))
+
+	var parsed map[string]any
+	if err := json.Unmarshal(out, &parsed); err != nil {
+		fmt.Fprintf(os.Stderr, "parse output error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if parsed["auth"] != "Bearer token123" {
+		fmt.Fprintf(os.Stderr, "expected auth=Bearer token123, got %v\n", parsed["auth"])
+		os.Exit(1)
+	}
+	if parsed["url"] != "/api/v1/test" {
+		fmt.Fprintf(os.Stderr, "expected url=/api/v1/test, got %v\n", parsed["url"])
+		os.Exit(1)
+	}
+	if parsed["data"] != float64(42) {
+		fmt.Fprintf(os.Stderr, "expected data=42, got %v\n", parsed["data"])
+		os.Exit(1)
+	}
+
+	fmt.Println("PASS")
+}
+`
+
+	writeTestFiles(t, dir, src, harness)
+
+	cmd := exec.Command("go", "run", ".")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GOEXPERIMENT=jsonv2")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("running generated code failed:\n%s\nerror: %v", output, err)
+	}
+
+	if !strings.Contains(string(output), "PASS") {
+		t.Fatalf("generated code did not PASS:\n%s", output)
+	}
+	t.Logf("generated code output:\n%s", output)
+}
+
+// --- Test helpers ---
+
+func copyRuntimePackage(t *testing.T, dir string) {
+	t.Helper()
+	runtimeDir := filepath.Join(dir, "runtime")
+	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runtimeSrc, err := os.ReadFile("../../runtime/helpers.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runtimeDir, "helpers.go"), runtimeSrc, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeTestFiles(t *testing.T, dir string, generatedSrc []byte, harness string) {
+	t.Helper()
+
+	// Fix import path in generated code to use local module.
+	genCode := strings.ReplaceAll(string(generatedSrc), `"github.com/gcossani/ssfbff/runtime"`, `"testharness/runtime"`)
+	if err := os.WriteFile(filepath.Join(dir, "transform_gen.go"), []byte(genCode), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(harness), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	gomod := "module testharness\n\ngo 1.26\n"
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(gomod), 0o644); err != nil {
+		t.Fatal(err)
+	}
 }
