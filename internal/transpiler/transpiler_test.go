@@ -37,24 +37,28 @@ func TestAnalyzeOrdersExpression(t *testing.T) {
 	if len(plan.Filters) != 1 {
 		t.Fatalf("Filters count = %d, want 1", len(plan.Filters))
 	}
-	if plan.Filters[0].Op != ">" {
-		t.Errorf("Filter op = %q, want %q", plan.Filters[0].Op, ">")
+	f := plan.Filters[0]
+	if f.Kind != "binary" || f.Op != ">" {
+		t.Errorf("Filter: Kind=%q Op=%q, want binary/>", f.Kind, f.Op)
 	}
-	if plan.Filters[0].Literal != "100" {
-		t.Errorf("Filter literal = %q, want %q", plan.Filters[0].Literal, "100")
+	if f.Left == nil || f.Left.Kind != "field" || f.Left.FieldName != "Price" {
+		t.Errorf("Filter LHS: expected field Price, got %+v", f.Left)
+	}
+	if f.Right == nil || f.Right.Kind != "literal" || f.Right.LiteralValue != "100" {
+		t.Errorf("Filter RHS: expected literal 100, got %+v", f.Right)
 	}
 	if len(plan.OutputFields) != 2 {
 		t.Fatalf("OutputFields count = %d, want 2", len(plan.OutputFields))
 	}
 
 	idField := plan.OutputFields[0]
-	if idField.GoName != "ID" || idField.SourceField != "OrderID" {
-		t.Errorf("output[0]: GoName=%q SourceField=%q, want ID/OrderID", idField.GoName, idField.SourceField)
+	if idField.GoName != "ID" || idField.Value == nil || idField.Value.Kind != "field" || idField.Value.FieldName != "OrderID" {
+		t.Errorf("output[0]: GoName=%q Value=%+v, want ID with field OrderID", idField.GoName, idField.Value)
 	}
 
 	totalField := plan.OutputFields[1]
-	if totalField.GoName != "Total" || totalField.AggregateFunc != "sum" {
-		t.Errorf("output[1]: GoName=%q AggFunc=%q, want Total/sum", totalField.GoName, totalField.AggregateFunc)
+	if totalField.GoName != "Total" || totalField.Value == nil || totalField.Value.Kind != "funcCall" || totalField.Value.FuncName != "sum" {
+		t.Errorf("output[1]: GoName=%q Value=%+v, want Total with funcCall sum", totalField.GoName, totalField.Value)
 	}
 }
 
@@ -86,7 +90,7 @@ func TestGenerateOrdersCode(t *testing.T) {
 		"OrdersResult",
 		`json:"order_id"`,
 		"elem.Price > 100",
-		"totalAgg += v.Price",
+		"agg1 += v.Price",
 	}
 
 	for _, s := range mustContain {

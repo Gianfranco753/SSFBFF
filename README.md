@@ -294,17 +294,150 @@ docker run -p 3000:3000 \
 
 The build copies `data/` into the build stage, runs `go generate` to transpile all JSONata into Go, compiles the binary, then copies only the binary and `data/providers/` into the runtime image. Routes and service logic are compiled into the binary.
 
-## Supported JSONata Subset
+## JSONata Coverage — 61% of spec
+
+**55 of 90** features from the [JSONata specification](https://docs.jsonata.org/) are supported.
+The remaining gaps are mainly higher-order functions, date/time, and advanced path operators.
+
+| Category | Supported | Total | Coverage |
+|---|:---:|:---:|:---:|
+| Path & Navigation | 5 | 11 | 45% |
+| Comparison Operators | 6 | 7 | 86% |
+| Boolean Operators | 2 | 2 | 100% |
+| Arithmetic Operators | 6 | 6 | 100% |
+| Other Operators | 2 | 3 | 67% |
+| Literals | 4 | 6 | 67% |
+| String Functions | 10 | 14 | 71% |
+| Numeric Functions | 5 | 10 | 50% |
+| Aggregation Functions | 5 | 5 | 100% |
+| Boolean Functions | 3 | 3 | 100% |
+| Array Functions | 4 | 6 | 67% |
+| Object Functions | 3 | 5 | 60% |
+| Higher-Order Functions | 0 | 5 | — |
+| Date/Time Functions | 0 | 4 | — |
+| Other | 0 | 3 | — |
+
+<details>
+<summary>Full feature matrix</summary>
+
+### Path & Navigation
+| Feature | Status | Example |
+|---|:---:|---|
+| `.` field access | ✅ | `order_id`, `items.price` |
+| `[predicate]` filter | ✅ | `orders[price > 100]` |
+| `{}` object constructor | ✅ | `{id: order_id}` |
+| `()` grouping | ✅ | `price * (1 - discount)` |
+| `[n]` array index | ❌ | `orders[0]` |
+| `^()` order-by | ❌ | `orders^(price)` |
+| `*` wildcard | ❌ | `address.*` |
+| `**` descendant | ❌ | `**.price` |
+| `~>` chain | ❌ | `$ ~> $sum()` |
+| `:=` binding | ❌ | `$x := 5` |
+| `$` context | ❌ | `$.orders` |
+
+### Operators
+| Feature | Status | Example |
+|---|:---:|---|
+| `=` `!=` `<` `<=` `>` `>=` | ✅ | `price > 100` |
+| `and` `or` | ✅ | `price > 50 and active` |
+| `+` `-` `*` `/` `%` | ✅ | `price * quantity` |
+| Unary `-` | ✅ | `-price` |
+| `&` string concat | ✅ | `first & " " & last` |
+| `? :` conditional | ✅ | `price > 100 ? "high" : "low"` |
+| `in` membership | ❌ | `status in ["active", "pending"]` |
+| `..` range | ❌ | `[1..5]` |
+
+### Literals
+| Feature | Status | Example |
+|---|:---:|---|
+| Numbers | ✅ | `42`, `3.14` |
+| Strings | ✅ | `"hello"` |
+| Booleans | ✅ | `true`, `false` |
+| null | ✅ | `null` |
+| Array literals | ❌ | `[1, 2, 3]` |
+| Regex | ❌ | `/pattern/i` |
+
+### String Functions
+| Feature | Status | Example |
+|---|:---:|---|
+| `$string()` | ✅ | `$string(42)` → `"42"` |
+| `$length()` | ✅ | `$length("hello")` → `5` |
+| `$substring()` | ✅ | `$substring("hello", 0, 3)` → `"hel"` |
+| `$substringBefore()` | ✅ | `$substringBefore("a-b", "-")` → `"a"` |
+| `$substringAfter()` | ✅ | `$substringAfter("a-b", "-")` → `"b"` |
+| `$uppercase()` | ✅ | `$uppercase("hello")` → `"HELLO"` |
+| `$lowercase()` | ✅ | `$lowercase("HELLO")` → `"hello"` |
+| `$trim()` | ✅ | `$trim("  hi  ")` → `"hi"` |
+| `$contains()` | ✅ | `$contains("hello", "ell")` → `true` |
+| `$join()` | ✅ | `$join(tags, ", ")` |
+| `$pad()` | ❌ | `$pad("x", 5, "#")` |
+| `$split()` | ❌ | `$split("a,b", ",")` |
+| `$match()` | ❌ | `$match("abc", /[a-z]/)` |
+| `$replace()` | ❌ | `$replace("hello", "l", "r")` |
+
+### Numeric Functions
+| Feature | Status | Example |
+|---|:---:|---|
+| `$number()` | ✅ | `$number("42")` → `42` |
+| `$abs()` | ✅ | `$abs(-5)` → `5` |
+| `$floor()` | ✅ | `$floor(3.7)` → `3` |
+| `$ceil()` | ✅ | `$ceil(3.2)` → `4` |
+| `$round()` | ✅ | `$round(3.456, 2)` → `3.46` |
+| `$power()` | ❌ | `$power(2, 3)` → `8` |
+| `$sqrt()` | ❌ | `$sqrt(16)` → `4` |
+| `$random()` | ❌ | `$random()` |
+| `$formatNumber()` | ❌ | `$formatNumber(1234.5, "#,###.00")` |
+| `$parseInteger()` | ❌ | `$parseInteger("FF", 16)` |
+
+### Aggregation Functions
+| Feature | Status | Example |
+|---|:---:|---|
+| `$sum()` | ✅ | `$sum(items.price)` |
+| `$count()` | ✅ | `$count(items)` |
+| `$min()` | ✅ | `$min(items.price)` |
+| `$max()` | ✅ | `$max(items.price)` |
+| `$average()` | ✅ | `$average(items.price)` |
+
+### Boolean Functions
+| Feature | Status | Example |
+|---|:---:|---|
+| `$boolean()` | ✅ | `$boolean(0)` → `false` |
+| `$not()` | ✅ | `$not(true)` → `false` |
+| `$exists()` | ✅ | `$exists(field)` |
+
+### Array Functions
+| Feature | Status | Example |
+|---|:---:|---|
+| `$append()` | ✅ | `$append([1,2], [3,4])` |
+| `$sort()` | ✅ | `$sort(items)` |
+| `$reverse()` | ✅ | `$reverse([1,2,3])` |
+| `$distinct()` | ✅ | `$distinct([1,1,2])` |
+| `$shuffle()` | ❌ | `$shuffle([1,2,3])` |
+| `$zip()` | ❌ | `$zip([1,2], [3,4])` |
+
+### Object Functions
+| Feature | Status | Example |
+|---|:---:|---|
+| `$keys()` | ✅ | `$keys({"a":1})` → `["a"]` |
+| `$merge()` | ✅ | `$merge([{"a":1},{"b":2}])` |
+| `$type()` | ✅ | `$type(42)` → `"number"` |
+| `$values()` | ❌ | `$values({"a":1})` → `[1]` |
+| `$spread()` | ❌ | `$spread({"a":1})` |
+
+### Not yet implemented
+| Category | Features |
+|---|---|
+| Higher-Order | `$map()`, `$filter()`, `$reduce()`, `$sift()`, `$each()` |
+| Date/Time | `$now()`, `$millis()`, `$fromMillis()`, `$toMillis()` |
+| Other | Lambda expressions, `$eval()`, `$error()` |
+
+</details>
+
+### BFF Extensions (not part of JSONata spec)
 
 | Feature | Example |
 |---|---|
-| Field access | `order_id`, `items.price` |
-| Array filter | `orders[price > 100]` |
-| Comparisons | `>`, `<`, `=`, `!=`, `>=`, `<=` |
-| Object projection | `{id: order_id, total: $sum(items.price)}` |
-| `$sum(path)` | `$sum(items.price)` |
-| `$count(path)` | `$count(items)` |
-| `$fetch(p, e)` | `$fetch("user_service", "profile").name` |
-| `$fetch(p, e, config)` | `$fetch("svc", "ep", {"method": "POST"}).val` |
-| `$request().path` | `$request().headers.Authorization` |
-| `$service(name)` | `$service("get_user").name` |
+| `$fetch(provider, endpoint)` | `$fetch("user_service", "profile").name` |
+| `$fetch()` with config | `$fetch("svc", "ep", {"method": "POST"}).val` |
+| `$request()` context | `$request().headers.Authorization` |
+| `$service(name)` composition | `$service("get_user").name` |

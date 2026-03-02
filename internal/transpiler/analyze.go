@@ -14,7 +14,7 @@ import (
 type QueryPlan struct {
 	RootField    string        // top-level JSON field to navigate to (e.g., "orders")
 	InputFields  []StructField // fields to deserialize from each array element
-	Filters      []Filter      // conditions applied to each element
+	Filters      []*Expr       // each entry is a predicate expression; all ANDed
 	OutputName   string        // Go type name for output struct
 	OutputFields []OutputField // fields in the output struct
 	FuncName     string        // generated Go function name
@@ -29,25 +29,47 @@ type StructField struct {
 	Children []StructField // nested fields (only when IsArray is true)
 }
 
-// Filter describes a comparison applied to each array element.
-type Filter struct {
-	FieldGoName string // Go struct field name to compare (e.g., "Price")
-	Op          string // Go comparison operator (e.g., ">")
-	Literal     string // Go literal value (e.g., "100")
-}
-
 // OutputField describes a field in the generated output struct.
 type OutputField struct {
 	JSONName string // output JSON name (e.g., "id")
 	GoName   string // exported Go name (e.g., "ID")
 	GoType   string // Go type (e.g., "float64", "any")
+	Value    *Expr  // expression tree that computes this field's value
+}
 
-	// Exactly one of these groups is populated:
-	SourceField string // direct field mapping — Go name of input field (e.g., "OrderID")
+// Expr represents a value expression in the filter-mode pipeline.
+// It is a recursive tree that models field access, literals, function calls,
+// arithmetic, comparisons, boolean logic, string concatenation, and conditionals.
+type Expr struct {
+	Kind   string // "field","arrayField","literal","funcCall","binary","unary","conditional"
+	GoType string // inferred Go type: "float64","string","bool","any"
 
-	AggregateFunc  string // aggregate function name (e.g., "sum")
-	AggregateArray string // Go name of the array field (e.g., "Items")
-	AggregateField string // Go name of the field inside the array element (e.g., "Price")
+	// Kind="field": reference to an input struct field.
+	FieldName string // Go struct field name (e.g., "Price")
+	FieldJSON string // JSON name (e.g., "price")
+
+	// Kind="arrayField": reference to a nested array+child pattern (items.price).
+	ArrayName string // Go name of array field
+	ArrayJSON string // JSON name
+	ChildName string // Go name of child field
+	ChildJSON string // JSON name
+
+	// Kind="literal": a Go literal value.
+	LiteralValue string // e.g. "100", `"active"`, "true", "nil"
+
+	// Kind="funcCall": a function invocation ($sum, $uppercase, …).
+	FuncName string
+	FuncArgs []*Expr
+
+	// Kind="binary"/"unary": operator + operands.
+	Op    string // Go operator: +,-,*,/,%,==,!=,<,<=,>,>=,&&,||,& (concat)
+	Left  *Expr  // binary left / unary operand
+	Right *Expr  // binary right (nil for unary)
+
+	// Kind="conditional": ternary ? : expression.
+	Cond *Expr
+	Then *Expr
+	Else *Expr
 }
 
 // Analyze walks a parsed JSONata AST and produces a QueryPlan.
@@ -82,9 +104,9 @@ func Analyze(root jparse.Node) (*QueryPlan, error) {
 	fields := &fieldCollector{numeric: map[string]bool{}}
 
 	// --- Filters ---
-	var filters []Filter
+	var filters []*Expr
 	for _, f := range pred.Filters {
-		filter, err := analyzeFilter(f, fields)
+		filter, err := analyzeExpr(f, fields)
 		if err != nil {
 			return nil, fmt.Errorf("analyzing filter: %w", err)
 		}
@@ -101,6 +123,15 @@ func Analyze(root jparse.Node) (*QueryPlan, error) {
 		outputFields = append(outputFields, out)
 	}
 
+	// Resolve field types after all references are collected.
+	for _, f := range filters {
+		resolveFieldTypes(f, fields)
+	}
+	for i := range outputFields {
+		resolveFieldTypes(outputFields[i].Value, fields)
+		outputFields[i].GoType = outputFields[i].Value.GoType
+	}
+
 	inputFields := fields.build()
 	funcName := "Transform" + exportedName(rootField)
 
@@ -114,37 +145,6 @@ func Analyze(root jparse.Node) (*QueryPlan, error) {
 	}, nil
 }
 
-// --- Filter analysis ---
-
-func analyzeFilter(node jparse.Node, fc *fieldCollector) (Filter, error) {
-	cmp, ok := node.(*jparse.ComparisonOperatorNode)
-	if !ok {
-		return Filter{}, fmt.Errorf("unsupported filter type %T (only comparisons supported)", node)
-	}
-
-	fieldPath, err := extractPath(cmp.LHS)
-	if err != nil {
-		return Filter{}, fmt.Errorf("filter LHS: %w", err)
-	}
-
-	num, ok := cmp.RHS.(*jparse.NumberNode)
-	if !ok {
-		return Filter{}, fmt.Errorf("filter RHS must be a number literal, got %T", cmp.RHS)
-	}
-
-	jsonName := fieldPath[0]
-	fc.addField(jsonName, true)
-
-	op := comparisonOpToGo(cmp.Type)
-	literal := formatFloat(num.Value)
-
-	return Filter{
-		FieldGoName: exportedName(jsonName),
-		Op:          op,
-		Literal:     literal,
-	}, nil
-}
-
 // --- Projection analysis ---
 
 func analyzeProjection(pair [2]jparse.Node, fc *fieldCollector) (OutputField, error) {
@@ -153,54 +153,438 @@ func analyzeProjection(pair [2]jparse.Node, fc *fieldCollector) (OutputField, er
 		return OutputField{}, fmt.Errorf("projection key: %w", err)
 	}
 
-	out := OutputField{
+	value, err := analyzeExpr(pair[1], fc)
+	if err != nil {
+		return OutputField{}, fmt.Errorf("projection %q: %w", keyName, err)
+	}
+
+	return OutputField{
 		JSONName: keyName,
 		GoName:   exportedName(keyName),
-	}
+		GoType:   value.GoType,
+		Value:    value,
+	}, nil
+}
 
-	switch val := pair[1].(type) {
+// --- Expression analysis ---
+// analyzeExpr recursively walks a JSONata AST node and produces an Expr tree.
+// It handles field references, literals, comparisons, boolean operators,
+// arithmetic, negation, string concatenation, conditionals, and function calls.
+
+func analyzeExpr(node jparse.Node, fc *fieldCollector) (*Expr, error) {
+	switch n := node.(type) {
 	case *jparse.PathNode:
-		// Direct field mapping: value comes from a field on the element.
-		jsonField, err := extractSingleName(val)
-		if err != nil {
-			return OutputField{}, fmt.Errorf("projection value path: %w", err)
+		if len(n.Steps) == 1 {
+			return analyzeExpr(n.Steps[0], fc)
 		}
-		fc.addField(jsonField, false)
-		out.SourceField = exportedName(jsonField)
-		out.GoType = fc.typeOf(jsonField)
+		// Multi-step path: if exactly 2 steps and both are names, treat as
+		// a field.subfield reference (used in $sum(items.price) arguments).
+		if len(n.Steps) == 2 {
+			name1, err1 := extractName(n.Steps[0])
+			name2, err2 := extractName(n.Steps[1])
+			if err1 == nil && err2 == nil {
+				// This is the items.price pattern. Register as array field.
+				fc.addArrayField(name1, name2, true)
+				return &Expr{
+					Kind:      "arrayField",
+					ArrayName: exportedName(name1),
+					ArrayJSON: name1,
+					ChildName: exportedName(name2),
+					ChildJSON: name2,
+					GoType:    "float64",
+				}, nil
+			}
+		}
+		return nil, fmt.Errorf("multi-step path not supported in this context (got %d steps)", len(n.Steps))
+
+	case *jparse.NameNode:
+		jsonName := n.Value
+		fc.addField(jsonName, false)
+		return &Expr{
+			Kind:      "field",
+			FieldName: exportedName(jsonName),
+			FieldJSON: jsonName,
+			GoType:    "any", // resolved later
+		}, nil
+
+	case *jparse.NumberNode:
+		return &Expr{
+			Kind:         "literal",
+			LiteralValue: formatFloat(n.Value),
+			GoType:       "float64",
+		}, nil
+
+	case *jparse.StringNode:
+		return &Expr{
+			Kind:         "literal",
+			LiteralValue: fmt.Sprintf("%q", n.Value),
+			GoType:       "string",
+		}, nil
+
+	case *jparse.BooleanNode:
+		return &Expr{
+			Kind:         "literal",
+			LiteralValue: fmt.Sprintf("%t", n.Value),
+			GoType:       "bool",
+		}, nil
+
+	case *jparse.NullNode:
+		return &Expr{
+			Kind:         "literal",
+			LiteralValue: "nil",
+			GoType:       "any",
+		}, nil
+
+	case *jparse.BlockNode:
+		// Parenthesized expression: (expr). Unwrap the single child.
+		if len(n.Exprs) == 1 {
+			return analyzeExpr(n.Exprs[0], fc)
+		}
+		return nil, fmt.Errorf("block with %d expressions not supported (only single-expression parentheses)", len(n.Exprs))
+
+	case *jparse.ComparisonOperatorNode:
+		left, err := analyzeExpr(n.LHS, fc)
+		if err != nil {
+			return nil, fmt.Errorf("comparison LHS: %w", err)
+		}
+		right, err := analyzeExpr(n.RHS, fc)
+		if err != nil {
+			return nil, fmt.Errorf("comparison RHS: %w", err)
+		}
+		// When the RHS is numeric, mark the LHS field as numeric so the
+		// generated struct uses float64 and comparisons like > compile.
+		if right.GoType == "float64" {
+			markNumeric(left, fc)
+		}
+		return &Expr{
+			Kind:   "binary",
+			Op:     comparisonOpToGo(n.Type),
+			Left:   left,
+			Right:  right,
+			GoType: "bool",
+		}, nil
+
+	case *jparse.BooleanOperatorNode:
+		left, err := analyzeExpr(n.LHS, fc)
+		if err != nil {
+			return nil, fmt.Errorf("boolean LHS: %w", err)
+		}
+		right, err := analyzeExpr(n.RHS, fc)
+		if err != nil {
+			return nil, fmt.Errorf("boolean RHS: %w", err)
+		}
+		op := "&&"
+		if n.Type == jparse.BooleanOr {
+			op = "||"
+		}
+		return &Expr{
+			Kind:   "binary",
+			Op:     op,
+			Left:   left,
+			Right:  right,
+			GoType: "bool",
+		}, nil
+
+	case *jparse.NumericOperatorNode:
+		left, err := analyzeExpr(n.LHS, fc)
+		if err != nil {
+			return nil, fmt.Errorf("arithmetic LHS: %w", err)
+		}
+		right, err := analyzeExpr(n.RHS, fc)
+		if err != nil {
+			return nil, fmt.Errorf("arithmetic RHS: %w", err)
+		}
+		markNumeric(left, fc)
+		markNumeric(right, fc)
+		return &Expr{
+			Kind:   "binary",
+			Op:     numericOpToGo(n.Type),
+			Left:   left,
+			Right:  right,
+			GoType: "float64",
+		}, nil
+
+	case *jparse.NegationNode:
+		operand, err := analyzeExpr(n.RHS, fc)
+		if err != nil {
+			return nil, fmt.Errorf("negation: %w", err)
+		}
+		markNumeric(operand, fc)
+		return &Expr{
+			Kind:   "unary",
+			Op:     "-",
+			Left:   operand,
+			GoType: "float64",
+		}, nil
+
+	case *jparse.StringConcatenationNode:
+		left, err := analyzeExpr(n.LHS, fc)
+		if err != nil {
+			return nil, fmt.Errorf("concat LHS: %w", err)
+		}
+		right, err := analyzeExpr(n.RHS, fc)
+		if err != nil {
+			return nil, fmt.Errorf("concat RHS: %w", err)
+		}
+		return &Expr{
+			Kind:   "binary",
+			Op:     "&",
+			Left:   left,
+			Right:  right,
+			GoType: "string",
+		}, nil
+
+	case *jparse.ConditionalNode:
+		cond, err := analyzeExpr(n.If, fc)
+		if err != nil {
+			return nil, fmt.Errorf("conditional if: %w", err)
+		}
+		then, err := analyzeExpr(n.Then, fc)
+		if err != nil {
+			return nil, fmt.Errorf("conditional then: %w", err)
+		}
+		var els *Expr
+		if n.Else != nil {
+			els, err = analyzeExpr(n.Else, fc)
+			if err != nil {
+				return nil, fmt.Errorf("conditional else: %w", err)
+			}
+		}
+		goType := then.GoType
+		if els != nil && els.GoType != goType {
+			goType = "any"
+		}
+		return &Expr{
+			Kind:   "conditional",
+			Cond:   cond,
+			Then:   then,
+			Else:   els,
+			GoType: goType,
+		}, nil
 
 	case *jparse.FunctionCallNode:
-		// Aggregate function, e.g. $sum(items.price)
-		funcName, err := extractVariableName(val.Func)
+		funcName, err := extractVariableName(n.Func)
 		if err != nil {
-			return OutputField{}, fmt.Errorf("function name: %w", err)
-		}
-		if len(val.Args) != 1 {
-			return OutputField{}, fmt.Errorf("expected 1 argument for $%s, got %d", funcName, len(val.Args))
-		}
-		argPath, err := extractPath(val.Args[0])
-		if err != nil {
-			return OutputField{}, fmt.Errorf("$%s argument: %w", funcName, err)
-		}
-		if len(argPath) != 2 {
-			return OutputField{}, fmt.Errorf("$%s argument must be a two-part path (array.field), got %v", funcName, argPath)
+			return nil, fmt.Errorf("function name: %w", err)
 		}
 
-		arrayField := argPath[0]
-		innerField := argPath[1]
+		// For aggregate functions with a 2-part path argument, build an
+		// arrayField Expr so codegen can emit the right loop pattern.
+		if isAggregateFunc(funcName) && len(n.Args) == 1 {
+			if p, ok := n.Args[0].(*jparse.PathNode); ok && len(p.Steps) == 2 {
+				name1, err1 := extractName(p.Steps[0])
+				name2, err2 := extractName(p.Steps[1])
+				if err1 == nil && err2 == nil {
+					fc.addArrayField(name1, name2, true)
+					return &Expr{
+						Kind:     "funcCall",
+						FuncName: funcName,
+						FuncArgs: []*Expr{{
+							Kind:      "arrayField",
+							ArrayName: exportedName(name1),
+							ArrayJSON: name1,
+							ChildName: exportedName(name2),
+							ChildJSON: name2,
+							GoType:    "float64",
+						}},
+						GoType: "float64",
+					}, nil
+				}
+			}
+		}
 
-		fc.addArrayField(arrayField, innerField, true)
+		// Build arguments recursively.
+		var args []*Expr
+		for _, arg := range n.Args {
+			a, err := analyzeExpr(arg, fc)
+			if err != nil {
+				return nil, fmt.Errorf("$%s argument: %w", funcName, err)
+			}
+			args = append(args, a)
+		}
 
-		out.AggregateFunc = funcName
-		out.AggregateArray = exportedName(arrayField)
-		out.AggregateField = exportedName(innerField)
-		out.GoType = "float64"
+		// Mark operands numeric for numeric functions.
+		if isNumericFunc(funcName) {
+			for _, a := range args {
+				markNumeric(a, fc)
+			}
+		}
+
+		return &Expr{
+			Kind:     "funcCall",
+			FuncName: funcName,
+			FuncArgs: args,
+			GoType:   inferFuncReturnType(funcName),
+		}, nil
 
 	default:
-		return OutputField{}, fmt.Errorf("unsupported projection value type %T", pair[1])
+		return nil, fmt.Errorf("unsupported expression type %T", node)
 	}
+}
 
-	return out, nil
+// markNumeric marks a field expression as used in numeric context so the
+// generated input struct declares it as float64.
+func markNumeric(e *Expr, fc *fieldCollector) {
+	if e.Kind == "field" {
+		fc.addField(e.FieldJSON, true)
+	}
+}
+
+// resolveFieldTypes walks an expression tree and updates GoType for field
+// references based on the final field collector state.
+func resolveFieldTypes(e *Expr, fc *fieldCollector) {
+	if e == nil {
+		return
+	}
+	if e.Kind == "field" {
+		e.GoType = fc.typeOf(e.FieldJSON)
+	}
+	resolveFieldTypes(e.Left, fc)
+	resolveFieldTypes(e.Right, fc)
+	for _, a := range e.FuncArgs {
+		resolveFieldTypes(a, fc)
+	}
+	resolveFieldTypes(e.Cond, fc)
+	resolveFieldTypes(e.Then, fc)
+	resolveFieldTypes(e.Else, fc)
+}
+
+func numericOpToGo(op jparse.NumericOperator) string {
+	switch op {
+	case jparse.NumericAdd:
+		return "+"
+	case jparse.NumericSubtract:
+		return "-"
+	case jparse.NumericMultiply:
+		return "*"
+	case jparse.NumericDivide:
+		return "/"
+	case jparse.NumericModulo:
+		return "%"
+	default:
+		return "+"
+	}
+}
+
+func isAggregateFunc(name string) bool {
+	switch name {
+	case "sum", "count", "min", "max", "average":
+		return true
+	}
+	return false
+}
+
+func isNumericFunc(name string) bool {
+	switch name {
+	case "number", "abs", "floor", "ceil", "round":
+		return true
+	}
+	return false
+}
+
+func inferFuncReturnType(name string) string {
+	switch name {
+	case "sum", "count", "min", "max", "average",
+		"number", "abs", "floor", "ceil", "round",
+		"length":
+		return "float64"
+	case "string", "uppercase", "lowercase", "trim",
+		"substring", "substringBefore", "substringAfter",
+		"join", "type":
+		return "string"
+	case "boolean", "not", "exists", "contains":
+		return "bool"
+	default:
+		return "any"
+	}
+}
+
+// NeedsRuntime returns true if the plan uses any runtime.* helpers.
+func (plan *QueryPlan) NeedsRuntime() bool {
+	for _, f := range plan.Filters {
+		if exprNeedsRuntime(f) {
+			return true
+		}
+	}
+	for _, of := range plan.OutputFields {
+		if exprNeedsRuntime(of.Value) {
+			return true
+		}
+	}
+	return false
+}
+
+// NeedsMath returns true if the plan uses math.* functions.
+func (plan *QueryPlan) NeedsMath() bool {
+	for _, f := range plan.Filters {
+		if exprNeedsMath(f) {
+			return true
+		}
+	}
+	for _, of := range plan.OutputFields {
+		if exprNeedsMath(of.Value) {
+			return true
+		}
+	}
+	return false
+}
+
+func exprNeedsRuntime(e *Expr) bool {
+	if e == nil {
+		return false
+	}
+	// Aggregation functions that use runtime.Min/Max/AverageFloat64
+	if e.Kind == "funcCall" && isAggregateFunc(e.FuncName) && e.FuncName != "sum" && e.FuncName != "count" {
+		return true
+	}
+	// String/numeric/boolean/array/object functions
+	if e.Kind == "funcCall" && !isAggregateFunc(e.FuncName) {
+		return true
+	}
+	// String concatenation uses runtime.ToString
+	if e.Kind == "binary" && e.Op == "&" {
+		return true
+	}
+	// Conditional uses runtime.Truthy
+	if e.Kind == "conditional" {
+		return true
+	}
+	return exprNeedsRuntime(e.Left) || exprNeedsRuntime(e.Right) ||
+		exprNeedsRuntime(e.Cond) || exprNeedsRuntime(e.Then) || exprNeedsRuntime(e.Else) ||
+		anyExprNeedsRuntime(e.FuncArgs)
+}
+
+func anyExprNeedsRuntime(args []*Expr) bool {
+	for _, a := range args {
+		if exprNeedsRuntime(a) {
+			return true
+		}
+	}
+	return false
+}
+
+func exprNeedsMath(e *Expr) bool {
+	if e == nil {
+		return false
+	}
+	if e.Kind == "funcCall" {
+		switch e.FuncName {
+		case "abs", "floor", "ceil", "round":
+			return true
+		}
+	}
+	return exprNeedsMath(e.Left) || exprNeedsMath(e.Right) ||
+		exprNeedsMath(e.Cond) || exprNeedsMath(e.Then) || exprNeedsMath(e.Else) ||
+		anyExprNeedsMath(e.FuncArgs)
+}
+
+func anyExprNeedsMath(args []*Expr) bool {
+	for _, a := range args {
+		if exprNeedsMath(a) {
+			return true
+		}
+	}
+	return false
 }
 
 // --- Field collector ---
