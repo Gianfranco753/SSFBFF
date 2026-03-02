@@ -181,9 +181,9 @@ func generateSpecRoutes(routes []specRoute, pkg, genPkg string) ([]byte, error) 
 type configRoute struct {
 	Method   string
 	Path     string
-	FuncName string // e.g. "TransformDashboard"
-	HasFetch bool   // uses $fetch() or $service() — needs aggregator + Execute func
-	HasReq   bool   // uses $request() or $fetch with config — needs RequestContext
+	FuncName string      // e.g. "TransformDashboard"
+	HasFetch bool        // uses $fetch() or $service() — needs aggregator + Execute func
+	HasReq   bool        // uses $request() or $fetch with config — needs RequestContext
 	ReqKeys  requestKeys // which request fields are actually referenced
 }
 

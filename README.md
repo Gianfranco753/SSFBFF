@@ -262,26 +262,64 @@ go run ./cmd/apigen --routes=<routes.yaml> --jsonata-dir=<dir> --output=<file.go
 
 ## Environment Variables
 
+### Server
+
 | Variable | Description | Default |
 |---|---|---|
 | `PORT` | Server listen port | `3000` |
 | `DATA_DIR` | Path to the data directory | `data` |
 | `UPSTREAM_<PROVIDER>_URL` | Override base URL for a provider | — |
-| `HTTP_PROXY` | HTTP proxy URL | — |
-| `HTTPS_PROXY` | HTTPS proxy URL | — |
-| `NO_PROXY` | Comma-separated list of hosts to bypass proxy | — |
+
+### Proxy
+
+All upstream HTTP calls honour standard proxy environment variables:
+
+| Variable | Description |
+|---|---|
+| `HTTP_PROXY` | Proxy for HTTP requests |
+| `HTTPS_PROXY` | Proxy for HTTPS requests |
+| `NO_PROXY` | Comma-separated hosts/domains to bypass proxy |
+
+### OpenTelemetry
+
+Tracing is configured entirely via standard [OTEL environment variables](https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/):
+
+| Variable | Description | Default |
+|---|---|---|
+| `OTEL_SDK_DISABLED` | Set `true` to disable tracing | `false` |
+| `OTEL_TRACES_EXPORTER` | Set `none` to disable tracing | — |
+| `OTEL_SERVICE_NAME` | Service name attached to every span | `ssfbff` |
+| `OTEL_RESOURCE_ATTRIBUTES` | Extra resource attributes (e.g. `env=prod,version=1.2`) | — |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP collector endpoint | `http://localhost:4318` |
+| `OTEL_EXPORTER_OTLP_HEADERS` | Auth headers, e.g. `Authorization=Bearer <token>` | — |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Traces-specific endpoint override | — |
+| `OTEL_EXPORTER_OTLP_TRACES_HEADERS` | Traces-specific header override | — |
 
 ## Tracing & Observability
 
-The BFF server is fully traceable and supports standard HTTP proxy environment variables:
+The server is fully OpenTelemetry compatible out of the box:
 
-- **HTTP Proxy Support**: All upstream HTTP requests respect `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` environment variables, making the BFF work seamlessly behind corporate proxies or in cloud environments with proxy gateways.
+- **Incoming requests** — the [Fiber OTel middleware](https://github.com/gofiber/contrib/tree/main/v3/otel) (`github.com/gofiber/contrib/v3/otel`) creates a server span for every request, records HTTP metrics, and extracts W3C TraceContext + Baggage headers for distributed tracing.
 
-- **Request Context Propagation**: Request headers, cookies, and other context are extracted only when needed (based on JSONata expression analysis), minimizing memory allocation.
+- **Upstream calls** — every provider/upstream fetch is a child span of the active request trace, created by `otelhttp.NewTransport`. Trace context is automatically propagated to upstream services via the `traceparent` header.
 
-- **Error Propagation**: All upstream failures are logged with context (provider name, endpoint, HTTP status codes) for easy debugging.
+- **Proxy support** — `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` are respected by all upstream calls, making the BFF compatible with corporate proxies and cloud egress gateways.
 
-- **Performance Metrics**: The compiled nature means zero runtime JSONata interpretation overhead, making the BFF suitable for high-throughput tracing scenarios.
+- **Zero-config for development** — set `OTEL_SDK_DISABLED=true` or `OTEL_TRACES_EXPORTER=none` to disable OTel with no code changes.
+
+### Sending traces to Jaeger (example)
+
+```bash
+# Start Jaeger all-in-one
+docker run -p 16686:16686 -p 4318:4318 jaegertracing/all-in-one:latest
+
+# Run the BFF — traces go to Jaeger automatically
+OTEL_SERVICE_NAME=ssfbff \
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 \
+GOEXPERIMENT=jsonv2 go run ./cmd/server/
+
+# View traces at http://localhost:16686
+```
 
 ## Running Tests
 

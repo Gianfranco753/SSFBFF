@@ -101,19 +101,51 @@ func TestListenAddr(t *testing.T) {
 	}
 }
 
-// --- sharedHTTPClient tests ---
+// --- transport / proxy tests ---
 
-func TestSharedHTTPClientProxySupport(t *testing.T) {
-	// The sharedHTTPClient should have ProxyFromEnvironment set
-	if sharedHTTPClient.Transport == nil {
-		t.Fatal("sharedHTTPClient.Transport is nil")
+func TestBaseTransportProxySupport(t *testing.T) {
+	// baseTransport must have http.ProxyFromEnvironment configured so that
+	// HTTP_PROXY / HTTPS_PROXY / NO_PROXY env vars are honoured.
+	if baseTransport.Proxy == nil {
+		t.Error("baseTransport.Proxy should be set to http.ProxyFromEnvironment")
 	}
-	transport, ok := sharedHTTPClient.Transport.(*http.Transport)
-	if !ok {
-		t.Fatalf("expected *http.Transport, got %T", sharedHTTPClient.Transport)
+}
+
+// --- telemetry tests ---
+
+func TestInitTracingDisabledSDK(t *testing.T) {
+	t.Setenv("OTEL_SDK_DISABLED", "true")
+	shutdown, err := initTracing(context.Background())
+	if err != nil {
+		t.Fatalf("initTracing error: %v", err)
 	}
-	if transport.Proxy == nil {
-		t.Error("sharedHTTPClient.Transport.Proxy should be set to ProxyFromEnvironment")
+	if err := shutdown(context.Background()); err != nil {
+		t.Errorf("shutdown error: %v", err)
+	}
+}
+
+func TestInitTracingExporterNone(t *testing.T) {
+	t.Setenv("OTEL_TRACES_EXPORTER", "none")
+	shutdown, err := initTracing(context.Background())
+	if err != nil {
+		t.Fatalf("initTracing error: %v", err)
+	}
+	if err := shutdown(context.Background()); err != nil {
+		t.Errorf("shutdown error: %v", err)
+	}
+}
+
+func TestOtelServiceNameDefault(t *testing.T) {
+	t.Setenv("OTEL_SERVICE_NAME", "")
+	if got := otelServiceName(); got != "ssfbff" {
+		t.Errorf("otelServiceName() = %q, want %q", got, "ssfbff")
+	}
+}
+
+func TestOtelServiceNameFromEnv(t *testing.T) {
+	t.Setenv("OTEL_SERVICE_NAME", "my-bff")
+	if got := otelServiceName(); got != "my-bff" {
+		t.Errorf("otelServiceName() = %q, want %q", got, "my-bff")
 	}
 }
 

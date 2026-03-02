@@ -11,12 +11,17 @@
 //	UPSTREAM_USER_SERVICE_URL=http://user-svc:8080
 //	UPSTREAM_ORDERS_URL=http://orders-svc:8080/data
 //
+// OpenTelemetry tracing is configured via standard OTEL_* environment variables.
+// Set OTEL_SDK_DISABLED=true or OTEL_TRACES_EXPORTER=none to disable tracing.
+// See cmd/server/telemetry.go for the full list of supported variables.
+//
 // Run:
 //
 //	GOEXPERIMENT=jsonv2 go run ./cmd/server/
 package main
 
 import (
+	"context"
 	jsonv2 "encoding/json/v2"
 	"fmt"
 	"log"
@@ -30,30 +35,51 @@ import (
 	"time"
 
 	"github.com/gcossani/ssfbff/internal/aggregator"
+	otelfiber "github.com/gofiber/contrib/v3/otel"
 	"github.com/gofiber/fiber/v3"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"gopkg.in/yaml.v3"
 )
 
-// sharedHTTPClient is a single *http.Client used by both filter-mode fetchers
-// and the aggregator. A single transport means one connection pool for all
-// upstream calls, with sensible limits to prevent connection storms.
-// It respects HTTP_PROXY, HTTPS_PROXY, and NO_PROXY environment variables
-// for full traceability through proxy gateways.
+// baseTransport defines connection parameters for all upstream HTTP calls.
+// It respects HTTP_PROXY, HTTPS_PROXY, and NO_PROXY environment variables.
+var baseTransport = &http.Transport{
+	Proxy:               http.ProxyFromEnvironment,
+	MaxIdleConnsPerHost: 64,
+	MaxConnsPerHost:     128,
+	IdleConnTimeout:     90 * time.Second,
+	DialContext: (&net.Dialer{
+		Timeout:   3 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext,
+}
+
+// sharedHTTPClient is used by both filter-mode fetchers and the aggregator.
+// In main(), after OTel is initialized, its Transport is replaced with an
+// otelhttp-wrapped version so every upstream call gets a trace span.
 var sharedHTTPClient = &http.Client{
-	Timeout: 30 * time.Second,
-	Transport: &http.Transport{
-		Proxy:               http.ProxyFromEnvironment,
-		MaxIdleConnsPerHost: 64,
-		MaxConnsPerHost:     128,
-		IdleConnTimeout:     90 * time.Second,
-		DialContext: (&net.Dialer{
-			Timeout:   3 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-	},
+	Timeout:   30 * time.Second,
+	Transport: baseTransport,
 }
 
 func main() {
+	// Initialize OpenTelemetry first so the instrumented transport and Fiber
+	// middleware can register spans under the correct global TracerProvider.
+	ctx := context.Background()
+	shutdownTracing, err := initTracing(ctx)
+	if err != nil {
+		log.Fatalf("tracing setup: %v", err)
+	}
+	defer func() {
+		if err := shutdownTracing(ctx); err != nil {
+			log.Printf("tracing shutdown: %v", err)
+		}
+	}()
+
+	// Wrap baseTransport with otelhttp so all upstream HTTP calls become
+	// child spans of the active trace, propagating W3C trace context headers.
+	sharedHTTPClient.Transport = otelhttp.NewTransport(baseTransport)
+
 	dataDir := os.Getenv("DATA_DIR")
 	if dataDir == "" {
 		dataDir = "data"
@@ -74,6 +100,10 @@ func main() {
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	})
+
+	// Instrument all incoming requests: creates a server span, extracts
+	// W3C TraceContext/Baggage from request headers, and records HTTP metrics.
+	app.Use(otelfiber.Middleware())
 
 	RegisterRoutes(app, defaultFetch, agg)
 

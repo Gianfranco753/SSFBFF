@@ -5,6 +5,7 @@
 *.so
 *.dylib
 apigen
+server
 mockserver
 
 # Test binary, built with `go test -c`
