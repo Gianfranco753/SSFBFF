@@ -181,7 +181,7 @@ type configRoute struct {
 	Method   string
 	Path     string
 	FuncName string // e.g. "TransformDashboard"
-	HasFetch bool   // uses $fetch() — needs aggregator + deps
+	HasFetch bool   // uses $fetch() or $service() — needs aggregator + Execute func
 	HasReq   bool   // uses $request() or $fetch with config — needs RequestContext
 }
 
@@ -219,7 +219,7 @@ func parseConfig(path, jsonataDir string) ([]configRoute, error) {
 		}
 
 		exprStr := string(expr)
-		hasFetch := strings.Contains(exprStr, "$fetch(")
+		hasFetch := strings.Contains(exprStr, "$fetch(") || strings.Contains(exprStr, "$service(")
 		hasReq := strings.Contains(exprStr, "$request(")
 
 		routes = append(routes, configRoute{
@@ -287,16 +287,12 @@ func generateConfigRoutes(routes []configRoute, pkg, genPkg string) ([]byte, err
 		w("\tapp.%s(%q, func(c fiber.Ctx) error {\n", r.Method, r.Path)
 
 		if r.HasFetch {
-			// Provider mode: build request context, compute deps, fan-out, transform.
+			// Provider/service mode: build request context, call the bundled Execute function.
+			execName := strings.TrimPrefix(r.FuncName, "Transform")
 			writeRequestContextBuilder(w, "\t\t")
-			w("\t\tdeps := generated.%sDeps(reqCtx)\n", r.FuncName)
-			w("\t\tfetched, err := agg.Fetch(c.Context(), deps)\n")
+			w("\t\tresult, err := generated.Execute%s(c.Context(), agg, reqCtx)\n", execName)
 			w("\t\tif err != nil {\n")
 			w("\t\t\treturn fiber.NewError(fiber.StatusBadGateway, err.Error())\n")
-			w("\t\t}\n\n")
-			w("\t\tresult, err := generated.%s(fetched, reqCtx)\n", r.FuncName)
-			w("\t\tif err != nil {\n")
-			w("\t\t\treturn fiber.NewError(fiber.StatusInternalServerError, err.Error())\n")
 			w("\t\t}\n\n")
 			w("\t\tc.Set(\"Content-Type\", \"application/json\")\n")
 			w("\t\treturn c.Send(result)\n")

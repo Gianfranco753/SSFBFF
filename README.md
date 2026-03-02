@@ -18,11 +18,12 @@ There are two code generators that run at build time:
 ```
 config.yaml       --> cmd/apigen    --> cmd/server/routes_gen.go
 dashboard.jsonata  --> cmd/transpiler --> internal/generated/dashboard_gen.go
+get_user.jsonata   --> cmd/transpiler --> internal/generated/get_user_gen.go
 orders.jsonata     --> cmd/transpiler --> internal/generated/orders_gen.go
 products.jsonata   --> cmd/transpiler --> internal/generated/products_gen.go
 ```
 
-At runtime, each request either fans out to multiple upstream services in parallel (via the aggregator) or fetches from a single upstream, passes the raw bytes through the compiled transform, and returns the shaped result.
+At runtime, each request either fans out to multiple upstream services in parallel (via the aggregator), composes sub-service pipelines (via `$service()`), or fetches from a single upstream — then passes the raw bytes through the compiled transform and returns the shaped result.
 
 ## Two Expression Modes
 
@@ -96,6 +97,54 @@ The config object supports three keys:
 - `headers` — object mapping header names to values (static strings or `$request()` paths)
 - `body` — object whose fields become a JSON body (values can be static strings or `$request()` paths)
 
+### `$service()` - composing transform pipelines
+
+`$service("name")` calls another generated transform pipeline in-process. This enables service composition: complex orchestrations are built by combining simple, reusable services.
+
+```jsonata
+{"user": $service("get_user").name, "balance": $fetch("bank_service", "accounts").amount}
+```
+
+**Execution model within a single service:**
+
+1. **All `$fetch()` calls** run in parallel first (fan-out via the aggregator)
+2. **All `$service()` calls** run in parallel next (each sub-service recursively executes its own pipeline)
+3. **Transform** assembles the final output from all results
+
+This is a flat, two-phase model. Sequential provider calls are achieved by composing services — not by nesting `$fetch()` calls:
+
+```
+┌─ dashboard service ──────────────────────────────────────────────┐
+│  Phase 1 (parallel providers):  $fetch("bank_svc", "accounts")  │
+│  Phase 2 (parallel services):   $service("get_user")            │
+│    └─ get_user service ─────────────────────────────────────┐    │
+│       Phase 1: $fetch("user_svc", "profile")                │    │
+│       Phase 2: (none)                                        │    │
+│       Transform: {"id": .id, "name": .name}                  │    │
+│    └─────────────────────────────────────────────────────────┘    │
+│  Transform: {"user": ..., "balance": ...}                        │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+**Rules:**
+- `$service()` is **output-only** — it cannot be used inside `$fetch()` configs
+- Each service is a separate `.jsonata` file with its own `go:generate` directive
+- Sub-services receive the same `RequestContext` as the parent
+
+### Optional providers
+
+Providers can be marked as `optional: true` in `config.yaml`. When an optional provider fails (timeout, connection error, etc.), the pipeline continues with `null` instead of aborting:
+
+```yaml
+providers:
+  rec_service:
+    base_url: http://rec-svc:8080
+    timeout: 2s
+    optional: true   # failure stores null, pipeline continues
+```
+
+In the JSONata expression, fields from optional providers simply resolve to `null` on failure — no special syntax needed.
+
 #### Why `$fetch()` instead of `$providers.x.y`?
 
 In JSONata, `$name` is variable syntax - variables can be assigned with `:=` and read anywhere. Using `$providers` as a magic namespace would:
@@ -129,8 +178,10 @@ SSFBFF/
 |   |   +-- aggregator.go            # Parallel upstream fetcher (errgroup)
 |   +-- generated/
 |   |   +-- generate.go              # go:generate directives
-|   |   +-- dashboard.jsonata        # $fetch() mode expression
-|   |   +-- dashboard_gen.go         # Generated multi-provider transform
+|   |   +-- dashboard.jsonata        # $fetch() + $service() expression
+|   |   +-- dashboard_gen.go         # Generated: transform + execute (with service composition)
+|   |   +-- get_user.jsonata         # Reusable service (called via $service("get_user"))
+|   |   +-- get_user_gen.go          # Generated: transform + execute for get_user
 |   |   +-- orders.jsonata           # Filter mode expression
 |   |   +-- orders_gen.go            # Generated filter transform
 |   |   +-- products.jsonata         # Filter mode expression
@@ -194,11 +245,15 @@ providers:
     timeout: 3s
     endpoints:
       accounts: /api/accounts
+  rec_service:
+    base_url: http://rec-svc:8080
+    timeout: 2s
+    optional: true                  # failure stores null, pipeline continues
 
 routes:
   - path: /dashboard
     method: GET
-    jsonata: dashboard.jsonata      # uses $fetch() -> aggregator mode
+    jsonata: dashboard.jsonata      # uses $fetch() + $service() -> aggregator mode
   - path: /api/v1/orders
     method: GET
     jsonata: orders.jsonata         # array filter -> single upstream mode
@@ -208,6 +263,8 @@ routes:
 ```
 
 Provider base URLs can be overridden at runtime via `UPSTREAM_<PROVIDER>_URL` environment variables.
+
+The `optional: true` flag makes a provider non-critical. If the call fails (timeout, connection error, HTTP error), the result is stored as `null` and the pipeline continues. Fields that depend on an optional provider will resolve to `null` in the output.
 
 ## Adding a New Endpoint
 
@@ -277,6 +334,47 @@ routes:
 
 **Step 4.** Regenerate and run. The generated route will automatically use the aggregator for parallel fetching.
 
+### Service composition (chaining transforms)
+
+Build complex orchestrations by composing simple services. Each service is a separate `.jsonata` file.
+
+**Step 1.** Create a reusable inner service:
+
+```bash
+cat > internal/generated/get_user.jsonata << 'EOF'
+{"id": $fetch("user_service", "profile", {"headers": {"Authorization": $request().headers.Authorization}}).id, "name": $fetch("user_service", "profile", {"headers": {"Authorization": $request().headers.Authorization}}).name}
+EOF
+```
+
+**Step 2.** Create the outer service that calls the inner one:
+
+```bash
+cat > internal/generated/dashboard.jsonata << 'EOF'
+{"user": $service("get_user").name, "balance": $fetch("bank_service", "accounts").amount, "auth": $request().headers.Authorization}
+EOF
+```
+
+**Step 3.** Add `go:generate` directives for both:
+
+```go
+//go:generate go run ../../cmd/transpiler --input=get_user.jsonata --output=get_user_gen.go --package=generated
+//go:generate go run ../../cmd/transpiler --input=dashboard.jsonata --output=dashboard_gen.go --package=generated
+```
+
+**Step 4.** Add the route to `config.yaml`:
+
+```yaml
+routes:
+  - path: /dashboard
+    method: GET
+    jsonata: dashboard.jsonata
+```
+
+**Step 5.** Regenerate and run. The generated `ExecuteDashboard` function will:
+1. Fetch `bank_service/accounts` in parallel
+2. Call `ExecuteGetUser` in parallel (which internally fetches `user_service/profile`)
+3. Assemble the final JSON from both results
+
 ## Example: What Gets Generated
 
 ### Filter mode
@@ -344,23 +442,47 @@ func TransformDashboard(results map[string][]byte, req runtime.RequestContext) (
 }
 ```
 
-The generated route handler builds a `RequestContext` from the Fiber `Ctx`, computes deps, fans out in parallel, and transforms:
+### Service composition (with `$service()`)
+
+When an expression uses `$service()`, the transpiler generates an `ExecuteXxx` function that orchestrates the full pipeline: parallel provider fetches, then parallel sub-service calls, then the transform.
+
+Given `dashboard.jsonata` using `$service("get_user")`:
+
+```go
+func ExecuteDashboard(ctx context.Context, agg *aggregator.Aggregator, req runtime.RequestContext) ([]byte, error) {
+    // Phase 1: fetch all providers in parallel
+    deps := TransformDashboardDeps(req)
+    results, err := agg.Fetch(ctx, deps)
+    if err != nil { return nil, fmt.Errorf("Dashboard: fetch: %w", err) }
+
+    // Phase 2: run all sub-services in parallel
+    g, gctx := errgroup.WithContext(ctx)
+    var mu sync.Mutex
+
+    g.Go(func() error {
+        r, err := ExecuteGetUser(gctx, agg, req)  // in-process call
+        if err != nil { return fmt.Errorf("service get_user: %w", err) }
+        mu.Lock()
+        results["$service.get_user"] = r
+        mu.Unlock()
+        return nil
+    })
+
+    if err := g.Wait(); err != nil { return nil, err }
+
+    // Phase 3: transform with combined results
+    return TransformDashboard(results, req)
+}
+```
+
+The generated route handler simply calls `ExecuteDashboard`:
 
 ```go
 app.Get("/dashboard", func(c fiber.Ctx) error {
-    reqCtx := runtime.RequestContext{
-        Path:   c.Path(),
-        Method: c.Method(),
-        Body:   c.Body(),
-    }
-    // ... headers, cookies, query, params populated from c ...
+    reqCtx := runtime.RequestContext{/* ... built from Fiber Ctx ... */}
 
-    deps := generated.TransformDashboardDeps(reqCtx)
-    fetched, err := agg.Fetch(c.Context(), deps)
+    result, err := generated.ExecuteDashboard(c.Context(), agg, reqCtx)
     if err != nil { return fiber.NewError(502, err.Error()) }
-
-    result, err := generated.TransformDashboard(fetched, reqCtx)
-    if err != nil { return fiber.NewError(500, err.Error()) }
 
     c.Set("Content-Type", "application/json")
     return c.Send(result)
@@ -424,7 +546,7 @@ go run ./cmd/transpiler --input=<file.jsonata> --output=<file.go> --package=<pkg
 | `--package` | Go package name in the generated file | `main` |
 
 The transpiler auto-detects the mode:
-- If the expression contains `$fetch()` calls -> generates a multi-provider transform with `Deps` metadata
+- If the expression contains `$fetch()` or `$service()` calls -> generates a multi-provider transform with `Deps` metadata and an `ExecuteXxx` orchestration function
 - Otherwise -> generates a streaming filter+projection transform
 
 ### `cmd/apigen` - Config/OpenAPI to Fiber Routes
@@ -476,3 +598,4 @@ GOEXPERIMENT=jsonv2 go test ./internal/transpiler/ -v
 | Request path | `$request().path` | `$request().path` |
 | Request method | `$request().method` | `$request().method` |
 | Request body | `$request().body.path` | `$request().body.user.name` |
+| `$service` | `$service("name").path` | `$service("get_user").name` |

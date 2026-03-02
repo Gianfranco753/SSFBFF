@@ -2,6 +2,9 @@
 #
 # Provider base URLs can be overridden at runtime via environment variables:
 #   UPSTREAM_USER_SERVICE_URL, UPSTREAM_BANK_SERVICE_URL, etc.
+#
+# Set "optional: true" on a provider to allow graceful degradation — if the
+# provider fails, its data is set to null and the request continues.
 
 providers:
   user_service:
@@ -13,6 +16,7 @@ providers:
   bank_service:
     base_url: http://bank-svc:8080
     timeout: 3s
+    optional: true  # failure stores null, chain continues
     endpoints:
       accounts: /api/accounts
 

@@ -44,15 +44,9 @@ func RegisterRoutes(app *fiber.App, fetch FetchFunc, agg *aggregator.Aggregator)
 			}
 		}
 
-		deps := generated.TransformDashboardDeps(reqCtx)
-		fetched, err := agg.Fetch(c.Context(), deps)
+		result, err := generated.ExecuteDashboard(c.Context(), agg, reqCtx)
 		if err != nil {
 			return fiber.NewError(fiber.StatusBadGateway, err.Error())
-		}
-
-		result, err := generated.TransformDashboard(fetched, reqCtx)
-		if err != nil {
-			return fiber.NewError(fiber.StatusInternalServerError, err.Error())
 		}
 
 		c.Set("Content-Type", "application/json")

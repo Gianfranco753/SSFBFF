@@ -301,11 +301,12 @@ func (fc *fieldCollector) build() []StructField {
 //    $request().path, $request().method, $request().body.field
 
 // ProviderPlan is the intermediate representation for expressions that use
-// $fetch() calls and/or request functions.
+// $fetch() calls, $service() calls, and/or request functions.
 type ProviderPlan struct {
 	FuncName     string             // e.g. "TransformDashboard"
 	Fields       []ProviderField    // output fields in order
 	Deps         []ProviderDepEntry // unique provider+endpoint pairs needed
+	Services     []string           // unique service names referenced via $service()
 	NeedsRequest bool               // true if any field or fetch config uses request functions
 }
 
@@ -314,13 +315,17 @@ type ProviderPlan struct {
 // the corresponding group.
 type ProviderField struct {
 	OutputKey string
-	Kind      string // "fetch", "header", "cookie", "query", "param", "path", "method", "body", "static"
+	Kind      string // "fetch", "service", "header", "cookie", "query", "param", "path", "method", "body", "static"
 
 	// Kind="fetch": value comes from a pre-fetched upstream response.
 	Provider    string
 	Endpoint    string
 	JSONPath    []string
 	FetchConfig *FetchConfig // nil when $fetch() has only 2 args
+
+	// Kind="service": value comes from another generated transform pipeline.
+	// JSONPath is reused for the path into the service result.
+	ServiceName string
 
 	// Kind="header"/"cookie"/"query"/"param": value from $request().headers.X etc.
 	Arg string
@@ -415,13 +420,23 @@ func AnalyzeFetchCalls(root jparse.Node, funcName string) (*ProviderPlan, error)
 				})
 			}
 		}
+
+		// Register unique service deps.
+		if field.Kind == "service" {
+			svcKey := "$service." + field.ServiceName
+			if !seen[svcKey] {
+				seen[svcKey] = true
+				plan.Services = append(plan.Services, field.ServiceName)
+			}
+		}
 	}
 
 	return plan, nil
 }
 
-// HasFetchCalls returns true if the AST contains $fetch() or $request() calls.
-// Used to auto-detect which codegen path the transpiler should take.
+// HasFetchCalls returns true if the AST contains $fetch(), $request(), or
+// $service() calls. Used to auto-detect which codegen path the transpiler
+// should take.
 func HasFetchCalls(root jparse.Node) bool {
 	switch n := root.(type) {
 	case *jparse.PathNode:
@@ -438,7 +453,7 @@ func HasFetchCalls(root jparse.Node) bool {
 		}
 	case *jparse.FunctionCallNode:
 		if v, ok := n.Func.(*jparse.VariableNode); ok {
-			if v.Name == "fetch" || v.Name == "request" {
+			if v.Name == "fetch" || v.Name == "request" || v.Name == "service" {
 				return true
 			}
 		}
@@ -511,6 +526,9 @@ func analyzeFunctionCall(fnCall *jparse.FunctionCallNode, trailingPath []string)
 	switch fnVar.Name {
 	case "fetch":
 		return analyzeFetchFn(fnCall, trailingPath)
+
+	case "service":
+		return analyzeServiceFn(fnCall, trailingPath)
 
 	case "request":
 		if len(fnCall.Args) != 0 {
@@ -596,6 +614,26 @@ func analyzeFetchFn(fnCall *jparse.FunctionCallNode, trailingPath []string) (Pro
 	}
 
 	return field, nil
+}
+
+// analyzeServiceFn parses a $service("name") call. It takes one string argument
+// (the service name) and optional trailing path segments for extracting nested
+// values from the service result.
+func analyzeServiceFn(fnCall *jparse.FunctionCallNode, trailingPath []string) (ProviderField, error) {
+	if len(fnCall.Args) != 1 {
+		return ProviderField{}, fmt.Errorf("$service() requires exactly 1 argument, got %d", len(fnCall.Args))
+	}
+
+	nameArg, ok := fnCall.Args[0].(*jparse.StringNode)
+	if !ok {
+		return ProviderField{}, fmt.Errorf("$service() argument must be a string literal, got %T", fnCall.Args[0])
+	}
+
+	return ProviderField{
+		Kind:        "service",
+		ServiceName: nameArg.Value,
+		JSONPath:    trailingPath,
+	}, nil
 }
 
 // analyzeFetchConfig parses the 3rd argument of $fetch() — an ObjectNode with

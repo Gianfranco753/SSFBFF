@@ -21,11 +21,14 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// ProviderConfig describes a single upstream service.
+// ProviderConfig describes a single upstream service. When Optional is true,
+// a fetch failure stores null instead of stopping the request — this supports
+// graceful degradation for non-critical services.
 type ProviderConfig struct {
-	BaseURL  string                    `yaml:"base_url"`
-	Timeout  time.Duration             `yaml:"timeout"`
-	Endpoints map[string]string        `yaml:"endpoints"` // name -> path
+	BaseURL   string            `yaml:"base_url"`
+	Timeout   time.Duration     `yaml:"timeout"`
+	Endpoints map[string]string `yaml:"endpoints"` // name -> path
+	Optional  bool              `yaml:"optional"`
 }
 
 // Aggregator holds provider configs and an HTTP client pool. It is safe for
@@ -70,8 +73,14 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 
 	for _, dep := range deps {
 		g.Go(func() error {
-			url, timeout, err := a.resolveURL(dep)
+			url, timeout, optional, err := a.resolveURL(dep)
 			if err != nil {
+				if optional {
+					mu.Lock()
+					results[dep.Key()] = []byte("null")
+					mu.Unlock()
+					return nil
+				}
 				return err
 			}
 
@@ -80,6 +89,12 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 
 			body, err := a.doRequest(reqCtx, dep, url)
 			if err != nil {
+				if optional {
+					mu.Lock()
+					results[dep.Key()] = []byte("null")
+					mu.Unlock()
+					return nil
+				}
 				return fmt.Errorf("%s/%s: %w", dep.Provider, dep.Endpoint, err)
 			}
 
@@ -96,33 +111,33 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 	return results, nil
 }
 
-// resolveURL builds the full URL for a dep and returns the provider timeout.
-// It checks for an env var override first: UPSTREAM_<PROVIDER>_URL.
-func (a *Aggregator) resolveURL(dep runtime.ProviderDep) (string, time.Duration, error) {
+// resolveURL builds the full URL for a dep and returns the provider timeout
+// and whether the provider is optional. It checks for an env var override
+// first: UPSTREAM_<PROVIDER>_URL.
+func (a *Aggregator) resolveURL(dep runtime.ProviderDep) (url string, timeout time.Duration, optional bool, err error) {
 	prov, ok := a.providers[dep.Provider]
 	if !ok {
-		return "", 0, fmt.Errorf("unknown provider %q", dep.Provider)
+		return "", 0, false, fmt.Errorf("unknown provider %q", dep.Provider)
 	}
 
 	path, ok := prov.Endpoints[dep.Endpoint]
 	if !ok {
-		return "", 0, fmt.Errorf("provider %q has no endpoint %q", dep.Provider, dep.Endpoint)
+		return "", 0, prov.Optional, fmt.Errorf("provider %q has no endpoint %q", dep.Provider, dep.Endpoint)
 	}
 
-	// Allow env var override for the base URL (same convention as existing BFF).
 	envKey := "UPSTREAM_" + strings.ToUpper(dep.Provider) + "_URL"
 	baseURL := os.Getenv(envKey)
 	if baseURL == "" {
 		baseURL = prov.BaseURL
 	}
 
-	timeout := prov.Timeout
+	timeout = prov.Timeout
 	if timeout == 0 {
 		timeout = 10 * time.Second
 	}
 
-	url := strings.TrimRight(baseURL, "/") + path
-	return url, timeout, nil
+	url = strings.TrimRight(baseURL, "/") + path
+	return url, timeout, prov.Optional, nil
 }
 
 // doRequest makes an HTTP request respecting dep.Method, dep.Headers, and

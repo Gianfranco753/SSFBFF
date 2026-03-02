@@ -49,9 +49,16 @@ func (d ProviderDep) Key() string {
 // given path. It streams through the JSON with jsontext.Decoder so it never
 // allocates a map[string]any for the entire document.
 //
+// If data is nil, empty, or a JSON null literal, it returns the JSON value
+// "null" — this supports graceful degradation when an optional provider fails.
+//
 // Example: ExtractPath(data, "user", "name") finds {"user":{"name":"Alice"}}
 // and returns the raw JSON value "Alice".
 func ExtractPath(data []byte, path ...string) (jsontext.Value, error) {
+	if len(data) == 0 || string(bytes.TrimSpace(data)) == "null" {
+		return jsontext.Value("null"), nil
+	}
+
 	dec := jsontext.NewDecoder(bytes.NewReader(data))
 
 	for i, key := range path {

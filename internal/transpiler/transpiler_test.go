@@ -1,6 +1,8 @@
 package transpiler_test
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -135,6 +137,16 @@ func TestHasFetchCalls(t *testing.T) {
 		{
 			name: "$request().body with path",
 			expr: `{"name": $request().body.user.name}`,
+			want: true,
+		},
+		{
+			name: "$service() call",
+			expr: `{"user": $service("get_user").name}`,
+			want: true,
+		},
+		{
+			name: "$service() with $fetch()",
+			expr: `{"user": $service("get_user").name, "data": $fetch("svc", "ep").val}`,
 			want: true,
 		},
 	}
@@ -568,6 +580,7 @@ func TestFetchEndToEnd(t *testing.T) {
 
 	dir := t.TempDir()
 	copyRuntimePackage(t, dir)
+	copyAggregatorPackage(t, dir)
 
 	harness := `//go:build goexperiment.jsonv2
 
@@ -651,6 +664,7 @@ func TestRequestContextEndToEnd(t *testing.T) {
 
 	dir := t.TempDir()
 	copyRuntimePackage(t, dir)
+	copyAggregatorPackage(t, dir)
 
 	harness := `//go:build goexperiment.jsonv2
 
@@ -720,6 +734,257 @@ func main() {
 	t.Logf("generated code output:\n%s", output)
 }
 
+// --- $service() tests ---
+
+func TestAnalyzeServiceCalls(t *testing.T) {
+	expr := `{"user": $service("get_user").name, "balance": $fetch("bank_svc", "accounts").amount}`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformDashboard")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	if len(plan.Fields) != 2 {
+		t.Fatalf("Fields count = %d, want 2", len(plan.Fields))
+	}
+
+	userField := plan.Fields[0]
+	if userField.Kind != "service" || userField.ServiceName != "get_user" {
+		t.Errorf("field[0] = %+v, want Kind=service, ServiceName=get_user", userField)
+	}
+	if len(userField.JSONPath) != 1 || userField.JSONPath[0] != "name" {
+		t.Errorf("field[0] JSONPath = %v, want [name]", userField.JSONPath)
+	}
+
+	balanceField := plan.Fields[1]
+	if balanceField.Kind != "fetch" || balanceField.Provider != "bank_svc" {
+		t.Errorf("field[1] = %+v, want Kind=fetch, Provider=bank_svc", balanceField)
+	}
+
+	if len(plan.Deps) != 1 {
+		t.Errorf("Deps count = %d, want 1", len(plan.Deps))
+	}
+	if len(plan.Services) != 1 || plan.Services[0] != "get_user" {
+		t.Errorf("Services = %v, want [get_user]", plan.Services)
+	}
+}
+
+func TestGenerateServiceCode(t *testing.T) {
+	expr := `{"user": $service("get_user").name, "data": $fetch("svc", "ep").value}`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformDashboard")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	src, err := transpiler.GenerateProvider(plan, "testpkg", "dashboard.jsonata", expr)
+	if err != nil {
+		t.Fatalf("generate error: %v", err)
+	}
+
+	code := string(src)
+
+	mustContain := []string{
+		"TransformDashboardDeps(req runtime.RequestContext)",
+		"TransformDashboard(results map[string][]byte, req runtime.RequestContext)",
+		`results["$service.get_user"]`,
+		`runtime.ExtractPath(results["$service.get_user"], "name")`,
+		`runtime.ExtractPath(results["svc.ep"], "value")`,
+	}
+
+	for _, s := range mustContain {
+		if !strings.Contains(code, s) {
+			t.Errorf("generated code missing %q\n\ngenerated:\n%s", s, code)
+		}
+	}
+}
+
+func TestGenerateExecuteFunc(t *testing.T) {
+	expr := `{"user": $service("get_user").name, "data": $fetch("svc", "ep").value}`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformDashboard")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	src, err := transpiler.GenerateProvider(plan, "testpkg", "dashboard.jsonata", expr)
+	if err != nil {
+		t.Fatalf("generate error: %v", err)
+	}
+
+	code := string(src)
+
+	mustContain := []string{
+		"func ExecuteDashboard(ctx context.Context, agg *aggregator.Aggregator, req runtime.RequestContext)",
+		"TransformDashboardDeps(req)",
+		"agg.Fetch(ctx, deps)",
+		"errgroup.WithContext(ctx)",
+		"ExecuteGetUser(gctx, agg, req)",
+		`results["$service.get_user"]`,
+		"TransformDashboard(results, req)",
+	}
+
+	for _, s := range mustContain {
+		if !strings.Contains(code, s) {
+			t.Errorf("generated code missing %q\n\ngenerated:\n%s", s, code)
+		}
+	}
+}
+
+func TestServiceCompositionEndToEnd(t *testing.T) {
+	// Generate the "inner" service: get_user
+	innerExpr := `{"id": $fetch("user_svc", "profile").id, "name": $fetch("user_svc", "profile").name}`
+	innerAST, err := jparse.Parse(innerExpr)
+	if err != nil {
+		t.Fatalf("parse inner: %v", err)
+	}
+	innerPlan, err := transpiler.AnalyzeFetchCalls(innerAST, "TransformGetUser")
+	if err != nil {
+		t.Fatalf("analyze inner: %v", err)
+	}
+	innerSrc, err := transpiler.GenerateProvider(innerPlan, "main", "get_user.jsonata", innerExpr)
+	if err != nil {
+		t.Fatalf("generate inner: %v", err)
+	}
+
+	// Generate the "outer" service: dashboard (uses $service("get_user"))
+	outerExpr := `{"user_name": $service("get_user").name, "balance": $fetch("bank_svc", "accounts").amount}`
+	outerAST, err := jparse.Parse(outerExpr)
+	if err != nil {
+		t.Fatalf("parse outer: %v", err)
+	}
+	outerPlan, err := transpiler.AnalyzeFetchCalls(outerAST, "TransformDashboard")
+	if err != nil {
+		t.Fatalf("analyze outer: %v", err)
+	}
+	outerSrc, err := transpiler.GenerateProvider(outerPlan, "main", "dashboard.jsonata", outerExpr)
+	if err != nil {
+		t.Fatalf("generate outer: %v", err)
+	}
+
+	dir := t.TempDir()
+	copyRuntimePackage(t, dir)
+	copyAggregatorPackage(t, dir)
+
+	// Fix imports to use local module path.
+	fixImports := func(src []byte) []byte {
+		s := string(src)
+		s = strings.ReplaceAll(s, `"github.com/gcossani/ssfbff/runtime"`, `"testharness/runtime"`)
+		s = strings.ReplaceAll(s, `"github.com/gcossani/ssfbff/internal/aggregator"`, `"testharness/aggregator"`)
+		s = strings.ReplaceAll(s, `"golang.org/x/sync/errgroup"`, `"testharness/errgroup"`)
+		return []byte(s)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "get_user_gen.go"), fixImports(innerSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "dashboard_gen.go"), fixImports(outerSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	harness := `//go:build goexperiment.jsonv2
+
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"testharness/aggregator"
+	"testharness/runtime"
+	"time"
+)
+
+func main() {
+	providers := map[string]aggregator.ProviderConfig{
+		"user_svc": {
+			BaseURL:   os.Getenv("UPSTREAM_USER_SVC_URL"),
+			Timeout:   5 * time.Second,
+			Endpoints: map[string]string{"profile": "/profile"},
+		},
+		"bank_svc": {
+			BaseURL:   os.Getenv("UPSTREAM_BANK_SVC_URL"),
+			Timeout:   5 * time.Second,
+			Endpoints: map[string]string{"accounts": "/accounts"},
+		},
+	}
+
+	agg := aggregator.New(providers)
+	reqCtx := runtime.RequestContext{
+		Headers: map[string]string{"Authorization": "Bearer test"},
+	}
+
+	result, err := ExecuteDashboard(context.Background(), agg, reqCtx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println(string(result))
+
+	var parsed map[string]any
+	if err := json.Unmarshal(result, &parsed); err != nil {
+		fmt.Fprintf(os.Stderr, "parse error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if parsed["user_name"] != "Alice" {
+		fmt.Fprintf(os.Stderr, "expected user_name=Alice, got %v\n", parsed["user_name"])
+		os.Exit(1)
+	}
+	if parsed["balance"] != 42500.75 {
+		fmt.Fprintf(os.Stderr, "expected balance=42500.75, got %v\n", parsed["balance"])
+		os.Exit(1)
+	}
+
+	fmt.Println("PASS")
+}
+`
+
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(harness), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	gomod := "module testharness\n\ngo 1.26\n"
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(gomod), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Start a mock HTTP server that serves user and bank data.
+	mockServer := startMockServer(t)
+	defer mockServer.Close()
+
+	cmd := exec.Command("go", "run", ".")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		"GOEXPERIMENT=jsonv2",
+		"UPSTREAM_USER_SVC_URL="+mockServer.URL,
+		"UPSTREAM_BANK_SVC_URL="+mockServer.URL,
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("running generated code failed:\n%s\nerror: %v", output, err)
+	}
+
+	if !strings.Contains(string(output), "PASS") {
+		t.Fatalf("generated code did not PASS:\n%s", output)
+	}
+	t.Logf("generated code output:\n%s", output)
+}
+
 // --- Test helpers ---
 
 func copyRuntimePackage(t *testing.T, dir string) {
@@ -737,11 +1002,101 @@ func copyRuntimePackage(t *testing.T, dir string) {
 	}
 }
 
+func copyAggregatorPackage(t *testing.T, dir string) {
+	t.Helper()
+	aggDir := filepath.Join(dir, "aggregator")
+	if err := os.MkdirAll(aggDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	aggSrc, err := os.ReadFile("../../internal/aggregator/aggregator.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Fix imports to use local module path.
+	fixed := strings.ReplaceAll(string(aggSrc), `"github.com/gcossani/ssfbff/runtime"`, `"testharness/runtime"`)
+	fixed = strings.ReplaceAll(fixed, `"golang.org/x/sync/errgroup"`, `"testharness/errgroup"`)
+	if err := os.WriteFile(filepath.Join(aggDir, "aggregator.go"), []byte(fixed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The aggregator depends on errgroup — provide a minimal shim.
+	copyErrgroupShim(t, dir)
+}
+
+func copyErrgroupShim(t *testing.T, dir string) {
+	t.Helper()
+	errgroupDir := filepath.Join(dir, "errgroup")
+	if err := os.MkdirAll(errgroupDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	shim := `package errgroup
+
+import (
+	"context"
+	"sync"
+)
+
+type Group struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+	mu     sync.Mutex
+	err    error
+}
+
+func WithContext(ctx context.Context) (*Group, context.Context) {
+	ctx, cancel := context.WithCancel(ctx)
+	return &Group{ctx: ctx, cancel: cancel}, ctx
+}
+
+func (g *Group) Go(f func() error) {
+	g.wg.Add(1)
+	go func() {
+		defer g.wg.Done()
+		if err := f(); err != nil {
+			g.mu.Lock()
+			if g.err == nil {
+				g.err = err
+				g.cancel()
+			}
+			g.mu.Unlock()
+		}
+	}()
+}
+
+func (g *Group) Wait() error {
+	g.wg.Wait()
+	g.cancel()
+	return g.err
+}
+`
+	if err := os.WriteFile(filepath.Join(errgroupDir, "errgroup.go"), []byte(shim), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func startMockServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/profile", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id": 42, "name": "Alice", "email": "alice@example.com"}`))
+	})
+	mux.HandleFunc("/accounts", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"amount": 42500.75, "currency": "USD"}`))
+	})
+	return httptest.NewServer(mux)
+}
+
 func writeTestFiles(t *testing.T, dir string, generatedSrc []byte, harness string) {
 	t.Helper()
 
-	// Fix import path in generated code to use local module.
-	genCode := strings.ReplaceAll(string(generatedSrc), `"github.com/gcossani/ssfbff/runtime"`, `"testharness/runtime"`)
+	// Fix import paths in generated code to use local module.
+	genCode := string(generatedSrc)
+	genCode = strings.ReplaceAll(genCode, `"github.com/gcossani/ssfbff/runtime"`, `"testharness/runtime"`)
+	genCode = strings.ReplaceAll(genCode, `"github.com/gcossani/ssfbff/internal/aggregator"`, `"testharness/aggregator"`)
+	genCode = strings.ReplaceAll(genCode, `"golang.org/x/sync/errgroup"`, `"testharness/errgroup"`)
 	if err := os.WriteFile(filepath.Join(dir, "transform_gen.go"), []byte(genCode), 0o644); err != nil {
 		t.Fatal(err)
 	}
