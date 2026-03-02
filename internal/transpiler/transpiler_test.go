@@ -906,6 +906,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"testharness/aggregator"
 	"testharness/runtime"
@@ -926,7 +927,7 @@ func main() {
 		},
 	}
 
-	agg := aggregator.New(providers)
+	agg := aggregator.New(providers, http.DefaultClient)
 	reqCtx := runtime.RequestContext{
 		Headers: map[string]string{"Authorization": "Bearer test"},
 	}

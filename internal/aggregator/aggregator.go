@@ -10,7 +10,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -31,40 +30,45 @@ type ProviderConfig struct {
 	Optional  bool              `yaml:"optional"`
 }
 
-// Aggregator holds provider configs and an HTTP client pool. It is safe for
+// Aggregator holds provider configs and an HTTP client. It is safe for
 // concurrent use and should be created once at startup.
 type Aggregator struct {
 	providers map[string]ProviderConfig
 	client    *http.Client
-	bufPool   sync.Pool
 }
 
-// New creates an Aggregator from a provider config map.
-func New(providers map[string]ProviderConfig) *Aggregator {
+// LookupEnv is the function used to read environment variables during New().
+// Tests can replace it to avoid depending on real env vars.
+var LookupEnv = os.LookupEnv
+
+// New creates an Aggregator from a provider config map and a shared HTTP client.
+// It resolves UPSTREAM_<PROVIDER>_URL environment overrides once at startup
+// so that per-request lookups are just map reads with zero allocation.
+func New(providers map[string]ProviderConfig, client *http.Client) *Aggregator {
+	resolved := make(map[string]ProviderConfig, len(providers))
+	for name, prov := range providers {
+		envKey := "UPSTREAM_" + strings.ToUpper(name) + "_URL"
+		if override, ok := LookupEnv(envKey); ok && override != "" {
+			prov.BaseURL = override
+		}
+		// Normalize: strip trailing slash so endpoint paths join cleanly.
+		prov.BaseURL = strings.TrimRight(prov.BaseURL, "/")
+		// Apply default timeout once.
+		if prov.Timeout == 0 {
+			prov.Timeout = 10 * time.Second
+		}
+		resolved[name] = prov
+	}
+
 	return &Aggregator{
-		providers: providers,
-		client: &http.Client{
-			// Per-request timeouts are applied via context; this is a safety net.
-			Timeout: 30 * time.Second,
-			Transport: &http.Transport{
-				MaxIdleConnsPerHost: 64,
-				IdleConnTimeout:     90 * time.Second,
-				DialContext: (&net.Dialer{
-					Timeout:   3 * time.Second,
-					KeepAlive: 30 * time.Second,
-				}).DialContext,
-			},
-		},
-		bufPool: sync.Pool{
-			New: func() any { return new(bytes.Buffer) },
-		},
+		providers: resolved,
+		client:    client,
 	}
 }
 
 // Fetch calls all endpoints listed in deps concurrently and returns their raw
 // JSON bodies keyed by "provider.endpoint". Each call respects the provider's
-// configured timeout. Base URLs can be overridden with UPSTREAM_<PROVIDER>_URL
-// environment variables.
+// configured timeout.
 func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map[string][]byte, error) {
 	results := make(map[string][]byte, len(deps))
 	var mu sync.Mutex
@@ -112,8 +116,8 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 }
 
 // resolveURL builds the full URL for a dep and returns the provider timeout
-// and whether the provider is optional. It checks for an env var override
-// first: UPSTREAM_<PROVIDER>_URL.
+// and whether the provider is optional. Env overrides and default timeouts
+// were already applied at startup in New().
 func (a *Aggregator) resolveURL(dep runtime.ProviderDep) (url string, timeout time.Duration, optional bool, err error) {
 	prov, ok := a.providers[dep.Provider]
 	if !ok {
@@ -125,19 +129,7 @@ func (a *Aggregator) resolveURL(dep runtime.ProviderDep) (url string, timeout ti
 		return "", 0, prov.Optional, fmt.Errorf("provider %q has no endpoint %q", dep.Provider, dep.Endpoint)
 	}
 
-	envKey := "UPSTREAM_" + strings.ToUpper(dep.Provider) + "_URL"
-	baseURL := os.Getenv(envKey)
-	if baseURL == "" {
-		baseURL = prov.BaseURL
-	}
-
-	timeout = prov.Timeout
-	if timeout == 0 {
-		timeout = 10 * time.Second
-	}
-
-	url = strings.TrimRight(baseURL, "/") + path
-	return url, timeout, prov.Optional, nil
+	return prov.BaseURL + path, prov.Timeout, prov.Optional, nil
 }
 
 // doRequest makes an HTTP request respecting dep.Method, dep.Headers, and
@@ -172,15 +164,5 @@ func (a *Aggregator) doRequest(ctx context.Context, dep runtime.ProviderDep, url
 		return nil, fmt.Errorf("%s returned %d", url, resp.StatusCode)
 	}
 
-	buf := a.bufPool.Get().(*bytes.Buffer)
-	buf.Reset()
-	defer a.bufPool.Put(buf)
-
-	if _, err := io.Copy(buf, resp.Body); err != nil {
-		return nil, fmt.Errorf("reading response: %w", err)
-	}
-
-	result := make([]byte, buf.Len())
-	copy(result, buf.Bytes())
-	return result, nil
+	return io.ReadAll(resp.Body)
 }

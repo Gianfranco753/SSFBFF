@@ -29,6 +29,7 @@ import (
 	"go/format"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"unicode"
 
@@ -183,6 +184,60 @@ type configRoute struct {
 	FuncName string // e.g. "TransformDashboard"
 	HasFetch bool   // uses $fetch() or $service() — needs aggregator + Execute func
 	HasReq   bool   // uses $request() or $fetch with config — needs RequestContext
+	ReqKeys  requestKeys // which request fields are actually referenced
+}
+
+// requestKeys tracks which specific request fields a JSONata expression uses.
+// By extracting only the needed keys, we avoid copying all headers/cookies on
+// every request — a significant win for high-throughput BFF servers.
+type requestKeys struct {
+	Headers []string // specific header names
+	Cookies []string // specific cookie names
+	Query   bool     // needs query params
+	Params  bool     // needs route params
+	Path    bool     // needs request path
+	Method  bool     // needs HTTP method
+	Body    bool     // needs request body
+}
+
+// reRequestField matches patterns like $request().headers.Authorization,
+// $request().cookies.session, $request().query.page, $request().params.id,
+// $request().path, $request().method, $request().body.
+var reRequestField = regexp.MustCompile(`\$request\(\)\.(headers|cookies|query|params|path|method|body)(?:\.(\w+))?`)
+
+func scanRequestKeys(expr string) requestKeys {
+	var rk requestKeys
+	seenHeaders := map[string]bool{}
+	seenCookies := map[string]bool{}
+
+	for _, match := range reRequestField.FindAllStringSubmatch(expr, -1) {
+		kind := match[1]
+		name := match[2]
+
+		switch kind {
+		case "headers":
+			if name != "" && !seenHeaders[name] {
+				seenHeaders[name] = true
+				rk.Headers = append(rk.Headers, name)
+			}
+		case "cookies":
+			if name != "" && !seenCookies[name] {
+				seenCookies[name] = true
+				rk.Cookies = append(rk.Cookies, name)
+			}
+		case "query":
+			rk.Query = true
+		case "params":
+			rk.Params = true
+		case "path":
+			rk.Path = true
+		case "method":
+			rk.Method = true
+		case "body":
+			rk.Body = true
+		}
+	}
+	return rk
 }
 
 func parseConfig(path, jsonataDir string) ([]configRoute, error) {
@@ -221,6 +276,7 @@ func parseConfig(path, jsonataDir string) ([]configRoute, error) {
 		exprStr := string(expr)
 		hasFetch := strings.Contains(exprStr, "$fetch(") || strings.Contains(exprStr, "$service(")
 		hasReq := strings.Contains(exprStr, "$request(")
+		rk := scanRequestKeys(exprStr)
 
 		routes = append(routes, configRoute{
 			Method:   capitalizeFirst(r.Method),
@@ -228,6 +284,7 @@ func parseConfig(path, jsonataDir string) ([]configRoute, error) {
 			FuncName: funcName,
 			HasFetch: hasFetch,
 			HasReq:   hasReq || hasFetch, // $fetch always uses RequestContext now
+			ReqKeys:  rk,
 		})
 	}
 	return routes, nil
@@ -289,7 +346,7 @@ func generateConfigRoutes(routes []configRoute, pkg, genPkg string) ([]byte, err
 		if r.HasFetch {
 			// Provider/service mode: build request context, call the bundled Execute function.
 			execName := strings.TrimPrefix(r.FuncName, "Transform")
-			writeRequestContextBuilder(w, "\t\t")
+			writeRequestContextBuilder(w, "\t\t", r.ReqKeys)
 			w("\t\tresult, err := generated.Execute%s(c.Context(), agg, reqCtx)\n", execName)
 			w("\t\tif err != nil {\n")
 			w("\t\t\treturn fiber.NewError(fiber.StatusBadGateway, err.Error())\n")
@@ -299,7 +356,7 @@ func generateConfigRoutes(routes []configRoute, pkg, genPkg string) ([]byte, err
 
 		} else if r.HasReq {
 			// Request-only mode: no upstream, just read request data.
-			writeRequestContextBuilder(w, "\t\t")
+			writeRequestContextBuilder(w, "\t\t", r.ReqKeys)
 			w("\t\tresult, err := generated.%s(reqCtx)\n", r.FuncName)
 			w("\t\tif err != nil {\n")
 			w("\t\t\treturn fiber.NewError(fiber.StatusInternalServerError, err.Error())\n")
@@ -335,38 +392,55 @@ func generateConfigRoutes(routes []configRoute, pkg, genPkg string) ([]byte, err
 }
 
 // writeRequestContextBuilder emits Go code that populates a runtime.RequestContext
-// from the Fiber Ctx. We inline this rather than calling a helper function so the
-// runtime package doesn't depend on Fiber.
-func writeRequestContextBuilder(w func(string, ...any), indent string) {
-	w("%sreqCtx := runtime.RequestContext{\n", indent)
-	w("%s\tPath:   c.Path(),\n", indent)
-	w("%s\tMethod: c.Method(),\n", indent)
-	w("%s\tBody:   c.Body(),\n", indent)
-	w("%s}\n", indent)
+// from the Fiber Ctx. It only extracts the specific fields that the JSONata expression
+// actually references — no wasted work copying all headers/cookies on every request.
+func writeRequestContextBuilder(w func(string, ...any), indent string, rk requestKeys) {
+	w("%sreqCtx := runtime.RequestContext{}\n", indent)
 
-	// Fiber v3 exposes headers/cookies/query/params via individual getters.
-	// We copy them into maps for the generated code. This is only done once
-	// per request, so the allocation cost is negligible.
-	w("%sc.Request().Header.VisitAll(func(key, val []byte) {\n", indent)
-	w("%s\tif reqCtx.Headers == nil { reqCtx.Headers = map[string]string{} }\n", indent)
-	w("%s\treqCtx.Headers[string(key)] = string(val)\n", indent)
-	w("%s})\n", indent)
+	// Only extract specific headers that the expression references.
+	if len(rk.Headers) > 0 {
+		w("%sreqCtx.Headers = map[string]string{\n", indent)
+		for _, h := range rk.Headers {
+			w("%s\t%q: c.Get(%q),\n", indent, h, h)
+		}
+		w("%s}\n", indent)
+	}
 
-	w("%sc.Request().Header.VisitAllCookie(func(key, val []byte) {\n", indent)
-	w("%s\tif reqCtx.Cookies == nil { reqCtx.Cookies = map[string]string{} }\n", indent)
-	w("%s\treqCtx.Cookies[string(key)] = string(val)\n", indent)
-	w("%s})\n", indent)
+	// Only extract specific cookies.
+	if len(rk.Cookies) > 0 {
+		w("%sreqCtx.Cookies = map[string]string{\n", indent)
+		for _, c := range rk.Cookies {
+			w("%s\t%q: c.Cookies(%q),\n", indent, c, c)
+		}
+		w("%s}\n", indent)
+	}
 
-	w("%sreqCtx.Query = c.Queries()\n\n", indent)
+	if rk.Query {
+		w("%sreqCtx.Query = c.Queries()\n", indent)
+	}
 
-	// Route params — Fiber v3 doesn't have AllParams(), so we iterate over
-	// the param names from the matched route and read each value.
-	w("%sif routeParams := c.Route().Params; len(routeParams) > 0 {\n", indent)
-	w("%s\treqCtx.Params = make(map[string]string, len(routeParams))\n", indent)
-	w("%s\tfor _, p := range routeParams {\n", indent)
-	w("%s\t\treqCtx.Params[p] = c.Params(p)\n", indent)
-	w("%s\t}\n", indent)
-	w("%s}\n\n", indent)
+	if rk.Params {
+		w("%sif routeParams := c.Route().Params; len(routeParams) > 0 {\n", indent)
+		w("%s\treqCtx.Params = make(map[string]string, len(routeParams))\n", indent)
+		w("%s\tfor _, p := range routeParams {\n", indent)
+		w("%s\t\treqCtx.Params[p] = c.Params(p)\n", indent)
+		w("%s\t}\n", indent)
+		w("%s}\n", indent)
+	}
+
+	if rk.Path {
+		w("%sreqCtx.Path = c.Path()\n", indent)
+	}
+
+	if rk.Method {
+		w("%sreqCtx.Method = c.Method()\n", indent)
+	}
+
+	if rk.Body {
+		w("%sreqCtx.Body = c.Body()\n", indent)
+	}
+
+	w("\n")
 }
 
 // --- Helpers ---

@@ -10,6 +10,11 @@ import (
 	"github.com/gcossani/ssfbff/runtime"
 )
 
+// testClient creates a simple default http.Client for tests.
+func testClient() *http.Client {
+	return &http.Client{Timeout: 10 * time.Second}
+}
+
 func TestFetchParallel(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -26,7 +31,7 @@ func TestFetchParallel(t *testing.T) {
 	agg := New(map[string]ProviderConfig{
 		"user_svc": {BaseURL: srv.URL, Timeout: 5 * time.Second, Endpoints: map[string]string{"profile": "/profile"}},
 		"bank_svc": {BaseURL: srv.URL, Timeout: 5 * time.Second, Endpoints: map[string]string{"accounts": "/accounts"}},
-	})
+	}, testClient())
 
 	deps := []runtime.ProviderDep{
 		{Provider: "user_svc", Endpoint: "profile"},
@@ -60,7 +65,7 @@ func TestFetchWithMethod(t *testing.T) {
 
 	agg := New(map[string]ProviderConfig{
 		"svc": {BaseURL: srv.URL, Timeout: 5 * time.Second, Endpoints: map[string]string{"ep": "/ep"}},
-	})
+	}, testClient())
 
 	deps := []runtime.ProviderDep{
 		{
@@ -82,7 +87,7 @@ func TestFetchWithMethod(t *testing.T) {
 }
 
 func TestFetchUnknownProvider(t *testing.T) {
-	agg := New(map[string]ProviderConfig{})
+	agg := New(map[string]ProviderConfig{}, testClient())
 
 	deps := []runtime.ProviderDep{{Provider: "missing", Endpoint: "ep"}}
 	_, err := agg.Fetch(context.Background(), deps)
@@ -94,7 +99,7 @@ func TestFetchUnknownProvider(t *testing.T) {
 func TestFetchUnknownEndpoint(t *testing.T) {
 	agg := New(map[string]ProviderConfig{
 		"svc": {BaseURL: "http://localhost", Timeout: 1 * time.Second, Endpoints: map[string]string{}},
-	})
+	}, testClient())
 
 	deps := []runtime.ProviderDep{{Provider: "svc", Endpoint: "missing"}}
 	_, err := agg.Fetch(context.Background(), deps)
@@ -104,7 +109,6 @@ func TestFetchUnknownEndpoint(t *testing.T) {
 }
 
 func TestFetchOptionalProviderFailure(t *testing.T) {
-	// Server that always returns 500.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "fail", http.StatusInternalServerError)
 	}))
@@ -117,7 +121,7 @@ func TestFetchOptionalProviderFailure(t *testing.T) {
 			Endpoints: map[string]string{"ep": "/ep"},
 			Optional:  true,
 		},
-	})
+	}, testClient())
 
 	deps := []runtime.ProviderDep{{Provider: "optional_svc", Endpoint: "ep"}}
 	results, err := agg.Fetch(context.Background(), deps)
@@ -142,7 +146,7 @@ func TestFetchRequiredProviderFailure(t *testing.T) {
 			Endpoints: map[string]string{"ep": "/ep"},
 			Optional:  false,
 		},
-	})
+	}, testClient())
 
 	deps := []runtime.ProviderDep{{Provider: "required_svc", Endpoint: "ep"}}
 	_, err := agg.Fetch(context.Background(), deps)
@@ -152,7 +156,6 @@ func TestFetchRequiredProviderFailure(t *testing.T) {
 }
 
 func TestFetchContextCancellation(t *testing.T) {
-	// Server that delays longer than our context timeout.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(2 * time.Second)
 		w.Write([]byte(`{}`))
@@ -161,7 +164,7 @@ func TestFetchContextCancellation(t *testing.T) {
 
 	agg := New(map[string]ProviderConfig{
 		"slow_svc": {BaseURL: srv.URL, Timeout: 100 * time.Millisecond, Endpoints: map[string]string{"ep": "/ep"}},
-	})
+	}, testClient())
 
 	deps := []runtime.ProviderDep{{Provider: "slow_svc", Endpoint: "ep"}}
 	_, err := agg.Fetch(context.Background(), deps)
@@ -176,15 +179,17 @@ func TestFetchEnvOverride(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	// Env overrides are now resolved at startup in New(). We set the env var
+	// before calling New() so the override is applied.
+	t.Setenv("UPSTREAM_MY_SVC_URL", srv.URL)
+
 	agg := New(map[string]ProviderConfig{
 		"my_svc": {
 			BaseURL:   "http://should-not-be-used:1234",
 			Timeout:   5 * time.Second,
 			Endpoints: map[string]string{"ep": "/ep"},
 		},
-	})
-
-	t.Setenv("UPSTREAM_MY_SVC_URL", srv.URL)
+	}, testClient())
 
 	deps := []runtime.ProviderDep{{Provider: "my_svc", Endpoint: "ep"}}
 	results, err := agg.Fetch(context.Background(), deps)
@@ -199,9 +204,9 @@ func TestFetchEnvOverride(t *testing.T) {
 func TestFetchDefaultTimeout(t *testing.T) {
 	agg := New(map[string]ProviderConfig{
 		"svc": {BaseURL: "http://localhost", Endpoints: map[string]string{"ep": "/ep"}},
-	})
+	}, testClient())
 
-	// Just verify resolveURL returns the default 10s timeout.
+	// Default timeout is now applied at startup in New(), so resolveURL returns it directly.
 	dep := runtime.ProviderDep{Provider: "svc", Endpoint: "ep"}
 	_, timeout, _, err := agg.resolveURL(dep)
 	if err != nil {

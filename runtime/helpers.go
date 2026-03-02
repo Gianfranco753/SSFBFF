@@ -33,6 +33,19 @@ type RequestContext struct {
 	Body    []byte
 }
 
+// RequestFieldSet describes which incoming request fields a transform needs.
+// The generated route handler uses this to extract only the necessary
+// headers/cookies/query/params instead of copying everything on every request.
+type RequestFieldSet struct {
+	Headers    []string // header names needed
+	Cookies    []string // cookie names needed
+	Query      []string // query param names needed
+	Params     []string // route param names needed
+	NeedPath   bool     // needs request path
+	NeedMethod bool     // needs HTTP method
+	NeedBody   bool     // needs request body
+}
+
 // ProviderDep identifies an upstream service endpoint that must be fetched
 // before a transform function can run. The aggregator uses this to build
 // the fan-out plan. Method/Headers/Body are optional and allow $fetch()
@@ -352,7 +365,7 @@ func SortArray(v any) any {
 	sorted := make([]any, len(arr))
 	copy(sorted, arr)
 	sort.Slice(sorted, func(i, j int) bool {
-		return fmt.Sprintf("%v", sorted[i]) < fmt.Sprintf("%v", sorted[j])
+		return anyLess(sorted[i], sorted[j])
 	})
 	return sorted
 }
@@ -398,7 +411,7 @@ func DistinctArray(v any) any {
 	seen := map[string]bool{}
 	result := make([]any, 0, len(arr))
 	for _, item := range arr {
-		key := fmt.Sprintf("%v", item)
+		key := anyString(item)
 		if !seen[key] {
 			seen[key] = true
 			result = append(result, item)
@@ -473,7 +486,7 @@ func SortJSON(data []byte) []byte {
 		return data
 	}
 	sort.Slice(arr, func(i, j int) bool {
-		return fmt.Sprintf("%v", arr[i]) < fmt.Sprintf("%v", arr[j])
+		return anyLess(arr[i], arr[j])
 	})
 	result, err := jsonv2.Marshal(arr)
 	if err != nil {
@@ -507,7 +520,7 @@ func DistinctJSON(data []byte) []byte {
 	seen := map[string]bool{}
 	result := make([]any, 0, len(arr))
 	for _, item := range arr {
-		key := fmt.Sprintf("%v", item)
+		key := anyString(item)
 		if !seen[key] {
 			seen[key] = true
 			result = append(result, item)
@@ -600,7 +613,7 @@ func In(value any, set any) bool {
 	switch s := set.(type) {
 	case []any:
 		for _, item := range s {
-			if fmt.Sprintf("%v", value) == fmt.Sprintf("%v", item) {
+			if anyEqual(value, item) {
 				return true
 			}
 		}
@@ -615,7 +628,7 @@ func In(value any, set any) bool {
 			}
 		}
 	case []string:
-		vs := fmt.Sprintf("%v", value)
+		vs := ToString(value)
 		for _, item := range s {
 			if vs == item {
 				return true
@@ -635,6 +648,67 @@ func toFloat(v any) (float64, bool) {
 		return float64(n), true
 	default:
 		return 0, false
+	}
+}
+
+// anyEqual compares two any values without fmt.Sprintf allocations.
+// It handles the common JSON types (string, float64, bool, nil) directly,
+// falling back to fmt.Sprintf only for complex types like maps/slices.
+func anyEqual(a, b any) bool {
+	switch av := a.(type) {
+	case string:
+		bv, ok := b.(string)
+		return ok && av == bv
+	case float64:
+		bv, ok := b.(float64)
+		return ok && av == bv
+	case bool:
+		bv, ok := b.(bool)
+		return ok && av == bv
+	case nil:
+		return b == nil
+	default:
+		return fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b)
+	}
+}
+
+// anyLess compares two any values for ordering without fmt.Sprintf allocations.
+// Numbers sort numerically, strings lexicographically, everything else by type name.
+func anyLess(a, b any) bool {
+	switch av := a.(type) {
+	case float64:
+		if bv, ok := b.(float64); ok {
+			return av < bv
+		}
+	case string:
+		if bv, ok := b.(string); ok {
+			return av < bv
+		}
+	case bool:
+		if bv, ok := b.(bool); ok {
+			return !av && bv // false < true
+		}
+	}
+	return fmt.Sprintf("%v", a) < fmt.Sprintf("%v", b)
+}
+
+// anyString returns a string key for a value, used for deduplication maps.
+// It avoids fmt.Sprintf for the common JSON types.
+func anyString(v any) string {
+	switch val := v.(type) {
+	case string:
+		return "s:" + val
+	case float64:
+		return "n:" + strconv.FormatFloat(val, 'g', -1, 64)
+	case bool:
+		if val {
+			return "b:true"
+		}
+		return "b:false"
+	case nil:
+		return "null"
+	default:
+		return fmt.Sprintf("%v", v)
 	}
 }
 

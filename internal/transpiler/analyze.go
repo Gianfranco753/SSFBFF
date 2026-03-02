@@ -11,6 +11,7 @@ import (
 // QueryPlan is the intermediate representation extracted from a JSONata AST.
 // It captures everything needed to generate Go code: which field to stream to,
 // what to filter, and how to project the output.
+
 // SortTerm describes one sort key for ^() order-by.
 type SortTerm struct {
 	FieldJSON  string // JSON field name (e.g., "price")
@@ -1002,6 +1003,87 @@ type ConfigValue struct {
 type ProviderDepEntry struct {
 	Provider string
 	Endpoint string
+}
+
+// RequestFieldSet describes which incoming request fields a transform needs.
+// This is used by the codegen to emit a targeted extraction var so the route
+// handler only copies the necessary headers/cookies instead of everything.
+type RequestFieldSet struct {
+	Headers    []string
+	Cookies    []string
+	Query      []string
+	Params     []string
+	NeedPath   bool
+	NeedMethod bool
+	NeedBody   bool
+}
+
+func (rf RequestFieldSet) IsEmpty() bool {
+	return len(rf.Headers) == 0 && len(rf.Cookies) == 0 &&
+		len(rf.Query) == 0 && len(rf.Params) == 0 &&
+		!rf.NeedPath && !rf.NeedMethod && !rf.NeedBody
+}
+
+// RequestFields returns the unique set of request context keys that this plan
+// needs, grouped by kind (headers, cookies, query, params) plus booleans for
+// path, method, and body. This lets the route handler extract only the needed
+// values from the incoming request instead of copying all headers/cookies.
+func (p *ProviderPlan) RequestFields() RequestFieldSet {
+	var rf RequestFieldSet
+	seen := map[string]bool{}
+
+	addKey := func(kind, arg string) {
+		key := kind + ":" + arg
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		switch kind {
+		case "header":
+			rf.Headers = append(rf.Headers, arg)
+		case "cookie":
+			rf.Cookies = append(rf.Cookies, arg)
+		case "query":
+			rf.Query = append(rf.Query, arg)
+		case "param":
+			rf.Params = append(rf.Params, arg)
+		case "path":
+			rf.NeedPath = true
+		case "method":
+			rf.NeedMethod = true
+		case "body":
+			rf.NeedBody = true
+		}
+	}
+
+	for _, f := range p.Fields {
+		switch f.Kind {
+		case "header", "cookie", "query", "param":
+			addKey(f.Kind, f.Arg)
+		case "path":
+			addKey("path", "")
+		case "method":
+			addKey("method", "")
+		case "body":
+			addKey("body", "")
+		}
+
+		// Also scan fetch configs for request field references.
+		if f.FetchConfig != nil {
+			for _, h := range f.FetchConfig.Headers {
+				if h.Value.Kind != "static" {
+					addKey(h.Value.Kind, h.Value.Arg)
+				}
+			}
+			for _, b := range f.FetchConfig.Body {
+				if b.Value.Kind != "static" {
+					addKey(b.Value.Kind, b.Value.Arg)
+				}
+			}
+		}
+	}
+
+	return rf
 }
 
 // AnalyzeFetchCalls walks a JSONata AST that uses $fetch() and/or $request()

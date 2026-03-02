@@ -488,6 +488,9 @@ func GenerateProvider(plan *ProviderPlan, packageName, sourceFile, expression st
 	}
 	w(")\n\n")
 
+	// --- RequestFields function (tells apigen which request keys are needed) ---
+	writeRequestFieldsFunc(w, plan)
+
 	// --- Deps function ---
 	writeProviderDepsFunc(w, plan, false)
 
@@ -500,6 +503,75 @@ func GenerateProvider(plan *ProviderPlan, packageName, sourceFile, expression st
 	}
 
 	return format.Source(buf.Bytes())
+}
+
+// writeRequestFieldsFunc emits a function that returns which incoming request
+// fields (headers, cookies, query, params, path, method, body) the transform
+// needs. The generated route handler calls this at init time to build targeted
+// extraction logic instead of copying all headers/cookies on every request.
+func writeRequestFieldsFunc(w func(string, ...any), plan *ProviderPlan) {
+	rf := plan.RequestFields()
+	if rf.IsEmpty() {
+		return
+	}
+
+	baseName := strings.TrimPrefix(plan.FuncName, "Transform")
+	w("// %sRequestFields describes which incoming request data this\n", baseName)
+	w("// transform needs. The route handler uses it to extract only the\n")
+	w("// necessary headers/cookies/query/params instead of copying everything.\n")
+	w("var %sRequestFields = runtime.RequestFieldSet{\n", baseName)
+
+	if len(rf.Headers) > 0 {
+		w("\tHeaders: []string{")
+		for i, h := range rf.Headers {
+			if i > 0 {
+				w(", ")
+			}
+			w("%q", h)
+		}
+		w("},\n")
+	}
+	if len(rf.Cookies) > 0 {
+		w("\tCookies: []string{")
+		for i, c := range rf.Cookies {
+			if i > 0 {
+				w(", ")
+			}
+			w("%q", c)
+		}
+		w("},\n")
+	}
+	if len(rf.Query) > 0 {
+		w("\tQuery: []string{")
+		for i, q := range rf.Query {
+			if i > 0 {
+				w(", ")
+			}
+			w("%q", q)
+		}
+		w("},\n")
+	}
+	if len(rf.Params) > 0 {
+		w("\tParams: []string{")
+		for i, p := range rf.Params {
+			if i > 0 {
+				w(", ")
+			}
+			w("%q", p)
+		}
+		w("},\n")
+	}
+	if rf.NeedPath {
+		w("\tNeedPath: true,\n")
+	}
+	if rf.NeedMethod {
+		w("\tNeedMethod: true,\n")
+	}
+	if rf.NeedBody {
+		w("\tNeedBody: true,\n")
+	}
+
+	w("}\n\n")
 }
 
 func writeProviderDepsFunc(w func(string, ...any), plan *ProviderPlan, _ bool) {
@@ -762,15 +834,6 @@ func requestFuncToMap(kind string) string {
 	default:
 		return "Headers"
 	}
-}
-
-func planHasFetchConfig(plan *ProviderPlan) bool {
-	for _, f := range plan.Fields {
-		if f.FetchConfig != nil {
-			return true
-		}
-	}
-	return false
 }
 
 // unexportedName returns a lowercase version of a Go name for local variables/types.

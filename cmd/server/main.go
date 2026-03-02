@@ -6,7 +6,7 @@
 //
 // Providers are loaded from data/providers/*.yaml at startup.
 // The data directory defaults to "data" but can be overridden with DATA_DIR env var.
-// Provider base URLs can be overridden at runtime:
+// Provider base URLs can be overridden at startup:
 //
 //	UPSTREAM_USER_SERVICE_URL=http://user-svc:8080
 //	UPSTREAM_ORDERS_URL=http://orders-svc:8080/data
@@ -20,6 +20,8 @@ import (
 	jsonv2 "encoding/json/v2"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -32,6 +34,22 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// sharedHTTPClient is a single *http.Client used by both filter-mode fetchers
+// and the aggregator. A single transport means one connection pool for all
+// upstream calls, with sensible limits to prevent connection storms.
+var sharedHTTPClient = &http.Client{
+	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConnsPerHost: 64,
+		MaxConnsPerHost:     128,
+		IdleConnTimeout:     90 * time.Second,
+		DialContext: (&net.Dialer{
+			Timeout:   3 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	},
+}
+
 func main() {
 	dataDir := os.Getenv("DATA_DIR")
 	if dataDir == "" {
@@ -43,7 +61,7 @@ func main() {
 		log.Fatalf("loading providers: %v", err)
 	}
 
-	agg := aggregator.New(providers)
+	agg := aggregator.New(providers, sharedHTTPClient)
 
 	app := fiber.New(fiber.Config{
 		JSONEncoder: func(v any) ([]byte, error) { return jsonv2.Marshal(v) },
