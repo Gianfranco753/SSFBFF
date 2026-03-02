@@ -1,0 +1,42 @@
+# BFF configuration — providers and routes.
+#
+# Provider base URLs can be overridden at runtime via environment variables:
+#   UPSTREAM_USER_SERVICE_URL, UPSTREAM_BANK_SERVICE_URL, etc.
+
+providers:
+  user_service:
+    base_url: http://user-svc:8080
+    timeout: 5s
+    endpoints:
+      profile: /api/profile
+
+  bank_service:
+    base_url: http://bank-svc:8080
+    timeout: 3s
+    endpoints:
+      accounts: /api/accounts
+
+  orders_service:
+    base_url: http://orders-svc:8080
+    timeout: 5s
+    endpoints:
+      data: /data
+
+  products_service:
+    base_url: http://products-svc:8080
+    timeout: 5s
+    endpoints:
+      data: /data
+
+routes:
+  - path: /dashboard
+    method: GET
+    jsonata: dashboard.jsonata
+
+  - path: /api/v1/orders
+    method: GET
+    jsonata: orders.jsonata
+
+  - path: /api/v1/products
+    method: GET
+    jsonata: products.jsonata

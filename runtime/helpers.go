@@ -1,12 +1,87 @@
 //go:build goexperiment.jsonv2
 
-// Package runtime provides optional helper functions that generated code may
-// use for JSONata built-in functions that are too complex to inline.
+// Package runtime provides helper functions and types used by generated code.
 //
-// Currently the transpiler inlines simple aggregations ($sum, $count) directly
-// into the generated code. This package exists as an extension point for more
-// complex built-ins like $reduce, $map, $filter, $string, etc.
+// It contains two categories of helpers:
+//   - Aggregation functions (SumFloat64, CountFloat64, etc.) for filter+projection transforms
+//   - Provider types and ExtractPath for multi-provider transforms that pull
+//     values from pre-fetched upstream JSON responses
 package runtime
+
+import (
+	"bytes"
+	"encoding/json/jsontext"
+	"fmt"
+)
+
+// ProviderDep identifies an upstream service endpoint that must be fetched
+// before a transform function can run. The aggregator uses this to build
+// the fan-out plan.
+type ProviderDep struct {
+	Provider string // e.g. "user_service"
+	Endpoint string // e.g. "profile"
+}
+
+// Key returns the map key used to store/retrieve fetched data for this dep.
+func (d ProviderDep) Key() string {
+	return d.Provider + "." + d.Endpoint
+}
+
+// ExtractPath navigates into a JSON document and returns the raw value at the
+// given path. It streams through the JSON with jsontext.Decoder so it never
+// allocates a map[string]any for the entire document.
+//
+// Example: ExtractPath(data, "user", "name") finds {"user":{"name":"Alice"}}
+// and returns the raw JSON value "Alice".
+func ExtractPath(data []byte, path ...string) (jsontext.Value, error) {
+	dec := jsontext.NewDecoder(bytes.NewReader(data))
+
+	for i, key := range path {
+		// We expect an object at each level of the path.
+		tok, err := dec.ReadToken()
+		if err != nil {
+			return nil, fmt.Errorf("reading object at path[%d] %q: %w", i, key, err)
+		}
+		if tok.Kind() != '{' {
+			return nil, fmt.Errorf("expected object at path[%d] %q, got %v", i, key, tok.Kind())
+		}
+
+		found := false
+		for dec.PeekKind() != '}' {
+			nameTok, err := dec.ReadToken()
+			if err != nil {
+				return nil, fmt.Errorf("reading field name at path[%d]: %w", i, err)
+			}
+
+			if nameTok.String() != key {
+				if err := dec.SkipValue(); err != nil {
+					return nil, fmt.Errorf("skipping field at path[%d]: %w", i, err)
+				}
+				continue
+			}
+
+			found = true
+			break
+		}
+
+		if !found {
+			return nil, fmt.Errorf("field %q not found at path[%d]", key, i)
+		}
+
+		// If this is the last key, read and return the value.
+		if i == len(path)-1 {
+			val, err := dec.ReadValue()
+			if err != nil {
+				return nil, fmt.Errorf("reading value for %q: %w", key, err)
+			}
+			return val, nil
+		}
+		// Otherwise, the next iteration will read the '{' of the nested object.
+	}
+
+	// Empty path — return the entire document as-is.
+	return jsontext.Value(data), nil
+}
 
 // SumFloat64 returns the sum of all values in the slice.
 func SumFloat64(values []float64) float64 {

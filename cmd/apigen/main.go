@@ -1,12 +1,22 @@
-// Command apigen reads an OpenAPI spec and generates Fiber v3 route registration
-// code. Each operation with an "x-service-name" extension is mapped to a
-// pre-compiled JSONata transform function (TransformXxx) and an upstream URL
-// sourced from an environment variable (UPSTREAM_XXX_URL).
+// Command apigen generates Fiber v3 route registration code from either:
+//   - an OpenAPI spec (--spec) with x-service-name extensions, or
+//   - a config.yaml (--config) with providers and routes sections.
+//
+// Config mode supports both filter-mode transforms (single upstream) and
+// provider-mode transforms (multiple upstreams via aggregator). The mode is
+// auto-detected by checking if the jsonata file uses $fetch() calls.
 //
 // Usage:
 //
 //	go run ./cmd/apigen \
 //	  --spec=api/openapi.yaml \
+//	  --output=cmd/server/routes_gen.go \
+//	  --package=main \
+//	  --generated-pkg=github.com/example/project/internal/generated
+//
+//	go run ./cmd/apigen \
+//	  --config=config.yaml \
+//	  --jsonata-dir=internal/generated \
 //	  --output=cmd/server/routes_gen.go \
 //	  --package=main \
 //	  --generated-pkg=github.com/example/project/internal/generated
@@ -18,6 +28,7 @@ import (
 	"fmt"
 	"go/format"
 	"os"
+	"path/filepath"
 	"strings"
 	"unicode"
 
@@ -25,43 +36,71 @@ import (
 )
 
 func main() {
-	spec := flag.String("spec", "", "path to OpenAPI YAML file")
+	spec := flag.String("spec", "", "path to OpenAPI YAML file (legacy mode)")
+	config := flag.String("config", "", "path to config.yaml (provider-aware mode)")
+	jsonataDir := flag.String("jsonata-dir", "", "directory containing .jsonata files (used with --config)")
 	output := flag.String("output", "", "path for the generated .go file")
 	pkg := flag.String("package", "main", "Go package name for the generated file")
 	genPkg := flag.String("generated-pkg", "", "import path of the generated transform package")
 	flag.Parse()
 
-	if *spec == "" || *output == "" || *genPkg == "" {
-		fatal("--spec, --output, and --generated-pkg are required")
+	if *output == "" || *genPkg == "" {
+		fatal("--output and --generated-pkg are required")
 	}
 
-	routes, err := parseSpec(*spec)
-	if err != nil {
-		fatal("parsing spec: %v", err)
+	hasSpec := *spec != ""
+	hasConfig := *config != ""
+	if !hasSpec && !hasConfig {
+		fatal("either --spec or --config is required")
+	}
+	if hasSpec && hasConfig {
+		fatal("--spec and --config are mutually exclusive")
 	}
 
-	src, err := generateRoutes(routes, *pkg, *genPkg)
-	if err != nil {
-		fatal("generating routes: %v", err)
+	var src []byte
+	var routeCount int
+	var sourceFile string
+
+	if hasSpec {
+		sourceFile = *spec
+		routes, err := parseSpec(*spec)
+		if err != nil {
+			fatal("parsing spec: %v", err)
+		}
+		routeCount = len(routes)
+		src, err = generateSpecRoutes(routes, *pkg, *genPkg)
+		if err != nil {
+			fatal("generating routes: %v", err)
+		}
+	} else {
+		sourceFile = *config
+		routes, err := parseConfig(*config, *jsonataDir)
+		if err != nil {
+			fatal("parsing config: %v", err)
+		}
+		routeCount = len(routes)
+		src, err = generateConfigRoutes(routes, *pkg, *genPkg)
+		if err != nil {
+			fatal("generating routes: %v", err)
+		}
 	}
 
 	if err := os.WriteFile(*output, src, 0o644); err != nil {
 		fatal("writing output: %v", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "apigen: %s -> %s (%d routes)\n", *spec, *output, len(routes))
+	fmt.Fprintf(os.Stderr, "apigen: %s -> %s (%d routes)\n", sourceFile, *output, routeCount)
 }
 
-// route captures what we need from each OpenAPI operation.
-type route struct {
-	Method      string // "Get", "Post", etc.
-	Path        string // e.g., "/api/v1/orders"
-	ServiceName string // value of x-service-name
+// --- OpenAPI spec mode (backward compatible) ---
+
+type specRoute struct {
+	Method      string
+	Path        string
+	ServiceName string
 }
 
-// parseSpec extracts routes with x-service-name from an OpenAPI YAML file.
-// We parse just enough structure — no heavy OpenAPI library needed.
-func parseSpec(path string) ([]route, error) {
+func parseSpec(path string) ([]specRoute, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -77,13 +116,13 @@ func parseSpec(path string) ([]route, error) {
 		return nil, fmt.Errorf("YAML parse: %w", err)
 	}
 
-	var routes []route
+	var routes []specRoute
 	for urlPath, methods := range doc.Paths {
 		for method, op := range methods {
 			if op.ServiceName == "" {
 				continue
 			}
-			routes = append(routes, route{
+			routes = append(routes, specRoute{
 				Method:      capitalizeFirst(method),
 				Path:        urlPath,
 				ServiceName: op.ServiceName,
@@ -93,7 +132,7 @@ func parseSpec(path string) ([]route, error) {
 	return routes, nil
 }
 
-func generateRoutes(routes []route, pkg, genPkg string) ([]byte, error) {
+func generateSpecRoutes(routes []specRoute, pkg, genPkg string) ([]byte, error) {
 	var buf bytes.Buffer
 	w := func(f string, args ...any) { fmt.Fprintf(&buf, f, args...) }
 
@@ -107,11 +146,8 @@ func generateRoutes(routes []route, pkg, genPkg string) ([]byte, error) {
 	w("\tgenerated %q\n", genPkg)
 	w(")\n\n")
 
-	w("// FetchFunc fetches raw JSON from an upstream service URL.\n")
 	w("type FetchFunc func(ctx context.Context, url string) ([]byte, error)\n\n")
 
-	w("// RegisterRoutes wires up all BFF endpoints from the OpenAPI spec.\n")
-	w("// Each route fetches upstream data, applies a compiled transform, and responds.\n")
 	w("func RegisterRoutes(app *fiber.App, fetch FetchFunc) {\n")
 
 	for _, r := range routes {
@@ -136,9 +172,154 @@ func generateRoutes(routes []route, pkg, genPkg string) ([]byte, error) {
 	}
 
 	w("}\n")
-
 	return format.Source(buf.Bytes())
 }
+
+// --- Config mode (provider-aware) ---
+
+type configRoute struct {
+	Method     string
+	Path       string
+	FuncName   string // e.g. "TransformDashboard"
+	IsProvider bool   // true if the jsonata uses $providers
+}
+
+func parseConfig(path, jsonataDir string) ([]configRoute, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var cfg struct {
+		Routes []struct {
+			Path    string `yaml:"path"`
+			Method  string `yaml:"method"`
+			Jsonata string `yaml:"jsonata"`
+		} `yaml:"routes"`
+	}
+
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("YAML parse: %w", err)
+	}
+
+	var routes []configRoute
+	for _, r := range cfg.Routes {
+		baseName := strings.TrimSuffix(r.Jsonata, filepath.Ext(r.Jsonata))
+		funcName := "Transform" + exportedName(baseName)
+
+		// Read the jsonata file to check if it uses $providers.
+		jsonataPath := r.Jsonata
+		if jsonataDir != "" {
+			jsonataPath = filepath.Join(jsonataDir, r.Jsonata)
+		}
+
+		expr, err := os.ReadFile(jsonataPath)
+		if err != nil {
+			return nil, fmt.Errorf("reading %s: %w", jsonataPath, err)
+		}
+
+		isProvider := strings.Contains(string(expr), "$fetch(")
+
+		routes = append(routes, configRoute{
+			Method:     capitalizeFirst(r.Method),
+			Path:       r.Path,
+			FuncName:   funcName,
+			IsProvider: isProvider,
+		})
+	}
+	return routes, nil
+}
+
+func generateConfigRoutes(routes []configRoute, pkg, genPkg string) ([]byte, error) {
+	var buf bytes.Buffer
+	w := func(f string, args ...any) { fmt.Fprintf(&buf, f, args...) }
+
+	// Check if we need the aggregator import.
+	needsAggregator := false
+	needsFetch := false
+	for _, r := range routes {
+		if r.IsProvider {
+			needsAggregator = true
+		} else {
+			needsFetch = true
+		}
+	}
+
+	w("//go:build goexperiment.jsonv2\n\n")
+	w("// Code generated by apigen from config.yaml. DO NOT EDIT.\n\n")
+	w("package %s\n\n", pkg)
+	w("import (\n")
+	if needsFetch {
+		w("\t\"context\"\n")
+		w("\t\"os\"\n")
+	}
+	w("\n")
+	w("\t\"github.com/gofiber/fiber/v3\"\n")
+	if needsAggregator {
+		w("\t\"github.com/gcossani/ssfbff/internal/aggregator\"\n")
+	}
+	w("\tgenerated %q\n", genPkg)
+	w(")\n\n")
+
+	if needsFetch {
+		w("type FetchFunc func(ctx context.Context, url string) ([]byte, error)\n\n")
+	}
+
+	// Build the RegisterRoutes signature based on what's needed.
+	switch {
+	case needsFetch && needsAggregator:
+		w("func RegisterRoutes(app *fiber.App, fetch FetchFunc, agg *aggregator.Aggregator) {\n")
+	case needsAggregator:
+		w("func RegisterRoutes(app *fiber.App, agg *aggregator.Aggregator) {\n")
+	default:
+		w("func RegisterRoutes(app *fiber.App, fetch FetchFunc) {\n")
+	}
+
+	for _, r := range routes {
+		w("\tapp.%s(%q, func(c fiber.Ctx) error {\n", r.Method, r.Path)
+
+		if r.IsProvider {
+			// Provider mode: fan-out via aggregator, then assemble output.
+			w("\t\tfetched, err := agg.Fetch(c.Context(), generated.%sDeps)\n", r.FuncName)
+			w("\t\tif err != nil {\n")
+			w("\t\t\treturn fiber.NewError(fiber.StatusBadGateway, err.Error())\n")
+			w("\t\t}\n\n")
+			w("\t\tresult, err := generated.%s(fetched)\n", r.FuncName)
+			w("\t\tif err != nil {\n")
+			w("\t\t\treturn fiber.NewError(fiber.StatusInternalServerError, err.Error())\n")
+			w("\t\t}\n\n")
+			// Result is already raw JSON bytes, send directly.
+			w("\t\tc.Set(\"Content-Type\", \"application/json\")\n")
+			w("\t\treturn c.Send(result)\n")
+		} else {
+			// Filter mode: single upstream fetch, then transform.
+			// Derive the env var from the function name.
+			svcName := strings.TrimPrefix(r.FuncName, "Transform")
+			envVar := "UPSTREAM_" + toEnvCase(svcName) + "_URL"
+
+			w("\t\tupstreamURL := os.Getenv(%q)\n", envVar)
+			w("\t\tif upstreamURL == \"\" {\n")
+			w("\t\t\treturn fiber.NewError(fiber.StatusServiceUnavailable, \"%s not configured\")\n", envVar)
+			w("\t\t}\n\n")
+			w("\t\tdata, err := fetch(c.Context(), upstreamURL)\n")
+			w("\t\tif err != nil {\n")
+			w("\t\t\treturn fiber.NewError(fiber.StatusBadGateway, err.Error())\n")
+			w("\t\t}\n\n")
+			w("\t\tresults, err := generated.%s(data)\n", r.FuncName)
+			w("\t\tif err != nil {\n")
+			w("\t\t\treturn fiber.NewError(fiber.StatusInternalServerError, err.Error())\n")
+			w("\t\t}\n\n")
+			w("\t\treturn c.JSON(results)\n")
+		}
+
+		w("\t})\n\n")
+	}
+
+	w("}\n")
+	return format.Source(buf.Bytes())
+}
+
+// --- Helpers ---
 
 func capitalizeFirst(s string) string {
 	if s == "" {
@@ -149,7 +330,6 @@ func capitalizeFirst(s string) string {
 	return string(runes)
 }
 
-// exportedName converts a lowercase/snake_case name to an exported Go name.
 func exportedName(s string) string {
 	acronyms := map[string]string{
 		"id": "ID", "url": "URL", "api": "API", "http": "HTTP",
@@ -172,6 +352,22 @@ func exportedName(s string) string {
 		}
 	}
 	return b.String()
+}
+
+// toEnvCase converts "Orders" -> "ORDERS", "UserService" -> "USER_SERVICE" etc.
+// It inserts underscores before uppercase letters that follow lowercase letters.
+func toEnvCase(s string) string {
+	var buf strings.Builder
+	for i, r := range s {
+		if i > 0 && unicode.IsUpper(r) {
+			prev := rune(s[i-1])
+			if unicode.IsLower(prev) {
+				buf.WriteByte('_')
+			}
+		}
+		buf.WriteRune(unicode.ToUpper(r))
+	}
+	return buf.String()
 }
 
 func fatal(format string, args ...any) {

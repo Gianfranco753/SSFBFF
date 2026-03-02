@@ -288,11 +288,174 @@ func (fc *fieldCollector) build() []StructField {
 	return result
 }
 
+// --- Fetch-mode analysis ---
+// Used for expressions like: {"user": $fetch("user_service", "profile").name}
+//
+// The $fetch() function is a custom JSONata convention that declares upstream
+// data dependencies. It is NOT a JSONata variable — it uses function-call syntax
+// so the AST is unambiguous (FunctionCallNode, not VariableNode) and cannot be
+// accidentally shadowed by $name := ... variable assignments.
+
+// ProviderPlan is the intermediate representation for expressions that use
+// $fetch() calls. Instead of filtering arrays, these expressions build an output
+// object by pulling values from multiple pre-fetched upstream responses.
+type ProviderPlan struct {
+	FuncName string             // e.g. "TransformDashboard"
+	Fields   []ProviderField    // output fields in order
+	Deps     []ProviderDepEntry // unique provider+endpoint pairs needed
+}
+
+// ProviderField describes one key in the output JSON object.
+type ProviderField struct {
+	OutputKey string   // JSON key in the output (e.g. "user")
+	Provider  string   // upstream provider name (e.g. "user_service")
+	Endpoint  string   // endpoint on that provider (e.g. "profile")
+	JSONPath  []string // remaining path segments to extract (e.g. ["name"])
+}
+
+// ProviderDepEntry is a unique provider+endpoint pair.
+type ProviderDepEntry struct {
+	Provider string
+	Endpoint string
+}
+
+// AnalyzeFetchCalls walks a JSONata AST that uses $fetch() calls and produces a
+// ProviderPlan. It expects an ObjectNode at the root (or inside a PathNode
+// wrapper) where each value is a path starting with $fetch("provider", "endpoint").
+func AnalyzeFetchCalls(root jparse.Node, funcName string) (*ProviderPlan, error) {
+	obj := unwrapObject(root)
+	if obj == nil {
+		return nil, fmt.Errorf("$fetch expression must be an object literal, got %T", root)
+	}
+
+	plan := &ProviderPlan{FuncName: funcName}
+	seen := map[string]bool{}
+
+	for _, pair := range obj.Pairs {
+		keyName, err := extractSingleName(pair[0])
+		if err != nil {
+			return nil, fmt.Errorf("object key: %w", err)
+		}
+
+		field, err := extractFetchCall(pair[1])
+		if err != nil {
+			return nil, fmt.Errorf("field %q: %w", keyName, err)
+		}
+		field.OutputKey = keyName
+
+		plan.Fields = append(plan.Fields, field)
+
+		depKey := field.Provider + "." + field.Endpoint
+		if !seen[depKey] {
+			seen[depKey] = true
+			plan.Deps = append(plan.Deps, ProviderDepEntry{
+				Provider: field.Provider,
+				Endpoint: field.Endpoint,
+			})
+		}
+	}
+
+	return plan, nil
+}
+
+// HasFetchCalls returns true if the AST contains $fetch() function calls.
+// Used by the transpiler to auto-detect which codegen path to take.
+func HasFetchCalls(root jparse.Node) bool {
+	switch n := root.(type) {
+	case *jparse.PathNode:
+		for _, step := range n.Steps {
+			if HasFetchCalls(step) {
+				return true
+			}
+		}
+	case *jparse.ObjectNode:
+		for _, pair := range n.Pairs {
+			if HasFetchCalls(pair[0]) || HasFetchCalls(pair[1]) {
+				return true
+			}
+		}
+	case *jparse.FunctionCallNode:
+		if v, ok := n.Func.(*jparse.VariableNode); ok && v.Name == "fetch" {
+			return true
+		}
+	}
+	return false
+}
+
+// unwrapObject extracts an ObjectNode from the root, handling the case where
+// jparse wraps it in a PathNode.
+func unwrapObject(root jparse.Node) *jparse.ObjectNode {
+	if obj, ok := root.(*jparse.ObjectNode); ok {
+		return obj
+	}
+	if p, ok := root.(*jparse.PathNode); ok && len(p.Steps) == 1 {
+		if obj, ok := p.Steps[0].(*jparse.ObjectNode); ok {
+			return obj
+		}
+	}
+	return nil
+}
+
+// extractFetchCall parses a value node that should be a $fetch() call,
+// optionally followed by path segments for JSON extraction.
+//
+// AST shape: PathNode → [FunctionCallNode($fetch, "svc", "ep"), NameNode("field"), ...]
+func extractFetchCall(node jparse.Node) (ProviderField, error) {
+	path, ok := node.(*jparse.PathNode)
+	if !ok {
+		return ProviderField{}, fmt.Errorf("expected a path expression, got %T", node)
+	}
+	if len(path.Steps) < 1 {
+		return ProviderField{}, fmt.Errorf("empty path")
+	}
+
+	fnCall, ok := path.Steps[0].(*jparse.FunctionCallNode)
+	if !ok {
+		return ProviderField{}, fmt.Errorf("expected $fetch() call, got %T", path.Steps[0])
+	}
+
+	fnVar, ok := fnCall.Func.(*jparse.VariableNode)
+	if !ok || fnVar.Name != "fetch" {
+		return ProviderField{}, fmt.Errorf("expected $fetch, got $%v", fnCall.Func)
+	}
+
+	if len(fnCall.Args) != 2 {
+		return ProviderField{}, fmt.Errorf("$fetch() requires exactly 2 arguments (provider, endpoint), got %d", len(fnCall.Args))
+	}
+
+	providerArg, ok := fnCall.Args[0].(*jparse.StringNode)
+	if !ok {
+		return ProviderField{}, fmt.Errorf("$fetch() first argument must be a string literal, got %T", fnCall.Args[0])
+	}
+	endpointArg, ok := fnCall.Args[1].(*jparse.StringNode)
+	if !ok {
+		return ProviderField{}, fmt.Errorf("$fetch() second argument must be a string literal, got %T", fnCall.Args[1])
+	}
+
+	// Remaining path steps after $fetch() are the JSON path to extract.
+	var jsonPath []string
+	for _, step := range path.Steps[1:] {
+		name, ok := step.(*jparse.NameNode)
+		if !ok {
+			return ProviderField{}, fmt.Errorf("expected name in path after $fetch(), got %T", step)
+		}
+		jsonPath = append(jsonPath, name.Value)
+	}
+
+	return ProviderField{
+		Provider: providerArg.Value,
+		Endpoint: endpointArg.Value,
+		JSONPath: jsonPath,
+	}, nil
+}
+
 // --- Helpers ---
 
 func extractName(node jparse.Node) (string, error) {
 	switch n := node.(type) {
 	case *jparse.NameNode:
+		return n.Value, nil
+	case *jparse.StringNode:
 		return n.Value, nil
 	case *jparse.PathNode:
 		if len(n.Steps) == 1 {
@@ -361,8 +524,13 @@ func formatFloat(v float64) string {
 	return fmt.Sprintf("%g", v)
 }
 
-// exportedName converts a snake_case or lowercase JSON name to an exported Go name.
+// ExportedName converts a snake_case or lowercase JSON name to an exported Go name.
 // "order_id" -> "OrderID", "price" -> "Price", "id" -> "ID"
+// It is also used by the transpiler CLI to derive function names from file names.
+func ExportedName(s string) string {
+	return exportedName(s)
+}
+
 func exportedName(s string) string {
 	// Common abbreviations that should be all-caps.
 	acronyms := map[string]string{

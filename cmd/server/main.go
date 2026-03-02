@@ -1,13 +1,13 @@
 //go:build goexperiment.jsonv2
 
-// Command server runs the BFF web server. Routes are generated from the OpenAPI
-// spec via cmd/apigen. Each route fetches upstream data and applies a compiled
-// JSONata transform before responding.
+// Command server runs the BFF web server. Routes are generated from config.yaml
+// via cmd/apigen. Each route either fetches from a single upstream (filter mode)
+// or fans out to multiple providers via the aggregator (provider mode).
 //
-// Upstream service URLs are configured via environment variables:
+// Provider base URLs default to config.yaml but can be overridden at runtime:
 //
+//	UPSTREAM_USER_SERVICE_URL=http://user-svc:8080
 //	UPSTREAM_ORDERS_URL=http://orders-svc:8080/data
-//	UPSTREAM_PRODUCTS_URL=http://products-svc:8080/data
 //
 // Run:
 //
@@ -23,12 +23,20 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gcossani/ssfbff/internal/aggregator"
 	"github.com/gofiber/fiber/v3"
+	"gopkg.in/yaml.v3"
 )
 
 func main() {
+	providers, err := loadProviders("config.yaml")
+	if err != nil {
+		log.Fatalf("loading config: %v", err)
+	}
+
+	agg := aggregator.New(providers)
+
 	app := fiber.New(fiber.Config{
-		// Use encoding/json/v2 for all JSON marshaling inside Fiber (c.JSON, etc.)
 		JSONEncoder: func(v any) ([]byte, error) { return jsonv2.Marshal(v) },
 		JSONDecoder: func(data []byte, v any) error { return jsonv2.Unmarshal(data, v) },
 
@@ -37,7 +45,7 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	})
 
-	RegisterRoutes(app, defaultFetch)
+	RegisterRoutes(app, defaultFetch, agg)
 
 	app.Get("/health", func(c fiber.Ctx) error {
 		return c.SendString("ok")
@@ -46,7 +54,6 @@ func main() {
 	addr := listenAddr()
 	log.Printf("BFF server starting on %s", addr)
 
-	// Start Fiber in a goroutine so we can listen for shutdown signals.
 	go func() {
 		if err := app.Listen(addr); err != nil {
 			log.Fatalf("server error: %v", err)
@@ -62,6 +69,24 @@ func main() {
 		log.Fatalf("shutdown error: %v", err)
 	}
 	log.Println("server stopped")
+}
+
+// loadProviders reads the providers section from config.yaml.
+func loadProviders(path string) (map[string]aggregator.ProviderConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var cfg struct {
+		Providers map[string]aggregator.ProviderConfig `yaml:"providers"`
+	}
+
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("parsing config: %w", err)
+	}
+
+	return cfg.Providers, nil
 }
 
 func listenAddr() string {

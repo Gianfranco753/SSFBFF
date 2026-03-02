@@ -52,21 +52,40 @@ func main() {
 		fatal("parsing JSONata expression: %v", err)
 	}
 
-	plan, err := transpiler.Analyze(ast)
-	if err != nil {
-		fatal("analyzing expression: %v", err)
-	}
+	// Auto-detect: if the expression uses $fetch() calls, use the
+	// provider codegen path; otherwise use the filter+projection path.
+	var src []byte
+	var funcName string
 
-	src, err := transpiler.Generate(plan, *pkg, *input, expression)
-	if err != nil {
-		fatal("generating Go code: %v", err)
+	if transpiler.HasFetchCalls(ast) {
+		baseName := strings.TrimSuffix(filepath.Base(*input), filepath.Ext(*input))
+		funcName = "Transform" + transpiler.ExportedName(baseName)
+
+		plan, err := transpiler.AnalyzeFetchCalls(ast, funcName)
+		if err != nil {
+			fatal("analyzing $fetch expression: %v", err)
+		}
+		src, err = transpiler.GenerateProvider(plan, *pkg, *input, expression)
+		if err != nil {
+			fatal("generating provider Go code: %v", err)
+		}
+	} else {
+		plan, err := transpiler.Analyze(ast)
+		if err != nil {
+			fatal("analyzing expression: %v", err)
+		}
+		funcName = plan.FuncName
+		src, err = transpiler.Generate(plan, *pkg, *input, expression)
+		if err != nil {
+			fatal("generating Go code: %v", err)
+		}
 	}
 
 	if err := os.WriteFile(*output, src, 0o644); err != nil {
 		fatal("writing output: %v", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "transpiler: %s -> %s (%s)\n", *input, *output, plan.FuncName)
+	fmt.Fprintf(os.Stderr, "transpiler: %s -> %s (%s)\n", *input, *output, funcName)
 }
 
 func fatal(format string, args ...any) {
