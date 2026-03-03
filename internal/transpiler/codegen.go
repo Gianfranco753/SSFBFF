@@ -278,6 +278,17 @@ func (em *exprEmitter) emit(e *Expr) string {
 	case "elemIndex":
 		return "elemIdx"
 
+	case "error":
+		// Error expression - this should be handled at a higher level
+		// Return a placeholder that will trigger error handling
+		em.w("%s// ERROR: $httpError() should be handled before evaluation\n", em.indent)
+		return "nil"
+
+	case "response":
+		// Response expression - this should be handled at a higher level
+		em.w("%s// ERROR: $httpResponse() should be handled before evaluation\n", em.indent)
+		return "nil"
+
 	default:
 		return "nil"
 	}
@@ -567,7 +578,12 @@ func generateFetchFilter(plan *ProviderPlan, packageName, sourceFile, expression
 	w("\tif err != nil {\n")
 	w("\t\treturn nil, fmt.Errorf(\"%s: marshal: %%w\", err)\n", baseName)
 	w("\t}\n")
-	w("\treturn out, nil\n")
+	w("\t// Wrap array result in 200 OK response\n")
+	w("\treturn &runtime.Response{\n")
+	w("\t\tStatusCode: 200,\n")
+	w("\t\tHeaders:    map[string]string{\"Content-Type\": \"application/json\"},\n")
+	w("\t\tBody:       out,\n")
+	w("\t}, nil\n")
 	w("}\n")
 
 	return format.Source(buf.Bytes())
@@ -720,9 +736,9 @@ func writeProviderTransformFunc(w func(string, ...any), plan *ProviderPlan, hasD
 	// The transform always accepts RequestContext — it's zero-cost when unused
 	// and keeps the signature uniform for the generated handler.
 	if hasDeps {
-		w("func %s(results map[string][]byte, req runtime.RequestContext) ([]byte, error) {\n", plan.FuncName)
+		w("func %s(results map[string][]byte, req runtime.RequestContext) (*runtime.Response, error) {\n", plan.FuncName)
 	} else {
-		w("func %s(req runtime.RequestContext) ([]byte, error) {\n", plan.FuncName)
+		w("func %s(req runtime.RequestContext) (*runtime.Response, error) {\n", plan.FuncName)
 	}
 
 	w("\tvar buf bytes.Buffer\n")
@@ -733,6 +749,162 @@ func writeProviderTransformFunc(w func(string, ...any), plan *ProviderPlan, hasD
 		w("\tenc.WriteToken(jsontext.String(%q))\n", field.OutputKey)
 
 		switch field.Kind {
+		case "error":
+			// If field is directly an error, return immediately
+			w("\t// Error field - return immediately\n")
+			w("\tenc.WriteToken(jsontext.EndObject)\n")
+			w("\treturn nil, runtime.NewHTTPError(%d, %q)\n", field.StatusCode, field.ErrorMessage)
+
+		case "response":
+			// If field is directly a response, evaluate body and headers, then return
+			w("\t// Response field - evaluate and return\n")
+			em := &exprEmitter{
+				w:       w,
+				indent:  "\t\t",
+				elemVar: "elem",
+			}
+			if field.BodyExpr != nil {
+				bodyVal := em.emit(field.BodyExpr)
+				w("\tbodyBytes, err := jsonv2.Marshal(%s)\n", bodyVal)
+			} else {
+				w("\tbodyBytes, err := jsonv2.Marshal(nil)\n")
+			}
+			w("\tif err != nil {\n")
+			w("\t\treturn nil, fmt.Errorf(\"marshal response body: %%w\", err)\n")
+			w("\t}\n")
+			w("\theaders := make(map[string]string)\n")
+			if field.Headers != nil {
+				for headerName, headerExpr := range field.Headers {
+					headerVal := em.emit(headerExpr)
+					w("\theaders[%q] = runtime.ToString(%s)\n", headerName, headerVal)
+				}
+			}
+			w("\tenc.WriteToken(jsontext.EndObject)\n")
+			w("\treturn &runtime.Response{\n")
+			w("\t\tStatusCode: %d,\n", field.StatusCode)
+			w("\t\tHeaders:    headers,\n")
+			w("\t\tBody:       bodyBytes,\n")
+			w("\t}, nil\n")
+
+		case "expr":
+			// Complex expression - evaluate it and check if result is error/response
+			// Use a provider-mode exprEmitter to evaluate the expression
+			em := &exprEmitter{
+				w:       w,
+				indent:  "\t\t",
+				elemVar: "elem", // Not used in provider mode, but needed for interface
+			}
+			// Check if expression contains error or response
+			if field.ValueExpr.Kind == "error" {
+				w("\t// Expression evaluates to error - return immediately\n")
+				w("\tenc.WriteToken(jsontext.EndObject)\n")
+				w("\treturn nil, runtime.NewHTTPError(%d, %q)\n", field.ValueExpr.StatusCode, field.ValueExpr.ErrorMessage)
+			} else if field.ValueExpr.Kind == "response" {
+				w("\t// Expression evaluates to response - return immediately\n")
+				// Evaluate body
+				bodyVal := em.emit(field.ValueExpr.ResponseBodyExpr)
+				w("\tbodyBytes, err := jsonv2.Marshal(%s)\n", bodyVal)
+				w("\tif err != nil {\n")
+				w("\t\treturn nil, fmt.Errorf(\"marshal response body: %%w\", err)\n")
+				w("\t}\n")
+				w("\theaders := make(map[string]string)\n")
+				if field.ValueExpr.ResponseHeaders != nil {
+					for headerName, headerExpr := range field.ValueExpr.ResponseHeaders {
+						headerVal := em.emit(headerExpr)
+						w("\theaders[%q] = runtime.ToString(%s)\n", headerName, headerVal)
+					}
+				}
+				w("\tenc.WriteToken(jsontext.EndObject)\n")
+				w("\treturn &runtime.Response{\n")
+				w("\t\tStatusCode: %d,\n", field.ValueExpr.ResponseStatusCode)
+				w("\t\tHeaders:    headers,\n")
+				w("\t\tBody:       bodyBytes,\n")
+				w("\t}, nil\n")
+			} else if field.ValueExpr.Kind == "conditional" {
+				// Handle conditional - check if branches are error/response
+				w("\t// Conditional expression - evaluate and check branches\n")
+				condVal := em.emit(field.ValueExpr.Cond)
+				if field.ValueExpr.Then.Kind == "error" {
+					w("\tif runtime.Truthy(%s) {\n", condVal)
+					w("\t\tenc.WriteToken(jsontext.EndObject)\n")
+					w("\t\treturn nil, runtime.NewHTTPError(%d, %q)\n", field.ValueExpr.Then.StatusCode, field.ValueExpr.Then.ErrorMessage)
+					w("\t}\n")
+					// Evaluate else branch
+					if field.ValueExpr.Else != nil {
+						if field.ValueExpr.Else.Kind == "error" {
+							w("\tenc.WriteToken(jsontext.EndObject)\n")
+							w("\treturn nil, runtime.NewHTTPError(%d, %q)\n", field.ValueExpr.Else.StatusCode, field.ValueExpr.Else.ErrorMessage)
+						} else if field.ValueExpr.Else.Kind == "response" {
+							bodyVal := em.emit(field.ValueExpr.Else.ResponseBodyExpr)
+							w("\tbodyBytes, err := jsonv2.Marshal(%s)\n", bodyVal)
+							w("\tif err != nil {\n")
+							w("\t\treturn nil, fmt.Errorf(\"marshal response body: %%w\", err)\n")
+							w("\t}\n")
+							w("\theaders := make(map[string]string)\n")
+							if field.ValueExpr.Else.ResponseHeaders != nil {
+								for headerName, headerExpr := range field.ValueExpr.Else.ResponseHeaders {
+									headerVal := em.emit(headerExpr)
+									w("\theaders[%q] = runtime.ToString(%s)\n", headerName, headerVal)
+								}
+							}
+							w("\tenc.WriteToken(jsontext.EndObject)\n")
+							w("\treturn &runtime.Response{StatusCode: %d, Headers: headers, Body: bodyBytes}, nil\n", field.ValueExpr.Else.ResponseStatusCode)
+						} else {
+							elseVal := em.emit(field.ValueExpr.Else)
+							w("\tenc.WriteValue(%s)\n\n", elseVal)
+						}
+					}
+				} else if field.ValueExpr.Then.Kind == "response" {
+					w("\tif runtime.Truthy(%s) {\n", condVal)
+					bodyVal := em.emit(field.ValueExpr.Then.ResponseBodyExpr)
+					w("\t\tbodyBytes, err := jsonv2.Marshal(%s)\n", bodyVal)
+					w("\t\tif err != nil {\n")
+					w("\t\t\treturn nil, fmt.Errorf(\"marshal response body: %%w\", err)\n")
+					w("\t\t}\n")
+					w("\t\theaders := make(map[string]string)\n")
+					if field.ValueExpr.Then.ResponseHeaders != nil {
+						for headerName, headerExpr := range field.ValueExpr.Then.ResponseHeaders {
+							headerVal := em.emit(headerExpr)
+							w("\t\theaders[%q] = runtime.ToString(%s)\n", headerName, headerVal)
+						}
+					}
+					w("\t\tenc.WriteToken(jsontext.EndObject)\n")
+					w("\t\treturn &runtime.Response{StatusCode: %d, Headers: headers, Body: bodyBytes}, nil\n", field.ValueExpr.Then.ResponseStatusCode)
+					w("\t}\n")
+					if field.ValueExpr.Else != nil {
+						if field.ValueExpr.Else.Kind == "error" {
+							w("\tenc.WriteToken(jsontext.EndObject)\n")
+							w("\treturn nil, runtime.NewHTTPError(%d, %q)\n", field.ValueExpr.Else.StatusCode, field.ValueExpr.Else.ErrorMessage)
+						} else if field.ValueExpr.Else.Kind == "response" {
+							bodyVal := em.emit(field.ValueExpr.Else.ResponseBodyExpr)
+							w("\tbodyBytes, err := jsonv2.Marshal(%s)\n", bodyVal)
+							w("\tif err != nil {\n")
+							w("\t\treturn nil, fmt.Errorf(\"marshal response body: %%w\", err)\n")
+							w("\t}\n")
+							w("\theaders := make(map[string]string)\n")
+							if field.ValueExpr.Else.ResponseHeaders != nil {
+								for headerName, headerExpr := range field.ValueExpr.Else.ResponseHeaders {
+									headerVal := em.emit(headerExpr)
+									w("\theaders[%q] = runtime.ToString(%s)\n", headerName, headerVal)
+								}
+							}
+							w("\tenc.WriteToken(jsontext.EndObject)\n")
+							w("\treturn &runtime.Response{StatusCode: %d, Headers: headers, Body: bodyBytes}, nil\n", field.ValueExpr.Else.ResponseStatusCode)
+						} else {
+							elseVal := em.emit(field.ValueExpr.Else)
+							w("\tenc.WriteValue(%s)\n\n", elseVal)
+						}
+					}
+				} else {
+					// Normal conditional - evaluate normally
+					exprVal := em.emitConditional(field.ValueExpr)
+					w("\tenc.WriteValue(%s)\n\n", exprVal)
+				}
+			} else {
+				// Normal expression - evaluate and write value
+				exprVal := em.emit(field.ValueExpr)
+				w("\tenc.WriteValue(%s)\n\n", exprVal)
+			}
 		case "fetch":
 			depKey := field.Provider + "." + field.Endpoint
 			if len(field.JSONPath) > 0 {
@@ -802,7 +974,12 @@ func writeProviderTransformFunc(w func(string, ...any), plan *ProviderPlan, hasD
 	}
 
 	w("\tenc.WriteToken(jsontext.EndObject)\n")
-	w("\treturn buf.Bytes(), nil\n")
+	w("\t// Wrap normal result in 200 OK response\n")
+	w("\treturn &runtime.Response{\n")
+	w("\t\tStatusCode: 200,\n")
+	w("\t\tHeaders:    map[string]string{\"Content-Type\": \"application/json\"},\n")
+	w("\t\tBody:       buf.Bytes(),\n")
+	w("\t}, nil\n")
 	w("}\n")
 }
 
@@ -815,7 +992,7 @@ func writeExecuteFunc(w func(string, ...any), plan *ProviderPlan) {
 	hasDeps := len(plan.Deps) > 0
 	hasServices := len(plan.Services) > 0
 
-	w("func Execute%s(ctx context.Context, agg *aggregator.Aggregator, req runtime.RequestContext) ([]byte, error) {\n", baseName)
+	w("func Execute%s(ctx context.Context, agg *aggregator.Aggregator, req runtime.RequestContext) (*runtime.Response, error) {\n", baseName)
 
 	if hasDeps {
 		w("\tdeps := %sDeps(req)\n", plan.FuncName)
@@ -838,8 +1015,11 @@ func writeExecuteFunc(w func(string, ...any), plan *ProviderPlan) {
 			w("\t\tif err != nil {\n")
 			w("\t\t\treturn fmt.Errorf(\"service %s: %%w\", err)\n", svc)
 			w("\t\t}\n")
+			w("\t\tif r == nil {\n")
+			w("\t\t\treturn fmt.Errorf(\"service %s: empty response\")\n", svc)
+			w("\t\t}\n")
 			w("\t\tmu.Lock()\n")
-			w("\t\tresults[%q] = r\n", svcKey)
+			w("\t\tresults[%q] = r.Body\n", svcKey)
 			w("\t\tmu.Unlock()\n")
 			w("\t\treturn nil\n")
 			w("\t})\n\n")
@@ -849,7 +1029,11 @@ func writeExecuteFunc(w func(string, ...any), plan *ProviderPlan) {
 		w("\t}\n\n")
 	}
 
-	w("\treturn %s(results, req)\n", plan.FuncName)
+	w("\tresp, err := %s(results, req)\n", plan.FuncName)
+	w("\tif err != nil {\n")
+	w("\t\treturn nil, err\n")
+	w("\t}\n")
+	w("\treturn resp, nil\n")
 	w("}\n\n")
 }
 

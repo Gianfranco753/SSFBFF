@@ -926,7 +926,7 @@ The remaining gaps are mainly higher-order functions, date/time, and regex.
 |---|---|
 | Higher-Order | `$map()`, `$filter()`, `$reduce()`, `$sift()`, `$each()` |
 | Date/Time | `$now()`, `$millis()`, `$fromMillis()`, `$toMillis()` |
-| Other | Lambda expressions, `$eval()`, `$error()` |
+| Other | Lambda expressions, `$eval()` |
 
 </details>
 
@@ -938,3 +938,42 @@ The remaining gaps are mainly higher-order functions, date/time, and regex.
 | `$fetch()` with config | `$fetch("svc", "ep", {"method": "POST"}).val` |
 | `$request()` context | `$request().headers.Authorization` |
 | `$service(name)` composition | `$service("get_user").name` |
+| `$httpError(statusCode, message)` | `$httpError(404, "Not found")` |
+| `$httpResponse(statusCode, body, headers?)` | `$httpResponse(201, $fetch("orders", "create"))` |
+
+#### `$httpError(statusCode, message)`
+
+Returns an HTTP error response with the specified status code and message. Use in conditionals to return errors when conditions aren't met:
+
+```jsonata
+$count($fetch("orders_service", "data")[order_id = $request().params.id]) = 0 
+  ? $httpError(404, "Order not found")
+  : $fetch("orders_service", "data")[order_id = $request().params.id][0]
+```
+
+**Note**: This is a BFF extension function. JSONata has a built-in `$error()` function that throws exceptions, so we use `$httpError()` to avoid conflicts.
+
+#### `$httpResponse(statusCode, body, headers?)`
+
+Returns a custom HTTP response with status code, body, and optional headers. Use for non-200 responses, redirects, or custom headers:
+
+```jsonata
+// 403 Forbidden
+$fetch("user_service", "permissions").can_view_order = false
+  ? $httpResponse(403, {"error": "Access denied"}, {"X-Reason": "insufficient_permissions"})
+  : $fetch("orders_service", "data")[order_id = $request().params.id][0]
+
+// 201 Created
+$httpResponse(201, $fetch("orders_service", "create", {
+  "method": "POST",
+  "body": $request().body
+}), {"Location": $request().path & "/" & $fetch("orders_service", "create").id})
+
+// 301 Redirect
+$httpResponse(301, null, {"Location": "https://example.com/new-path"})
+
+// 204 No Content
+$httpResponse(204, null)
+```
+
+**Note**: Normal data returns default to 200 OK. You only need to use `$httpError()` or `$httpResponse()` when you want non-default status codes, custom headers, or redirects.

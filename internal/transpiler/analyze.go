@@ -60,7 +60,7 @@ type OutputField struct {
 // arithmetic, comparisons, boolean logic, string concatenation, conditionals,
 // and variable bindings. Used internally by fetchFilter mode.
 type Expr struct {
-	Kind   string // "field","arrayField","literal","funcCall","binary","unary","conditional","assign","varRef"
+	Kind   string // "field","arrayField","literal","funcCall","binary","unary","conditional","assign","varRef","error","response"
 	GoType string // inferred Go type: "float64","string","bool","any"
 
 	// Kind="field": reference to an input struct field.
@@ -93,6 +93,15 @@ type Expr struct {
 	// Kind="assign": variable binding ($x := expr).
 	// Kind="varRef": variable reference ($x).
 	VarName string // variable name (without $ prefix)
+
+	// Kind="error": signals an HTTP error should be returned.
+	StatusCode  int    // HTTP status code
+	ErrorMessage string // Error message
+
+	// Kind="response": signals a full HTTP response should be returned.
+	ResponseStatusCode int                // HTTP status code
+	ResponseBodyExpr    *Expr              // Expression for response body
+	ResponseHeaders     map[string]*Expr   // Custom headers (optional)
 }
 
 // analyzeFilterPipeline walks a parsed JSONata AST and produces a QueryPlan.
@@ -607,6 +616,68 @@ func analyzeExpr(node jparse.Node, fc *fieldCollector) (*Expr, error) {
 			return nil, fmt.Errorf("function name: %w", err)
 		}
 
+		// Handle $httpError() function
+		if funcName == "httpError" {
+			if len(n.Args) != 2 {
+				return nil, fmt.Errorf("$httpError() requires exactly 2 arguments (statusCode, message), got %d", len(n.Args))
+			}
+			statusCodeNode, ok := n.Args[0].(*jparse.NumberNode)
+			if !ok {
+				return nil, fmt.Errorf("$httpError() first argument must be a number (status code), got %T", n.Args[0])
+			}
+			messageNode, ok := n.Args[1].(*jparse.StringNode)
+			if !ok {
+				return nil, fmt.Errorf("$httpError() second argument must be a string (message), got %T", n.Args[1])
+			}
+			return &Expr{
+				Kind:         "error",
+				StatusCode:   int(statusCodeNode.Value),
+				ErrorMessage: messageNode.Value,
+				GoType:       "any",
+			}, nil
+		}
+
+		// Handle $httpResponse() function
+		if funcName == "httpResponse" {
+			if len(n.Args) < 2 || len(n.Args) > 3 {
+				return nil, fmt.Errorf("$httpResponse() requires 2 or 3 arguments (statusCode, body, headers?), got %d", len(n.Args))
+			}
+			statusCodeNode, ok := n.Args[0].(*jparse.NumberNode)
+			if !ok {
+				return nil, fmt.Errorf("$httpResponse() first argument must be a number (status code), got %T", n.Args[0])
+			}
+			bodyExpr, err := analyzeExpr(n.Args[1], fc)
+			if err != nil {
+				return nil, fmt.Errorf("$httpResponse() body: %w", err)
+			}
+			expr := &Expr{
+				Kind:                 "response",
+				ResponseStatusCode:   int(statusCodeNode.Value),
+				ResponseBodyExpr:     bodyExpr,
+				GoType:               "any",
+			}
+			if len(n.Args) == 3 {
+				headersObj, ok := n.Args[2].(*jparse.ObjectNode)
+				if !ok {
+					return nil, fmt.Errorf("$httpResponse() third argument must be an object (headers), got %T", n.Args[2])
+				}
+				headers := make(map[string]*Expr)
+				for _, pair := range headersObj.Pairs {
+					key, err := extractSingleName(pair[0])
+					if err != nil {
+						return nil, fmt.Errorf("$httpResponse() header key: %w", err)
+					}
+					valueExpr, err := analyzeExpr(pair[1], fc)
+					if err != nil {
+						return nil, fmt.Errorf("$httpResponse() header %q value: %w", key, err)
+					}
+					headers[key] = valueExpr
+				}
+				expr.ResponseHeaders = headers
+			}
+			return expr, nil
+		}
+
 		// For aggregate functions with a 2-part path argument, build an
 		// arrayField Expr so codegen can emit the right loop pattern.
 		if isAggregateFunc(funcName) && len(n.Args) == 1 {
@@ -963,7 +1034,7 @@ type ProviderPlan struct {
 // the corresponding group.
 type ProviderField struct {
 	OutputKey string
-	Kind      string // "fetch", "fetchFilter", "service", "header", "cookie", "query", "param", "path", "method", "body", "static"
+	Kind      string // "fetch", "fetchFilter", "service", "header", "cookie", "query", "param", "path", "method", "body", "static", "error", "response"
 
 	// Kind="fetch": value comes from a pre-fetched upstream response.
 	Provider    string
@@ -988,6 +1059,17 @@ type ProviderField struct {
 
 	// Kind="static": a literal string value.
 	StaticValue string
+
+	// Kind="error": signals an HTTP error should be returned.
+	StatusCode  int    // HTTP status code
+	ErrorMessage string // Error message
+
+	// Kind="response": signals a full HTTP response should be returned.
+	BodyExpr *Expr                // Expression for response body
+	Headers  map[string]*Expr     // Custom headers (optional)
+
+	// Kind="expr": complex expression (conditionals, etc.) that needs evaluation
+	ValueExpr *Expr // The expression to evaluate
 }
 
 // FetchConfig describes the optional 3rd argument to $fetch() — an object
@@ -1304,7 +1386,7 @@ func tryAnalyzeFetchFilter(root jparse.Node, funcName string) (ProviderField, bo
 }
 
 // analyzeValueNode determines the kind of a value expression and extracts its
-// metadata. It handles $fetch(), request functions, and string literals.
+// metadata. It handles $fetch(), request functions, string literals, and complex expressions.
 func analyzeValueNode(node jparse.Node) (ProviderField, error) {
 	// A bare FunctionCallNode (no path after it) — e.g. $path() or $method().
 	if fnCall, ok := node.(*jparse.FunctionCallNode); ok {
@@ -1318,33 +1400,57 @@ func analyzeValueNode(node jparse.Node) (ProviderField, error) {
 
 	// A PathNode — could be $fetch(...).field, $body().field, $header("X"), etc.
 	path, ok := node.(*jparse.PathNode)
-	if !ok {
-		return ProviderField{}, fmt.Errorf("unsupported value expression %T", node)
-	}
-	if len(path.Steps) < 1 {
-		return ProviderField{}, fmt.Errorf("empty path")
-	}
-
-	fnCall, ok := path.Steps[0].(*jparse.FunctionCallNode)
-	if !ok {
-		return ProviderField{}, fmt.Errorf("expected a function call at start of path, got %T", path.Steps[0])
-	}
-
-	// Collect trailing path segments (NameNodes after the function call).
-	var trailingPath []string
-	for _, step := range path.Steps[1:] {
-		name, ok := step.(*jparse.NameNode)
-		if !ok {
-			return ProviderField{}, fmt.Errorf("expected name in path after function call, got %T", step)
+	if ok && len(path.Steps) > 0 {
+		fnCall, ok := path.Steps[0].(*jparse.FunctionCallNode)
+		if ok {
+			// Collect trailing path segments (NameNodes after the function call).
+			var trailingPath []string
+			for _, step := range path.Steps[1:] {
+				name, ok := step.(*jparse.NameNode)
+				if !ok {
+					return ProviderField{}, fmt.Errorf("expected name in path after function call, got %T", step)
+				}
+				trailingPath = append(trailingPath, name.Value)
+			}
+			return analyzeFunctionCall(fnCall, trailingPath)
 		}
-		trailingPath = append(trailingPath, name.Value)
 	}
 
-	return analyzeFunctionCall(fnCall, trailingPath)
+	// For complex expressions (conditionals, etc.), use analyzeExpr
+	// and check if the result is an error/response
+	fc := &fieldCollector{numeric: map[string]bool{}, varTypes: map[string]string{}}
+	expr, err := analyzeExpr(node, fc)
+	if err != nil {
+		return ProviderField{}, fmt.Errorf("analyzing expression: %w", err)
+	}
+
+	// Check if the expression is an error or response
+	if expr.Kind == "error" {
+		return ProviderField{
+			Kind:         "error",
+			StatusCode:   expr.StatusCode,
+			ErrorMessage: expr.ErrorMessage,
+		}, nil
+	}
+
+	if expr.Kind == "response" {
+		return ProviderField{
+			Kind:       "response",
+			StatusCode: expr.ResponseStatusCode,
+			BodyExpr:   expr.ResponseBodyExpr,
+			Headers:    expr.ResponseHeaders,
+		}, nil
+	}
+
+	// For other expressions, store the Expr for codegen to evaluate
+	return ProviderField{
+		Kind:      "expr",
+		ValueExpr: expr,
+	}, nil
 }
 
 // analyzeFunctionCall parses a FunctionCallNode and its trailing path segments
-// into a ProviderField. It handles $fetch() and $request().
+// into a ProviderField. It handles $fetch(), $request(), $httpError(), and $httpResponse().
 func analyzeFunctionCall(fnCall *jparse.FunctionCallNode, trailingPath []string) (ProviderField, error) {
 	fnVar, ok := fnCall.Func.(*jparse.VariableNode)
 	if !ok {
@@ -1363,6 +1469,21 @@ func analyzeFunctionCall(fnCall *jparse.FunctionCallNode, trailingPath []string)
 			return ProviderField{}, fmt.Errorf("$request() takes no arguments, got %d", len(fnCall.Args))
 		}
 		return analyzeRequestPath(trailingPath)
+
+	case "httpError":
+		if len(trailingPath) > 0 {
+			return ProviderField{}, fmt.Errorf("$httpError() does not support path navigation")
+		}
+		return analyzeErrorFn(fnCall)
+
+	case "httpResponse":
+		if len(trailingPath) > 0 {
+			return ProviderField{}, fmt.Errorf("$httpResponse() does not support path navigation")
+		}
+		// $httpResponse() needs a fieldCollector for analyzing expressions in body/headers
+		// We'll create a temporary one here
+		fc := &fieldCollector{numeric: map[string]bool{}, varTypes: map[string]string{}}
+		return analyzeResponseFn(fnCall, fc)
 
 	default:
 		return ProviderField{}, fmt.Errorf("unsupported function $%s", fnVar.Name)
@@ -1462,6 +1583,82 @@ func analyzeServiceFn(fnCall *jparse.FunctionCallNode, trailingPath []string) (P
 		ServiceName: nameArg.Value,
 		JSONPath:    trailingPath,
 	}, nil
+}
+
+// analyzeErrorFn parses a $httpError(statusCode, message) call.
+// It takes 2 arguments: status code (number) and message (string).
+func analyzeErrorFn(fnCall *jparse.FunctionCallNode) (ProviderField, error) {
+	if len(fnCall.Args) != 2 {
+		return ProviderField{}, fmt.Errorf("$httpError() requires exactly 2 arguments (statusCode, message), got %d", len(fnCall.Args))
+	}
+
+	statusCodeNode, ok := fnCall.Args[0].(*jparse.NumberNode)
+	if !ok {
+		return ProviderField{}, fmt.Errorf("$httpError() first argument must be a number (status code), got %T", fnCall.Args[0])
+	}
+
+	messageNode, ok := fnCall.Args[1].(*jparse.StringNode)
+	if !ok {
+		return ProviderField{}, fmt.Errorf("$httpError() second argument must be a string (message), got %T", fnCall.Args[1])
+	}
+
+	return ProviderField{
+		Kind:         "error",
+		StatusCode:   int(statusCodeNode.Value),
+		ErrorMessage: messageNode.Value,
+	}, nil
+}
+
+// analyzeResponseFn parses a $httpResponse(statusCode, body, headers?) call.
+// Arguments:
+//   - statusCode: number (HTTP status code)
+//   - body: any (response body, will be JSON-marshalled)
+//   - headers: object (optional, custom headers)
+func analyzeResponseFn(fnCall *jparse.FunctionCallNode, fc *fieldCollector) (ProviderField, error) {
+	if len(fnCall.Args) < 2 || len(fnCall.Args) > 3 {
+		return ProviderField{}, fmt.Errorf("$httpResponse() requires 2 or 3 arguments (statusCode, body, headers?), got %d", len(fnCall.Args))
+	}
+
+	statusCodeNode, ok := fnCall.Args[0].(*jparse.NumberNode)
+	if !ok {
+		return ProviderField{}, fmt.Errorf("$httpResponse() first argument must be a number (status code), got %T", fnCall.Args[0])
+	}
+
+	// Second arg is the body - can be any expression, we'll evaluate it
+	bodyExpr, err := analyzeExpr(fnCall.Args[1], fc)
+	if err != nil {
+		return ProviderField{}, fmt.Errorf("$httpResponse() body: %w", err)
+	}
+
+	field := ProviderField{
+		Kind:       "response",
+		StatusCode: int(statusCodeNode.Value),
+		BodyExpr:   bodyExpr,
+	}
+
+	// Optional 3rd arg: headers object
+	if len(fnCall.Args) == 3 {
+		headersObj, ok := fnCall.Args[2].(*jparse.ObjectNode)
+		if !ok {
+			return ProviderField{}, fmt.Errorf("$httpResponse() third argument must be an object (headers), got %T", fnCall.Args[2])
+		}
+
+		headers := make(map[string]*Expr)
+		for _, pair := range headersObj.Pairs {
+			key, err := extractSingleName(pair[0])
+			if err != nil {
+				return ProviderField{}, fmt.Errorf("$httpResponse() header key: %w", err)
+			}
+			valueExpr, err := analyzeExpr(pair[1], fc)
+			if err != nil {
+				return ProviderField{}, fmt.Errorf("$httpResponse() header %q value: %w", key, err)
+			}
+			headers[key] = valueExpr
+		}
+		field.Headers = headers
+	}
+
+	return field, nil
 }
 
 // analyzeFetchConfig parses the 3rd argument of $fetch() — an ObjectNode with

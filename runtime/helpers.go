@@ -11,6 +11,7 @@ package runtime
 import (
 	"bytes"
 	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
 	"fmt"
 	"math"
 	"sort"
@@ -710,4 +711,44 @@ func WildcardValues(v any) []any {
 		vals[i] = m[k]
 	}
 	return vals
+}
+
+// Response represents a complete HTTP response with status code, headers, and body.
+// This allows JSONata transforms to control the full HTTP response.
+type Response struct {
+	StatusCode int
+	Headers    map[string]string
+	Body       []byte
+}
+
+// HTTPError represents an error with an associated HTTP status code.
+// This is a convenience wrapper around Response for error cases.
+type HTTPError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *HTTPError) Error() string {
+	return e.Message
+}
+
+// NewHTTPError creates a new HTTPError with the given status code and message.
+func NewHTTPError(statusCode int, message string) *HTTPError {
+	return &HTTPError{
+		StatusCode: statusCode,
+		Message:    message,
+	}
+}
+
+// ToResponse converts an HTTPError to a Response.
+func (e *HTTPError) ToResponse() *Response {
+	body, _ := jsonv2.Marshal(map[string]any{
+		"error":  e.Message,
+		"status": e.StatusCode,
+	})
+	return &Response{
+		StatusCode: e.StatusCode,
+		Headers:    map[string]string{"Content-Type": "application/json"},
+		Body:       body,
+	}
 }

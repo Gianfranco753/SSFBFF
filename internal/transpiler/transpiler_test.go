@@ -66,6 +66,16 @@ func TestHasFetchCalls(t *testing.T) {
 			expr: `{"user": $service("get_user").name, "data": $fetch("svc", "ep").val}`,
 			want: true,
 		},
+		{
+			name: "$httpError() call",
+			expr: `$httpError(404, "Not found")`,
+			want: true,
+		},
+		{
+			name: "$httpResponse() call",
+			expr: `$httpResponse(201, {"id": 123})`,
+			want: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -1085,6 +1095,172 @@ func startMockServer(t *testing.T) *httptest.Server {
 		w.Write([]byte(`{"amount": 42500.75, "currency": "USD"}`))
 	})
 	return httptest.NewServer(mux)
+}
+
+// TestAnalyzeHttpError verifies that $httpError() is correctly parsed.
+func TestAnalyzeHttpError(t *testing.T) {
+	expr := `$httpError(404, "Order not found")`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformGetOrder")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	if len(plan.Fields) != 1 {
+		t.Fatalf("Fields count = %d, want 1", len(plan.Fields))
+	}
+
+	field := plan.Fields[0]
+	if field.Kind != "error" {
+		t.Errorf("field.Kind = %q, want %q", field.Kind, "error")
+	}
+	if field.StatusCode != 404 {
+		t.Errorf("field.StatusCode = %d, want 404", field.StatusCode)
+	}
+	if field.ErrorMessage != "Order not found" {
+		t.Errorf("field.ErrorMessage = %q, want %q", field.ErrorMessage, "Order not found")
+	}
+}
+
+// TestAnalyzeHttpResponse verifies that $httpResponse() is correctly parsed.
+func TestAnalyzeHttpResponse(t *testing.T) {
+	expr := `$httpResponse(201, {"id": 123, "name": "test"}, {"Location": "/orders/123"})`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformCreateOrder")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	if len(plan.Fields) != 1 {
+		t.Fatalf("Fields count = %d, want 1", len(plan.Fields))
+	}
+
+	field := plan.Fields[0]
+	if field.Kind != "response" {
+		t.Errorf("field.Kind = %q, want %q", field.Kind, "response")
+	}
+	if field.StatusCode != 201 {
+		t.Errorf("field.StatusCode = %d, want 201", field.StatusCode)
+	}
+	if field.BodyExpr == nil {
+		t.Error("field.BodyExpr should not be nil")
+	}
+	if field.Headers == nil || len(field.Headers) == 0 {
+		t.Error("field.Headers should not be empty")
+	}
+}
+
+// TestAnalyzeHttpErrorInConditional verifies that $httpError() works in conditionals.
+func TestAnalyzeHttpErrorInConditional(t *testing.T) {
+	expr := `$count($fetch("orders_service", "data")[order_id = $request().params.id]) = 0 
+		? $httpError(404, "Order not found")
+		: $fetch("orders_service", "data")[order_id = $request().params.id][0]`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformGetOrder")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	// Should have one field with kind "expr" containing a conditional
+	if len(plan.Fields) != 1 {
+		t.Fatalf("Fields count = %d, want 1", len(plan.Fields))
+	}
+
+	field := plan.Fields[0]
+	if field.Kind != "expr" {
+		t.Errorf("field.Kind = %q, want %q", field.Kind, "expr")
+	}
+	if field.ValueExpr == nil {
+		t.Fatal("field.ValueExpr should not be nil")
+	}
+	if field.ValueExpr.Kind != "conditional" {
+		t.Errorf("field.ValueExpr.Kind = %q, want %q", field.ValueExpr.Kind, "conditional")
+	}
+	if field.ValueExpr.Then == nil || field.ValueExpr.Then.Kind != "error" {
+		t.Errorf("Then branch should be error, got %v", field.ValueExpr.Then)
+	}
+	if field.ValueExpr.Then.StatusCode != 404 {
+		t.Errorf("Then.StatusCode = %d, want 404", field.ValueExpr.Then.StatusCode)
+	}
+}
+
+// TestGenerateHttpErrorCode verifies that generated code for $httpError() is correct.
+func TestGenerateHttpErrorCode(t *testing.T) {
+	expr := `$httpError(404, "Not found")`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformError")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	src, err := transpiler.GenerateProvider(plan, "testpkg", "error.jsonata", expr)
+	if err != nil {
+		t.Fatalf("generate error: %v", err)
+	}
+
+	code := string(src)
+	mustContain := []string{
+		"package testpkg",
+		"runtime.NewHTTPError(404",
+		`"Not found"`,
+		"*runtime.Response",
+	}
+
+	for _, s := range mustContain {
+		if !strings.Contains(code, s) {
+			t.Errorf("generated code missing %q", s)
+		}
+	}
+}
+
+// TestGenerateHttpResponseCode verifies that generated code for $httpResponse() is correct.
+func TestGenerateHttpResponseCode(t *testing.T) {
+	expr := `$httpResponse(201, {"id": 123}, {"Location": "/orders/123"})`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformCreate")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	src, err := transpiler.GenerateProvider(plan, "testpkg", "create.jsonata", expr)
+	if err != nil {
+		t.Fatalf("generate error: %v", err)
+	}
+
+	code := string(src)
+	mustContain := []string{
+		"package testpkg",
+		"StatusCode: 201",
+		"*runtime.Response",
+		"headers",
+		"Location",
+	}
+
+	for _, s := range mustContain {
+		if !strings.Contains(code, s) {
+			t.Errorf("generated code missing %q", s)
+		}
+	}
 }
 
 func writeTestFiles(t *testing.T, dir string, generatedSrc []byte, harness string) {
