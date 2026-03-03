@@ -15,11 +15,10 @@ import (
 
 // logEntry represents a log entry to be processed asynchronously.
 type logEntry struct {
-	level     zerolog.Level
-	event     *zerolog.Event
-	msg       string
-	ctx       context.Context
-	processed chan struct{}
+	level zerolog.Level
+	event *zerolog.Event
+	msg   string
+	ctx   context.Context
 }
 
 var (
@@ -46,9 +45,6 @@ func initAsyncLogging(logger zerolog.Logger) {
 
 		go func() {
 			for entry := range logChan {
-				if entry.processed != nil {
-					defer close(entry.processed)
-				}
 				entry.event.Msg(entry.msg)
 			}
 		}()
@@ -56,20 +52,19 @@ func initAsyncLogging(logger zerolog.Logger) {
 }
 
 // logAsync logs an entry asynchronously if async logging is enabled, otherwise synchronously.
+// When async logging is enabled and the channel is full, the log entry is dropped to avoid blocking.
 func logAsync(level zerolog.Level, event *zerolog.Event, msg string, ctx context.Context) {
 	if !errorLoggingEnabled {
 		return
 	}
 
 	if asyncLoggingEnabled && logChan != nil {
-		processed := make(chan struct{})
 		select {
-		case logChan <- &logEntry{level: level, event: event, msg: msg, ctx: ctx, processed: processed}:
-			// Non-blocking send - if channel is full, fall through to sync logging
-			<-processed
+		case logChan <- &logEntry{level: level, event: event, msg: msg, ctx: ctx}:
+			// Successfully queued, return immediately (fire-and-forget)
 		default:
-			// Channel full, log synchronously to avoid blocking
-			event.Msg(msg)
+			// Channel full, drop log to avoid blocking request path
+			// Optionally could log synchronously here, but dropping is safer for high throughput
 		}
 	} else {
 		event.Msg(msg)
@@ -82,6 +77,18 @@ func traceIDMiddleware() fiber.Handler {
 	useTraceIDAsRequestID := getEnvBool("USE_TRACE_ID_AS_REQUEST_ID", true)
 	if !useTraceIDAsRequestID {
 		// Middleware is a no-op if disabled
+		return func(c fiber.Ctx) error {
+			return c.Next()
+		}
+	}
+
+	// Check if tracing is disabled globally - if so, skip span context extraction
+	tracingDisabled := os.Getenv("OTEL_DISABLE_TRACING") == "true" || 
+		os.Getenv("OTEL_SDK_DISABLED") == "true" ||
+		os.Getenv("OTEL_TRACES_EXPORTER") == "none"
+	
+	if tracingDisabled {
+		// No-op when tracing is disabled to avoid span context extraction overhead
 		return func(c fiber.Ctx) error {
 			return c.Next()
 		}

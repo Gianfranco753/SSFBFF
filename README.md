@@ -368,6 +368,11 @@ The server includes several performance optimizations for high-throughput scenar
 | `ENABLE_RESOURCE_METRICS` | Enable resource metrics (goroutines, memory) | `true` |
 | `RESOURCE_METRICS_INTERVAL` | Resource metrics collection interval (e.g., `10s`, `30s`) | `10s` |
 | `METRICS_CACHE_TTL` | Cache metrics endpoint output for N seconds (0 = no cache) | `0` |
+| `METRICS_BATCHING_ENABLED` | Enable batched metrics updates (reduces contention at high RPS) | `true` |
+| `METRICS_BATCH_SIZE` | Batch size for metric updates before flushing | `1000` |
+| `METRICS_BATCH_INTERVAL` | Max time to wait before flushing metric batch (e.g., `100ms`) | `100ms` |
+| `METRICS_SAMPLE_RATE` | Metrics sampling rate (0.0-1.0, where 1.0 = no sampling) | `1.0` |
+| `METRICS_LABEL_CACHE_ENABLED` | Enable label value caching to avoid WithLabelValues() lookups | `true` |
 | `ASYNC_LOGGING` | Use async logging channel to avoid blocking request path | `false` |
 | `ASYNC_LOGGING_BUFFER_SIZE` | Size of async logging buffer | `1000` |
 
@@ -395,8 +400,35 @@ ENABLE_ERROR_LOGGING=true \
 ENABLE_RESOURCE_METRICS=true \
 RESOURCE_METRICS_INTERVAL=30s \
 METRICS_CACHE_TTL=5 \
+METRICS_BATCHING_ENABLED=true \
+METRICS_BATCH_SIZE=1000 \
+METRICS_BATCH_INTERVAL=100ms \
+METRICS_LABEL_CACHE_ENABLED=true \
 ASYNC_LOGGING=true \
 OTEL_DISABLE_TRACING=true \
+GOEXPERIMENT=jsonv2 go run ./cmd/server/
+```
+
+**High-Throughput with Observability** (650k+ RPS with metrics enabled):
+
+```bash
+# Optimize for high throughput while maintaining observability
+ENABLE_METRICS=true \
+METRICS_BATCHING_ENABLED=true \
+METRICS_BATCH_SIZE=2000 \
+METRICS_BATCH_INTERVAL=50ms \
+METRICS_SAMPLE_RATE=0.1 \
+METRICS_LABEL_CACHE_ENABLED=true \
+METRICS_CACHE_TTL=5 \
+ENABLE_ERROR_LOGGING=true \
+ASYNC_LOGGING=true \
+ASYNC_LOGGING_BUFFER_SIZE=5000 \
+ENABLE_RESOURCE_METRICS=false \
+OTEL_DISABLE_TRACING=true \
+FIBER_PREFORK=true \
+FIBER_CONCURRENCY=512 \
+MAX_IDLE_CONNS_PER_HOST=5000 \
+MAX_CONNS_PER_HOST=10000 \
 GOEXPERIMENT=jsonv2 go run ./cmd/server/
 ```
 

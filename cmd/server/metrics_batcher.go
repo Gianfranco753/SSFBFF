@@ -1,0 +1,168 @@
+//go:build goexperiment.jsonv2
+
+package main
+
+import (
+	"context"
+	"os"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+)
+
+type metricUpdateType int
+
+const (
+	updateTypeCounterInc metricUpdateType = iota
+	updateTypeHistogramObserve
+	updateTypeCounterAdd
+)
+
+type metricUpdate struct {
+	typ     metricUpdateType
+	counter prometheus.Counter
+	hist    prometheus.Observer
+	value   float64
+}
+
+type metricsBatcher struct {
+	updates      chan metricUpdate
+	batchSize    int
+	batchInterval time.Duration
+	ctx          context.Context
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
+	enabled      bool
+}
+
+var (
+	globalBatcher     *metricsBatcher
+	batcherInitOnce   sync.Once
+	batcherEnabled    bool
+	metricsSampleRate float64
+)
+
+func initMetricsBatcher() {
+	batcherEnabled = getEnvBool("METRICS_BATCHING_ENABLED", true)
+	if !batcherEnabled || !metricsEnabled {
+		return
+	}
+
+	batchSize := getEnvInt("METRICS_BATCH_SIZE", 1000)
+	batchInterval := 100 * time.Millisecond
+	if intervalStr := os.Getenv("METRICS_BATCH_INTERVAL"); intervalStr != "" {
+		if parsed, err := time.ParseDuration(intervalStr); err == nil && parsed > 0 {
+			batchInterval = parsed
+		}
+	}
+
+	sampleRate := 1.0
+	if rateStr := os.Getenv("METRICS_SAMPLE_RATE"); rateStr != "" {
+		if parsed, err := strconv.ParseFloat(rateStr, 64); err == nil && parsed >= 0 && parsed <= 1 {
+			sampleRate = parsed
+		}
+	}
+	metricsSampleRate = sampleRate
+
+	ctx, cancel := context.WithCancel(context.Background())
+	batcher := &metricsBatcher{
+		updates:       make(chan metricUpdate, batchSize*2),
+		batchSize:     batchSize,
+		batchInterval: batchInterval,
+		ctx:           ctx,
+		cancel:        cancel,
+		enabled:       true,
+	}
+
+	batcher.wg.Add(1)
+	go batcher.worker()
+
+	globalBatcher = batcher
+}
+
+func (mb *metricsBatcher) worker() {
+	defer mb.wg.Done()
+
+	batch := make([]metricUpdate, 0, mb.batchSize)
+	ticker := time.NewTicker(mb.batchInterval)
+	defer ticker.Stop()
+
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		for _, update := range batch {
+			switch update.typ {
+			case updateTypeCounterInc:
+				update.counter.Inc()
+			case updateTypeCounterAdd:
+				update.counter.Add(update.value)
+			case updateTypeHistogramObserve:
+				update.hist.Observe(update.value)
+			}
+		}
+		batch = batch[:0]
+	}
+
+	for {
+		select {
+		case <-mb.ctx.Done():
+			flush()
+			return
+		case update := <-mb.updates:
+			batch = append(batch, update)
+			if len(batch) >= mb.batchSize {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		}
+	}
+}
+
+func (mb *metricsBatcher) recordCounterInc(counter prometheus.Counter) {
+	if !mb.enabled {
+		counter.Inc()
+		return
+	}
+
+	select {
+	case mb.updates <- metricUpdate{typ: updateTypeCounterInc, counter: counter}:
+	default:
+		counter.Inc()
+	}
+}
+
+func (mb *metricsBatcher) recordHistogramObserve(hist prometheus.Observer, value float64) {
+	if !mb.enabled {
+		hist.Observe(value)
+		return
+	}
+
+	select {
+	case mb.updates <- metricUpdate{typ: updateTypeHistogramObserve, hist: hist, value: value}:
+	default:
+		hist.Observe(value)
+	}
+}
+
+func shutdownMetricsBatcher() {
+	if globalBatcher != nil {
+		globalBatcher.cancel()
+		globalBatcher.wg.Wait()
+	}
+}
+
+func shouldSample() bool {
+	if metricsSampleRate >= 1.0 {
+		return true
+	}
+	if metricsSampleRate <= 0.0 {
+		return false
+	}
+	// Use nanosecond timestamp modulo for pseudo-random sampling
+	// This provides consistent sampling without requiring a random number generator
+	return time.Now().UnixNano()%10000 < int64(metricsSampleRate*10000)
+}

@@ -206,6 +206,7 @@ func main() {
 		if err := meterProvider.Shutdown(ctx); err != nil {
 			logger.Error().Err(err).Msg("meter provider shutdown failed")
 		}
+		shutdownMetricsBatcher()
 	}()
 
 	dataDir := os.Getenv("DATA_DIR")

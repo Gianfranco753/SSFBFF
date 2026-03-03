@@ -4,9 +4,11 @@ package main
 
 import (
 	"fmt"
+	"hash/fnv"
 	"os"
 	"runtime"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -73,7 +75,39 @@ var (
 			Help: "Number of bytes obtained from system",
 		},
 	)
+
+	// Label caches for common label combinations
+	httpErrorCounterCache     sync.Map
+	upstreamCallHistCache     sync.Map
+	upstreamErrorCounterCache sync.Map
+	aggregatorOpCounterCache  sync.Map
+	labelCacheEnabled         bool
 )
+
+// Pre-format common status codes to avoid fmt.Sprintf
+var statusCodeStrings = func() map[int]string {
+	m := make(map[int]string, 20)
+	for i := 400; i <= 599; i++ {
+		m[i] = strconv.Itoa(i)
+	}
+	return m
+}()
+
+func getStatusCodeString(code int) string {
+	if s, ok := statusCodeStrings[code]; ok {
+		return s
+	}
+	return strconv.Itoa(code)
+}
+
+func hashLabels(labels []string) uint64 {
+	h := fnv.New64a()
+	for _, label := range labels {
+		h.Write([]byte(label))
+		h.Write([]byte{0})
+	}
+	return h.Sum64()
+}
 
 // getEnvBool reads a boolean environment variable, returning defaultValue if not set or invalid.
 func getEnvBool(key string, defaultValue bool) bool {
@@ -91,12 +125,56 @@ func getEnvBool(key string, defaultValue bool) bool {
 // metricsEnabled returns true if metrics recording is enabled.
 var metricsEnabled = getEnvBool("ENABLE_METRICS", true)
 
+func init() {
+	labelCacheEnabled = getEnvBool("METRICS_LABEL_CACHE_ENABLED", true)
+	initMetricsBatcher()
+}
+
+func getHTTPErrorCounter(endpoint, method string, statusCode int) prometheus.Counter {
+	if !labelCacheEnabled {
+		return httpErrorsTotal.WithLabelValues(endpoint, method, getStatusCodeString(statusCode))
+	}
+
+	key := hashLabels([]string{endpoint, method, getStatusCodeString(statusCode)})
+	if cached, ok := httpErrorCounterCache.Load(key); ok {
+		return cached.(prometheus.Counter)
+	}
+
+	counter := httpErrorsTotal.WithLabelValues(endpoint, method, getStatusCodeString(statusCode))
+	httpErrorCounterCache.Store(key, counter)
+	return counter
+}
+
 // recordHTTPError records an HTTP error with endpoint, method, and status code.
 func recordHTTPError(endpoint, method string, statusCode int) {
 	if !metricsEnabled {
 		return
 	}
-	httpErrorsTotal.WithLabelValues(endpoint, method, fmt.Sprintf("%d", statusCode)).Inc()
+	if !shouldSample() {
+		return
+	}
+
+	counter := getHTTPErrorCounter(endpoint, method, statusCode)
+	if globalBatcher != nil && globalBatcher.enabled {
+		globalBatcher.recordCounterInc(counter)
+	} else {
+		counter.Inc()
+	}
+}
+
+func getUpstreamCallHistogram(provider, endpoint, status string) prometheus.Observer {
+	if !labelCacheEnabled {
+		return upstreamCallDuration.WithLabelValues(provider, endpoint, status)
+	}
+
+	key := hashLabels([]string{provider, endpoint, status})
+	if cached, ok := upstreamCallHistCache.Load(key); ok {
+		return cached.(prometheus.Observer)
+	}
+
+	hist := upstreamCallDuration.WithLabelValues(provider, endpoint, status)
+	upstreamCallHistCache.Store(key, hist)
+	return hist
 }
 
 // recordUpstreamCall records upstream call metrics.
@@ -104,7 +182,32 @@ func recordUpstreamCall(provider, endpoint string, duration time.Duration, statu
 	if !metricsEnabled {
 		return
 	}
-	upstreamCallDuration.WithLabelValues(provider, endpoint, status).Observe(duration.Seconds())
+	if !shouldSample() {
+		return
+	}
+
+	hist := getUpstreamCallHistogram(provider, endpoint, status)
+	value := duration.Seconds()
+	if globalBatcher != nil && globalBatcher.enabled {
+		globalBatcher.recordHistogramObserve(hist, value)
+	} else {
+		hist.Observe(value)
+	}
+}
+
+func getUpstreamErrorCounter(provider, endpoint, errorType string) prometheus.Counter {
+	if !labelCacheEnabled {
+		return upstreamErrorsTotal.WithLabelValues(provider, endpoint, errorType)
+	}
+
+	key := hashLabels([]string{provider, endpoint, errorType})
+	if cached, ok := upstreamErrorCounterCache.Load(key); ok {
+		return cached.(prometheus.Counter)
+	}
+
+	counter := upstreamErrorsTotal.WithLabelValues(provider, endpoint, errorType)
+	upstreamErrorCounterCache.Store(key, counter)
+	return counter
 }
 
 // recordUpstreamError records an upstream error.
@@ -112,7 +215,31 @@ func recordUpstreamError(provider, endpoint, errorType string) {
 	if !metricsEnabled {
 		return
 	}
-	upstreamErrorsTotal.WithLabelValues(provider, endpoint, errorType).Inc()
+	if !shouldSample() {
+		return
+	}
+
+	counter := getUpstreamErrorCounter(provider, endpoint, errorType)
+	if globalBatcher != nil && globalBatcher.enabled {
+		globalBatcher.recordCounterInc(counter)
+	} else {
+		counter.Inc()
+	}
+}
+
+func getAggregatorOpCounter(status string) prometheus.Counter {
+	if !labelCacheEnabled {
+		return aggregatorOperationsTotal.WithLabelValues(status)
+	}
+
+	key := hashLabels([]string{status})
+	if cached, ok := aggregatorOpCounterCache.Load(key); ok {
+		return cached.(prometheus.Counter)
+	}
+
+	counter := aggregatorOperationsTotal.WithLabelValues(status)
+	aggregatorOpCounterCache.Store(key, counter)
+	return counter
 }
 
 // recordAggregatorOperation records aggregator operation status.
@@ -120,7 +247,16 @@ func recordAggregatorOperation(status string) {
 	if !metricsEnabled {
 		return
 	}
-	aggregatorOperationsTotal.WithLabelValues(status).Inc()
+	if !shouldSample() {
+		return
+	}
+
+	counter := getAggregatorOpCounter(status)
+	if globalBatcher != nil && globalBatcher.enabled {
+		globalBatcher.recordCounterInc(counter)
+	} else {
+		counter.Inc()
+	}
 }
 
 // resourceMetricsEnabled returns true if resource metrics collection is enabled.
