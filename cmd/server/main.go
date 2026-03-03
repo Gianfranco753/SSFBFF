@@ -1,6 +1,6 @@
 //go:build goexperiment.jsonv2
 
-// Command server runs the BFF web server. Routes are generated from data/routes.yaml
+// Command server runs the BFF web server. Routes are generated from data/openapi.yaml
 // via cmd/apigen. Each route fans out to upstream providers via the aggregator.
 //
 // Providers are loaded from data/providers/*.yaml at startup.

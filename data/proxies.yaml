@@ -1,0 +1,14 @@
+# Proxy route definitions — pass-through routes that forward requests directly
+# to downstream services without JSONata transformation.
+#
+# The proxy field value maps to an environment variable: proxy: downstream
+# -> UPSTREAM_DOWNSTREAM_URL
+
+routes:
+  - path: /proxy/*
+    method: ALL
+    proxy: downstream
+
+  - path: /api/legacy/*
+    method: ALL
+    proxy: legacy_service

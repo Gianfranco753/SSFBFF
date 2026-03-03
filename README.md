@@ -31,7 +31,7 @@ Two generators run at build time via `go generate`:
 | Generator | Input | Output |
 |---|---|---|
 | `cmd/transpiler` | `.jsonata` file | `_gen.go` transform function |
-| `cmd/apigen` | `data/routes.yaml` | `routes_gen.go` Fiber route wiring |
+| `cmd/apigen` | `data/openapi.yaml` + `data/proxies.yaml` | `routes_gen.go` Fiber route wiring |
 
 At runtime, each request either fans out to multiple upstreams in parallel or fetches from a single upstream, passes the raw bytes through the compiled transform, and returns the shaped result.
 
@@ -111,28 +111,44 @@ All BFF configuration lives in `data/`:
 
 ```
 data/
-├── routes.yaml           # HTTP path → JSONata service mapping
+├── openapi.yaml          # OpenAPI spec with x-service-name extensions
+├── proxies.yaml          # Pass-through proxy routes (optional)
 ├── providers/            # One YAML per upstream service
 │   ├── user_service.yaml
 │   └── bank_service.yaml
-├── services/             # JSONata expressions (one per service)
-│   ├── dashboard.jsonata
-│   ├── get_user.jsonata
-│   └── orders.jsonata
-└── openapi.yaml          # Optional: legacy OpenAPI spec mode
+└── services/             # JSONata expressions (one per service)
+    ├── dashboard.jsonata
+    ├── get_user.jsonata
+    └── orders.jsonata
 ```
 
-### `data/routes.yaml`
+### `data/openapi.yaml`
+
+OpenAPI 3.0 specification where each operation uses `x-service-name` to map to a JSONata service file:
+
+```yaml
+paths:
+  /api/v1/orders:
+    get:
+      x-service-name: orders
+      summary: Get filtered and projected orders
+      # ... response schemas
+```
+
+The `x-service-name` value maps to `data/services/{service-name}.jsonata`.
+
+### `data/proxies.yaml`
+
+Pass-through proxy routes that forward requests directly to downstream services without JSONata transformation:
 
 ```yaml
 routes:
-  - path: /dashboard
-    method: GET
-    jsonata: dashboard.jsonata
-  - path: /api/v1/orders
-    method: GET
-    jsonata: orders.jsonata
+  - path: /proxy/*
+    method: ALL
+    proxy: downstream
 ```
+
+The `proxy` field value maps to an environment variable: `proxy: downstream` → `UPSTREAM_DOWNSTREAM_URL`.
 
 ### `data/providers/*.yaml`
 
@@ -179,12 +195,23 @@ In `internal/generated/generate.go`:
 
 ### 3. Add the route
 
-In `data/routes.yaml`:
+In `data/openapi.yaml`:
 
 ```yaml
-  - path: /api/v1/users
-    method: GET
-    jsonata: users.jsonata
+  /api/v1/users:
+    get:
+      operationId: getUsers
+      x-service-name: users
+      summary: Get filtered users
+      responses:
+        "200":
+          description: User list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
 ```
 
 ### 4. Define providers (fetch mode only)
@@ -205,14 +232,15 @@ The generator auto-detects the mode — if the expression contains `$fetch()` or
 ```
 SSFBFF/
 ├── cmd/
-│   ├── apigen/main.go              # Route generator (routes.yaml → Fiber routes)
+│   ├── apigen/main.go              # Route generator (openapi.yaml → Fiber routes)
 │   ├── server/
 │   │   ├── main.go                 # Fiber v3 server entry point
 │   │   ├── fetch.go                # HTTP fetcher with sync.Pool
 │   │   └── routes_gen.go           # Generated (gitignored)
 │   └── transpiler/main.go          # JSONata → Go generator
 ├── data/                           # All BFF configuration
-│   ├── routes.yaml
+│   ├── openapi.yaml
+│   ├── proxies.yaml
 │   ├── providers/
 │   └── services/
 ├── examples/
@@ -248,17 +276,18 @@ go run ./cmd/transpiler --input=<file.jsonata> --output=<file.go> --package=<pkg
 ### `cmd/apigen`
 
 ```bash
-go run ./cmd/apigen --routes=<routes.yaml> --jsonata-dir=<dir> --output=<file.go> --package=<pkg> --generated-pkg=<import>
+go run ./cmd/apigen --spec=<openapi.yaml> --jsonata-dir=<dir> [--proxies=<proxies.yaml>] --output=<file.go> --package=<pkg> --generated-pkg=<import>
 ```
 
 | Flag | Description | Default |
 |---|---|---|
-| `--routes` | Path to `routes.yaml` | — |
-| `--spec` | OpenAPI YAML file (legacy mode) | — |
-| `--jsonata-dir` | Directory with `.jsonata` files | — |
+| `--spec` | Path to OpenAPI YAML file | — |
+| `--proxies` | Path to `proxies.yaml` (optional) | — |
+| `--jsonata-dir` | Directory with `.jsonata` files | **(required with --spec)** |
 | `--output` | Generated `.go` file | **(required)** |
 | `--package` | Package name | `main` |
 | `--generated-pkg` | Import path for transform functions | **(required)** |
+| `--routes` | Path to `routes.yaml` (legacy mode) | — |
 
 ## Environment Variables
 

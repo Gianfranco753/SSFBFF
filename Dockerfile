@@ -16,7 +16,7 @@ COPY . .
 ENV GOEXPERIMENT=jsonv2
 
 # Transpile all .jsonata files from data/services/ into *_gen.go
-# and generate route wiring from data/routes.yaml.
+# and generate route wiring from data/openapi.yaml and data/proxies.yaml.
 RUN go generate ./internal/generated/
 
 # Build a statically-linked binary with stripped debug info.

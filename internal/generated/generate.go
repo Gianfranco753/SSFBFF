@@ -12,4 +12,4 @@ package generated
 //go:generate go run ../../cmd/transpiler --input=../../data/services/products.jsonata --output=products_gen.go --package=generated
 //go:generate go run ../../cmd/transpiler --input=../../data/services/get_user.jsonata --output=get_user_gen.go --package=generated
 //go:generate go run ../../cmd/transpiler --input=../../data/services/dashboard.jsonata --output=dashboard_gen.go --package=generated
-//go:generate go run ../../cmd/apigen --routes=../../data/routes.yaml --jsonata-dir=../../data/services --output=../../cmd/server/routes_gen.go --package=main --generated-pkg=github.com/gcossani/ssfbff/internal/generated
+//go:generate go run ../../cmd/apigen --spec=../../data/openapi.yaml --jsonata-dir=../../data/services --proxies=../../data/proxies.yaml --output=../../cmd/server/routes_gen.go --package=main --generated-pkg=github.com/gcossani/ssfbff/internal/generated

@@ -10,6 +10,29 @@ servers:
   - url: http://localhost:3000
 
 paths:
+  /dashboard:
+    get:
+      operationId: getDashboard
+      x-service-name: dashboard
+      summary: Get dashboard data
+      description: >
+        Aggregates user data, bank balance, and authentication info from multiple
+        services using the compiled JSONata transform.
+      responses:
+        "200":
+          description: Dashboard data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user:
+                    type: string
+                  balance:
+                    type: number
+                  auth:
+                    type: string
+
   /api/v1/orders:
     get:
       operationId: getOrders
