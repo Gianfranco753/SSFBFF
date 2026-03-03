@@ -26,13 +26,24 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+
+	"bytes"
+	"io"
 
 	"github.com/gcossani/ssfbff/internal/aggregator"
 	otelfiber "github.com/gofiber/contrib/v3/otel"
 	"github.com/gofiber/fiber/v3"
+
+	"github.com/prometheus/client_golang/prometheus"
+	promhttp "github.com/prometheus/client_golang/prometheus/promhttp"
+
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	promexp "go.opentelemetry.io/otel/exporters/prometheus"
+	"go.opentelemetry.io/otel/sdk/metric"
 	"gopkg.in/yaml.v3"
 )
 
@@ -57,6 +68,22 @@ var sharedHTTPClient = &http.Client{
 	Transport: baseTransport,
 }
 
+// serverReady tracks whether the server has finished initialization and is listening.
+// It's set to true after the server starts listening in the goroutine.
+var (
+	serverReady   bool
+	serverReadyMu sync.RWMutex
+)
+
+// prometheusExporter holds the Prometheus exporter for metrics.
+var prometheusExporter *promexp.Exporter
+
+// prometheusRegistry holds the Prometheus registry with the exporter's collector registered.
+var prometheusRegistry *prometheus.Registry
+
+// serverAggregator holds the aggregator instance for readiness checks.
+var serverAggregator *aggregator.Aggregator
+
 func main() {
 	// Initialize OpenTelemetry first so the instrumented transport and Fiber
 	// middleware can register spans under the correct global TracerProvider.
@@ -68,6 +95,30 @@ func main() {
 	defer func() {
 		if err := shutdownTracing(ctx); err != nil {
 			log.Printf("tracing shutdown: %v", err)
+		}
+	}()
+
+	// Initialize Prometheus metrics exporter.
+	// This creates a meter provider that exports metrics in Prometheus format.
+	promExporter, err := promexp.New()
+	if err != nil {
+		log.Fatalf("prometheus exporter setup: %v", err)
+	}
+	prometheusExporter = promExporter
+
+	// Register the exporter's collector with a Prometheus registry.
+	prometheusRegistry = prometheus.NewRegistry()
+	if err := prometheusRegistry.Register(promExporter.Collector); err != nil {
+		log.Fatalf("registering prometheus collector: %v", err)
+	}
+
+	meterProvider := metric.NewMeterProvider(
+		metric.WithReader(promExporter),
+	)
+	otel.SetMeterProvider(meterProvider)
+	defer func() {
+		if err := meterProvider.Shutdown(ctx); err != nil {
+			log.Printf("meter provider shutdown: %v", err)
 		}
 	}()
 
@@ -91,6 +142,7 @@ func main() {
 	}
 
 	agg := aggregator.New(providers, sharedHTTPClient)
+	serverAggregator = agg
 
 	app := fiber.New(fiber.Config{
 		JSONEncoder: func(v any) ([]byte, error) { return jsonv2.Marshal(v) },
@@ -116,6 +168,38 @@ func main() {
 		return c.SendString("ok")
 	})
 
+	app.Get("/metrics", func(c fiber.Ctx) error {
+		if prometheusRegistry == nil {
+			return c.Status(503).SendString("metrics not available")
+		}
+
+		// Create a Prometheus HTTP handler using the pre-registered registry.
+		handler := promhttp.HandlerFor(prometheusRegistry, promhttp.HandlerOpts{})
+
+		// Create a mock HTTP request and response writer to capture metrics output.
+		req, _ := http.NewRequest("GET", "/metrics", nil)
+		var buf bytes.Buffer
+		handler.ServeHTTP(&mockResponseWriter{Writer: &buf}, req)
+
+		c.Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		return c.SendString(buf.String())
+	})
+
+	app.Get("/ready", func(c fiber.Ctx) error {
+		serverReadyMu.RLock()
+		ready := serverReady && serverAggregator != nil
+		serverReadyMu.RUnlock()
+
+		if !ready {
+			return c.Status(503).SendString("not ready")
+		}
+		return c.SendString("ready")
+	})
+
+	app.Get("/live", func(c fiber.Ctx) error {
+		return c.SendString("ok")
+	})
+
 	addr := listenAddr()
 	log.Printf("BFF server starting on %s", addr)
 
@@ -124,6 +208,13 @@ func main() {
 			log.Fatalf("server error: %v", err)
 		}
 	}()
+
+	// Give the server a moment to start listening, then mark as ready.
+	time.Sleep(100 * time.Millisecond)
+	serverReadyMu.Lock()
+	serverReady = true
+	serverReadyMu.Unlock()
+	log.Println("server ready")
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -171,4 +262,26 @@ func listenAddr() string {
 		port = "3000"
 	}
 	return fmt.Sprintf(":%s", port)
+}
+
+// mockResponseWriter implements http.ResponseWriter to capture Prometheus metrics output.
+type mockResponseWriter struct {
+	io.Writer
+	statusCode int
+	headers    http.Header
+}
+
+func (m *mockResponseWriter) Header() http.Header {
+	if m.headers == nil {
+		m.headers = make(http.Header)
+	}
+	return m.headers
+}
+
+func (m *mockResponseWriter) Write(b []byte) (int, error) {
+	return m.Writer.Write(b)
+}
+
+func (m *mockResponseWriter) WriteHeader(statusCode int) {
+	m.statusCode = statusCode
 }
