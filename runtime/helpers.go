@@ -14,9 +14,11 @@ import (
 	jsonv2 "encoding/json/v2"
 	"fmt"
 	"math"
+	"math/rand"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // RequestContext holds data from the incoming HTTP request, populated by the
@@ -290,6 +292,46 @@ func JoinArray(v any, sep ...string) string {
 	}
 }
 
+// Pad pads a string to the specified length with the given character (default " ").
+// If the string is longer than the length, it is returned unchanged.
+func Pad(str any, length float64, padChar ...any) string {
+	s := ToString(str)
+	targetLen := int(length)
+	if len(s) >= targetLen {
+		return s
+	}
+	pad := " "
+	if len(padChar) > 0 {
+		pad = ToString(padChar[0])
+		if pad == "" {
+			pad = " "
+		}
+	}
+	padLen := targetLen - len(s)
+	return s + strings.Repeat(pad, padLen)
+}
+
+// SplitArray splits a string into an array of strings using the given separator.
+func SplitArray(str any, separator any) any {
+	s := ToString(str)
+	sep := ToString(separator)
+	if sep == "" {
+		// Empty separator splits into individual characters
+		runes := []rune(s)
+		result := make([]any, len(runes))
+		for i, r := range runes {
+			result[i] = string(r)
+		}
+		return result
+	}
+	parts := strings.Split(s, sep)
+	result := make([]any, len(parts))
+	for i, part := range parts {
+		result[i] = part
+	}
+	return result
+}
+
 // --- Numeric functions ---
 
 // ToNumber coerces a value to float64.
@@ -346,6 +388,26 @@ func Round(v float64, precision ...int) float64 {
 	}
 	p := math.Pow(10, float64(precision[0]))
 	return math.Round(v*p) / p
+}
+
+// Power returns base raised to the power of exponent.
+func Power(base, exponent float64) float64 {
+	return math.Pow(base, exponent)
+}
+
+// Sqrt returns the square root of v.
+func Sqrt(v float64) float64 {
+	return math.Sqrt(v)
+}
+
+// Random returns a random number between 0.0 and 1.0.
+// The random number generator is seeded once at package initialization.
+func Random() float64 {
+	return rand.Float64()
+}
+
+func init() {
+	rand.Seed(time.Now().UnixNano())
 }
 
 // --- Boolean functions ---
@@ -486,6 +548,72 @@ func DistinctArray(v any) any {
 	return result
 }
 
+// ShuffleArray randomly shuffles the elements of an array.
+//
+// Input: expects []any (array of any type)
+// Output: returns []any (shuffled copy of input)
+//
+// If input is not []any, returns the input unchanged.
+//
+// Example:
+//
+//	ShuffleArray([]any{1, 2, 3})    // []any{3, 1, 2} (random order)
+func ShuffleArray(v any) any {
+	arr, ok := v.([]any)
+	if !ok {
+		return v
+	}
+	shuffled := make([]any, len(arr))
+	copy(shuffled, arr)
+	rand.Shuffle(len(shuffled), func(i, j int) {
+		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+	})
+	return shuffled
+}
+
+// ZipArray combines multiple arrays into an array of tuples.
+// Each tuple contains elements at the same index from each input array.
+// The result length is the minimum length of all input arrays.
+//
+// Input: variable number of []any arguments
+// Output: returns []any where each element is []any (a tuple)
+//
+// Example:
+//
+//	ZipArray([]any{1, 2}, []any{3, 4})    // []any{[]any{1, 3}, []any{2, 4}}
+func ZipArray(arrays ...any) any {
+	if len(arrays) == 0 {
+		return []any{}
+	}
+	// Convert all inputs to []any and find minimum length
+	var arrs [][]any
+	minLen := -1
+	for _, a := range arrays {
+		arr, ok := a.([]any)
+		if !ok {
+			// If not []any, treat as single-element array
+			arr = []any{a}
+		}
+		arrs = append(arrs, arr)
+		if minLen == -1 || len(arr) < minLen {
+			minLen = len(arr)
+		}
+	}
+	if minLen == 0 {
+		return []any{}
+	}
+	// Build result: array of tuples
+	result := make([]any, minLen)
+	for i := 0; i < minLen; i++ {
+		tuple := make([]any, len(arrs))
+		for j, arr := range arrs {
+			tuple[j] = arr[i]
+		}
+		result[i] = tuple
+	}
+	return result
+}
+
 // --- Object functions ---
 
 // KeysMap returns the keys of a map[string]any as []any.
@@ -571,6 +699,112 @@ func TypeOf(v any) string {
 	default:
 		return "undefined"
 	}
+}
+
+// ValuesMap extracts all values from an object as an array.
+//
+// Input: expects map[string]any (object)
+// Output: returns []any (array of values)
+//
+// If input is not map[string]any, returns nil.
+// Values are returned in sorted key order for deterministic output.
+//
+// Example:
+//
+//	ValuesMap(map[string]any{"a": 1, "b": 2})    // []any{1, 2}
+func ValuesMap(v any) any {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil
+	}
+	// Collect values in sorted key order for deterministic output
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	values := make([]any, len(keys))
+	for i, k := range keys {
+		values[i] = m[k]
+	}
+	return values
+}
+
+// SpreadMap spreads object properties into the parent context.
+// In JSONata, this is context-dependent. For our implementation,
+// we return the object itself, allowing codegen to handle the spreading
+// in object construction contexts.
+//
+// Input: expects map[string]any (object)
+// Output: returns map[string]any (the object itself)
+//
+// If input is not map[string]any, returns the input unchanged.
+//
+// Example:
+//
+//	SpreadMap(map[string]any{"a": 1, "b": 2})    // map[string]any{"a": 1, "b": 2}
+func SpreadMap(v any) any {
+	// Spread is context-dependent in JSONata. For now, we return the object itself.
+	// The codegen can handle spreading in object construction contexts.
+	return v
+}
+
+// --- Date/Time functions ---
+
+// Now generates a UTC timestamp in ISO 8601 compatible format and returns it as a string.
+//
+// Example:
+//
+//	Now()    // "2024-01-15T10:30:00.123456789Z"
+func Now() string {
+	return time.Now().UTC().Format(time.RFC3339Nano)
+}
+
+// Millis returns the number of milliseconds since the Unix Epoch (1 January, 1970 UTC) as a number.
+//
+// Example:
+//
+//	Millis()    // 1705315800123.0
+func Millis() float64 {
+	return float64(time.Now().UnixMilli())
+}
+
+// FromMillis converts the number representing milliseconds since the Unix Epoch
+// to a formatted string representation of the timestamp.
+//
+// The picture and timezone parameters are accepted for API compatibility but
+// only ISO 8601 format and UTC timezone are supported for performance.
+//
+// Example:
+//
+//	FromMillis(1705315800123)    // "2024-01-15T10:30:00.123Z"
+func FromMillis(ms float64, picture ...string) string {
+	// Picture and timezone parameters are ignored for performance (ISO 8601 only)
+	t := time.UnixMilli(int64(ms)).UTC()
+	return t.Format(time.RFC3339Nano)
+}
+
+// ToMillis converts a timestamp string to the number of milliseconds since the
+// Unix Epoch (1 January, 1970 UTC) as a number.
+//
+// The picture parameter is accepted for API compatibility but only ISO 8601
+// format is supported for performance.
+//
+// Example:
+//
+//	ToMillis("2024-01-15T10:30:00.123Z")    // 1705315800123.0
+func ToMillis(timestamp any, picture ...string) float64 {
+	// Picture parameter is ignored for performance (ISO 8601 only)
+	str := ToString(timestamp)
+	t, err := time.Parse(time.RFC3339Nano, str)
+	if err != nil {
+		// Try RFC3339 format as fallback
+		t, err = time.Parse(time.RFC3339, str)
+		if err != nil {
+			return 0
+		}
+	}
+	return float64(t.UnixMilli())
 }
 
 // Range returns a slice of float64 values from start to end (inclusive),

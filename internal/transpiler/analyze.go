@@ -795,7 +795,7 @@ func isAggregateFunc(name string) bool {
 
 func isNumericFunc(name string) bool {
 	switch name {
-	case "number", "abs", "floor", "ceil", "round":
+	case "number", "abs", "floor", "ceil", "round", "power", "sqrt":
 		return true
 	}
 	return false
@@ -805,12 +805,14 @@ func inferFuncReturnType(name string) string {
 	switch name {
 	case "sum", "count", "min", "max", "average",
 		"number", "abs", "floor", "ceil", "round",
-		"length":
+		"power", "sqrt", "random", "length", "millis", "toMillis":
 		return "float64"
 	case "string", "uppercase", "lowercase", "trim",
 		"substring", "substringBefore", "substringAfter",
-		"join", "type":
+		"join", "pad", "type", "now", "fromMillis":
 		return "string"
+	case "split", "shuffle", "zip", "values", "spread":
+		return "any"
 	case "boolean", "not", "exists", "contains":
 		return "bool"
 	default:

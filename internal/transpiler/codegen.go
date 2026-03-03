@@ -395,6 +395,10 @@ func (em *exprEmitter) mapFuncCall(name string, args []string) string {
 		return fmt.Sprintf("runtime.Contains(%s)", all)
 	case "join":
 		return fmt.Sprintf("runtime.JoinArray(%s)", all)
+	case "pad":
+		return fmt.Sprintf("runtime.Pad(%s)", all)
+	case "split":
+		return fmt.Sprintf("runtime.SplitArray(%s)", all)
 
 	// Numeric functions
 	case "number":
@@ -407,6 +411,12 @@ func (em *exprEmitter) mapFuncCall(name string, args []string) string {
 		return fmt.Sprintf("runtime.Ceil(%s)", all)
 	case "round":
 		return fmt.Sprintf("runtime.Round(%s)", all)
+	case "power":
+		return fmt.Sprintf("runtime.Power(%s)", all)
+	case "sqrt":
+		return fmt.Sprintf("runtime.Sqrt(%s)", all)
+	case "random":
+		return fmt.Sprintf("runtime.Random(%s)", all)
 
 	// Boolean functions
 	case "boolean":
@@ -433,12 +443,30 @@ func (em *exprEmitter) mapFuncCall(name string, args []string) string {
 		return fmt.Sprintf("runtime.AppendArray(%s)", all)
 	case "distinct":
 		return fmt.Sprintf("runtime.DistinctArray(%s)", all)
+	case "shuffle":
+		return fmt.Sprintf("runtime.ShuffleArray(%s)", all)
+	case "zip":
+		return fmt.Sprintf("runtime.ZipArray(%s)", all)
 	case "keys":
 		return fmt.Sprintf("runtime.KeysMap(%s)", all)
 	case "merge":
 		return fmt.Sprintf("runtime.MergeArray(%s)", all)
 	case "type":
 		return fmt.Sprintf("runtime.TypeOf(%s)", all)
+	case "values":
+		return fmt.Sprintf("runtime.ValuesMap(%s)", all)
+	case "spread":
+		return fmt.Sprintf("runtime.SpreadMap(%s)", all)
+
+	// Date/Time functions
+	case "now":
+		return fmt.Sprintf("runtime.Now(%s)", all)
+	case "millis":
+		return fmt.Sprintf("runtime.Millis(%s)", all)
+	case "fromMillis":
+		return fmt.Sprintf("runtime.FromMillis(%s)", all)
+	case "toMillis":
+		return fmt.Sprintf("runtime.ToMillis(%s)", all)
 
 	default:
 		return fmt.Sprintf("nil /* unsupported: $%s(%s) */", name, all)

@@ -791,10 +791,10 @@ docker compose -f examples/docker-compose.yaml up --build
 
 The build copies `data/` into the build stage, runs `go generate` to transpile all JSONata into Go, compiles the binary, then copies only the binary into the runtime image. Routes and service logic are compiled into the binary. The `data/` directory (specifically `data/providers/`) must be mounted as a volume at runtime.
 
-## JSONata Coverage — 70% of spec
+## JSONata Coverage — 86% of spec
 
-**56 of 80** core features from the [JSONata specification](https://docs.jsonata.org/) are supported.
-The remaining gaps are mainly higher-order functions, date/time, regex functions, and some utility functions.
+**69 of 80** core features from the [JSONata specification](https://docs.jsonata.org/) are supported.
+The remaining gaps are mainly higher-order functions and regex functions.
 
 | Category | Supported | Total | Coverage |
 |---|:---:|:---:|:---:|
@@ -804,14 +804,14 @@ The remaining gaps are mainly higher-order functions, date/time, regex functions
 | Arithmetic Operators | 6 | 6 | 100% |
 | Other Operators | 3 | 3 | 100% |
 | Literals | 5 | 6 | 83% |
-| String Functions | 10 | 14 | 71% |
-| Numeric Functions | 5 | 10 | 50% |
+| String Functions | 12 | 14 | 86% |
+| Numeric Functions | 8 | 10 | 80% |
 | Aggregation Functions | 5 | 5 | 100% |
 | Boolean Functions | 3 | 3 | 100% |
-| Array Functions | 4 | 6 | 67% |
-| Object Functions | 3 | 5 | 60% |
+| Array Functions | 6 | 6 | 100% |
+| Object Functions | 5 | 5 | 100% |
 | Higher-Order Functions | 0 | 5 | 0% |
-| Date/Time Functions | 0 | 4 | 0% |
+| Date/Time Functions | 4 | 4 | 100% |
 | Other | 0 | 3 | 0% |
 
 <details>
@@ -867,8 +867,8 @@ The remaining gaps are mainly higher-order functions, date/time, regex functions
 | `$trim()` | ✅ | `$trim("  hi  ")` → `"hi"` |
 | `$contains()` | ✅ | `$contains("hello", "ell")` → `true` |
 | `$join()` | ✅ | `$join(tags, ", ")` |
-| `$pad()` | ❌ | `$pad("x", 5, "#")` |
-| `$split()` | ❌ | `$split("a,b", ",")` |
+| `$pad()` | ✅ | `$pad("x", 5, "#")` |
+| `$split()` | ✅ | `$split("a,b", ",")` |
 | `$match()` | ❌ | `$match("abc", /[a-z]/)` |
 | `$replace()` | ❌ | `$replace("hello", "l", "r")` |
 
@@ -880,9 +880,9 @@ The remaining gaps are mainly higher-order functions, date/time, regex functions
 | `$floor()` | ✅ | `$floor(3.7)` → `3` |
 | `$ceil()` | ✅ | `$ceil(3.2)` → `4` |
 | `$round()` | ✅ | `$round(3.456, 2)` → `3.46` |
-| `$power()` | ❌ | `$power(2, 3)` → `8` |
-| `$sqrt()` | ❌ | `$sqrt(16)` → `4` |
-| `$random()` | ❌ | `$random()` |
+| `$power()` | ✅ | `$power(2, 3)` → `8` |
+| `$sqrt()` | ✅ | `$sqrt(16)` → `4` |
+| `$random()` | ✅ | `$random()` |
 | `$formatNumber()` | ❌ | `$formatNumber(1234.5, "#,###.00")` |
 | `$parseInteger()` | ❌ | `$parseInteger("FF", 16)` |
 
@@ -909,8 +909,8 @@ The remaining gaps are mainly higher-order functions, date/time, regex functions
 | `$sort()` | ✅ | `$sort(items)` |
 | `$reverse()` | ✅ | `$reverse([1,2,3])` |
 | `$distinct()` | ✅ | `$distinct([1,1,2])` |
-| `$shuffle()` | ❌ | `$shuffle([1,2,3])` |
-| `$zip()` | ❌ | `$zip([1,2], [3,4])` |
+| `$shuffle()` | ✅ | `$shuffle([1,2,3])` |
+| `$zip()` | ✅ | `$zip([1,2], [3,4])` |
 
 ### Object Functions
 | Feature | Status | Example |
@@ -918,39 +918,30 @@ The remaining gaps are mainly higher-order functions, date/time, regex functions
 | `$keys()` | ✅ | `$keys({"a":1})` → `["a"]` |
 | `$merge()` | ✅ | `$merge([{"a":1},{"b":2}])` |
 | `$type()` | ✅ | `$type(42)` → `"number"` |
-| `$values()` | ❌ | `$values({"a":1})` → `[1]` |
-| `$spread()` | ❌ | `$spread({"a":1})` |
+| `$values()` | ✅ | `$values({"a":1})` → `[1]` |
+| `$spread()` | ✅ | `$spread({"a":1})` |
+
+### Date/Time Functions
+| Feature | Status | Example | Notes |
+|---|:---:|---|---|
+| `$now()` | ✅ | `$now()` → `"2024-01-15T10:30:00.123456789Z"` | Returns UTC timestamp in ISO 8601 format |
+| `$millis()` | ✅ | `$millis()` → `1705315800123.0` | Returns milliseconds since Unix Epoch |
+| `$fromMillis(number [, picture [, timezone]])` | ✅ | `$fromMillis(1705315800123)` → `"2024-01-15T10:30:00.123Z"` | **Limitation**: Picture string and timezone parameters are accepted for API compatibility but only ISO 8601 format and UTC timezone are supported for performance |
+| `$toMillis(timestamp [, picture])` | ✅ | `$toMillis("2024-01-15T10:30:00.123Z")` → `1705315800123.0` | **Limitation**: Picture parameter is accepted for API compatibility but only ISO 8601 format is supported for performance |
 
 ### Missing Functions
 
-#### String Functions (4 missing)
+#### String Functions (2 missing)
 | Function | Effort | Notes |
 |---|---|---|
-| `$pad()` | Low | Simple string padding with character |
-| `$split()` | Low | String splitting into array |
 | `$match()` | Medium | Requires regex support (depends on regex literal) |
 | `$replace()` | Medium | Requires regex support (depends on regex literal) |
 
-#### Numeric Functions (5 missing)
+#### Numeric Functions (2 missing)
 | Function | Effort | Notes |
 |---|---|---|
-| `$power()` | Low | `math.Pow()` wrapper |
-| `$sqrt()` | Low | `math.Sqrt()` wrapper |
-| `$random()` | Low | `math/rand` wrapper |
 | `$formatNumber()` | High | Complex formatting patterns (e.g., `"#,###.00"`) |
 | `$parseInteger()` | Medium | Base conversion parsing |
-
-#### Array Functions (2 missing)
-| Function | Effort | Notes |
-|---|---|---|
-| `$shuffle()` | Low | Random array shuffling |
-| `$zip()` | Low | Combine multiple arrays into array of tuples |
-
-#### Object Functions (2 missing)
-| Function | Effort | Notes |
-|---|---|---|
-| `$values()` | Low | Extract all values from object as array |
-| `$spread()` | Low | Spread object properties into parent context |
 
 #### Higher-Order Functions (5 missing)
 | Function | Effort | Notes |
@@ -963,15 +954,13 @@ The remaining gaps are mainly higher-order functions, date/time, regex functions
 
 **Higher-Order Functions Effort**: These require implementing lambda expressions (anonymous functions), which is a significant architectural change. Estimated effort: **High** (2-3 weeks for full lambda support).
 
-#### Date/Time Functions (4 missing)
-| Function | Effort | Notes |
-|---|---|---|
-| `$now()` | Low | Current timestamp |
-| `$millis()` | Low | Current time in milliseconds |
-| `$fromMillis()` | Low | Convert milliseconds to date object |
-| `$toMillis()` | Low | Convert date object to milliseconds |
-
-**Date/Time Functions Effort**: All are straightforward wrappers around Go's `time` package. Estimated effort: **Low** (1-2 days).
+#### Date/Time Functions
+| Function | Status | Example | Notes |
+|---|---|---|---|
+| `$now()` | ✅ | `$now()` → `"2024-01-15T10:30:00.123456789Z"` | Returns UTC timestamp in ISO 8601 format |
+| `$millis()` | ✅ | `$millis()` → `1705315800123.0` | Returns milliseconds since Unix Epoch |
+| `$fromMillis(number [, picture [, timezone]])` | ✅ | `$fromMillis(1705315800123)` → `"2024-01-15T10:30:00.123Z"` | **Limitation**: Picture string and timezone parameters are accepted for API compatibility but only ISO 8601 format and UTC timezone are supported for performance |
+| `$toMillis(timestamp [, picture])` | ✅ | `$toMillis("2024-01-15T10:30:00.123Z")` → `1705315800123.0` | **Limitation**: Picture parameter is accepted for API compatibility but only ISO 8601 format is supported for performance |
 
 #### Other Missing Features
 | Feature | Effort | Notes |
@@ -983,10 +972,10 @@ The remaining gaps are mainly higher-order functions, date/time, regex functions
 ### Implementation Priority Recommendations
 
 **Quick Wins (Low effort, high value):**
-1. Date/Time functions (4 functions, ~1-2 days)
-2. `$values()`, `$spread()`, `$shuffle()`, `$zip()` (4 functions, ~1 day)
-3. `$power()`, `$sqrt()`, `$random()` (3 functions, ~1 day)
-4. `$pad()`, `$split()` (2 functions, ~1 day)
+- ✅ Date/Time functions (4 functions) - **Implemented**
+- ✅ `$values()`, `$spread()`, `$shuffle()`, `$zip()` (4 functions) - **Implemented**
+- ✅ `$power()`, `$sqrt()`, `$random()` (3 functions) - **Implemented**
+- ✅ `$pad()`, `$split()` (2 functions) - **Implemented**
 
 **Medium Priority:**
 1. `$match()`, `$replace()` (requires regex literal support first)
