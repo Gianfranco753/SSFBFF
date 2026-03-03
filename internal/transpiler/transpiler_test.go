@@ -990,6 +990,192 @@ func main() {
 	t.Logf("generated code output:\n%s", output)
 }
 
+// --- fetchFilter tests ---
+
+// TestAnalyzeFetchFilter verifies that $fetch(p,e)[filter].{proj} is recognized
+// as a single fetchFilter ProviderField, and that the embedded QueryPlan has the
+// right root field (endpoint name), filter, and projection.
+func TestAnalyzeFetchFilter(t *testing.T) {
+	expr := `$fetch("orders_service", "data")[price > 100].{id: order_id, total: $sum(items.price)}`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformOrders")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	if plan.FuncName != "TransformOrders" {
+		t.Errorf("FuncName = %q, want TransformOrders", plan.FuncName)
+	}
+	if len(plan.Fields) != 1 {
+		t.Fatalf("Fields count = %d, want 1", len(plan.Fields))
+	}
+
+	field := plan.Fields[0]
+	if field.Kind != "fetchFilter" {
+		t.Errorf("Kind = %q, want fetchFilter", field.Kind)
+	}
+	if field.Provider != "orders_service" {
+		t.Errorf("Provider = %q, want orders_service", field.Provider)
+	}
+	if field.Endpoint != "data" {
+		t.Errorf("Endpoint = %q, want data", field.Endpoint)
+	}
+	if field.FilterPlan == nil {
+		t.Fatal("FilterPlan should not be nil")
+	}
+	if field.FilterPlan.RootField != "data" {
+		t.Errorf("FilterPlan.RootField = %q, want data", field.FilterPlan.RootField)
+	}
+	if len(field.FilterPlan.Filters) != 1 {
+		t.Errorf("FilterPlan.Filters count = %d, want 1", len(field.FilterPlan.Filters))
+	}
+	if len(field.FilterPlan.OutputFields) != 2 {
+		t.Errorf("FilterPlan.OutputFields count = %d, want 2", len(field.FilterPlan.OutputFields))
+	}
+
+	if len(plan.Deps) != 1 {
+		t.Fatalf("Deps count = %d, want 1", len(plan.Deps))
+	}
+	if plan.Deps[0].Provider != "orders_service" || plan.Deps[0].Endpoint != "data" {
+		t.Errorf("Deps[0] = %+v, want orders_service.data", plan.Deps[0])
+	}
+}
+
+// TestGenerateFetchFilterCode verifies that GenerateProvider for a fetchFilter plan
+// emits both the streaming filter function (TransformOrders) and the Execute wrapper.
+func TestGenerateFetchFilterCode(t *testing.T) {
+	expr := `$fetch("orders_service", "data")[price > 100].{id: order_id, total: $sum(items.price)}`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformOrders")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	src, err := transpiler.GenerateProvider(plan, "testpkg", "orders.jsonata", expr)
+	if err != nil {
+		t.Fatalf("generate error: %v", err)
+	}
+
+	code := string(src)
+	mustContain := []string{
+		"package testpkg",
+		"goexperiment.jsonv2",
+		// Filter pipeline
+		"jsontext.NewDecoder",
+		"jsonv2.UnmarshalDecode",
+		"TransformOrders",
+		"OrdersResult",
+		`nameTok.String() != "data"`,
+		"elem.Price > 100",
+		// Execute wrapper
+		"func ExecuteOrders(ctx context.Context, agg *aggregator.Aggregator, req runtime.RequestContext)",
+		`Provider: "orders_service"`,
+		`Endpoint: "data"`,
+		`TransformOrders(results["orders_service.data"])`,
+		"jsonv2.Marshal(items)",
+	}
+
+	for _, s := range mustContain {
+		if !strings.Contains(code, s) {
+			t.Errorf("generated code missing %q", s)
+		}
+	}
+}
+
+// TestFetchFilterEndToEnd generates a fetchFilter transform, writes it alongside
+// a harness that simulates a pre-fetched upstream response, compiles and runs it.
+func TestFetchFilterEndToEnd(t *testing.T) {
+	expr := `$fetch("orders_service", "data")[price > 100].{id: order_id, total: $sum(items.price)}`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformOrders")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	src, err := transpiler.GenerateProvider(plan, "main", "orders.jsonata", expr)
+	if err != nil {
+		t.Fatalf("generate error: %v", err)
+	}
+
+	dir := t.TempDir()
+	copyRuntimePackage(t, dir)
+	copyAggregatorPackage(t, dir)
+
+	// The generated TransformOrders reads {"data": [...]} from upstream bytes.
+	harness := `//go:build goexperiment.jsonv2
+
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+)
+
+func main() {
+	// Simulate what the aggregator returns: raw bytes from the upstream endpoint.
+	// TransformOrders expects {"data": [...]} because the endpoint name is "data".
+	input := []byte(` + "`" + `{
+		"data": [
+			{"order_id": "A1", "price": 50,  "items": [{"price": 10}]},
+			{"order_id": "A2", "price": 200, "items": [{"price": 30}, {"price": 40}, {"price": 50}]},
+			{"order_id": "A3", "price": 150, "items": [{"price": 100}]}
+		]
+	}` + "`" + `)
+
+	// Call the internal filter function directly.
+	results, err := TransformOrders(input)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	out, _ := json.Marshal(results)
+	fmt.Println(string(out))
+
+	if len(results) != 2 {
+		fmt.Fprintf(os.Stderr, "expected 2 results, got %d\n", len(results))
+		os.Exit(1)
+	}
+	if results[0].Total != 120 {
+		fmt.Fprintf(os.Stderr, "expected total=120 for A2, got %v\n", results[0].Total)
+		os.Exit(1)
+	}
+	if results[1].Total != 100 {
+		fmt.Fprintf(os.Stderr, "expected total=100 for A3, got %v\n", results[1].Total)
+		os.Exit(1)
+	}
+	fmt.Println("PASS")
+}
+`
+	writeTestFiles(t, dir, src, harness)
+
+	cmd := exec.Command("go", "run", ".")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GOEXPERIMENT=jsonv2")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("running generated code failed:\n%s\nerror: %v", output, err)
+	}
+
+	if !strings.Contains(string(output), "PASS") {
+		t.Fatalf("generated code did not PASS:\n%s", output)
+	}
+	t.Logf("generated code output:\n%s", output)
+}
+
 // --- Test helpers ---
 
 func copyRuntimePackage(t *testing.T, dir string) {

@@ -4,8 +4,6 @@ package main
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -193,39 +191,3 @@ func TestDownstreamPropagatorDisabled(t *testing.T) {
 	}
 }
 
-// --- fetch.go tests ---
-
-func TestDefaultFetch(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"status":"ok"}`))
-	}))
-	defer srv.Close()
-
-	data, err := defaultFetch(context.Background(), srv.URL)
-	if err != nil {
-		t.Fatalf("defaultFetch error: %v", err)
-	}
-	if got := string(data); got != `{"status":"ok"}` {
-		t.Errorf("defaultFetch = %q, want %q", got, `{"status":"ok"}`)
-	}
-}
-
-func TestDefaultFetchError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "not found", http.StatusNotFound)
-	}))
-	defer srv.Close()
-
-	_, err := defaultFetch(context.Background(), srv.URL)
-	if err == nil {
-		t.Fatal("expected error for 404 response")
-	}
-}
-
-func TestDefaultFetchBadURL(t *testing.T) {
-	_, err := defaultFetch(context.Background(), "http://localhost:1") // connection refused
-	if err == nil {
-		t.Fatal("expected error for unreachable server")
-	}
-}

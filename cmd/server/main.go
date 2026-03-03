@@ -1,15 +1,10 @@
 //go:build goexperiment.jsonv2
 
 // Command server runs the BFF web server. Routes are generated from data/routes.yaml
-// via cmd/apigen. Each route either fetches from a single upstream (filter mode)
-// or fans out to multiple providers via the aggregator (provider mode).
+// via cmd/apigen. Each route fans out to upstream providers via the aggregator.
 //
 // Providers are loaded from data/providers/*.yaml at startup.
 // The data directory defaults to "data" but can be overridden with DATA_DIR env var.
-// Provider base URLs can be overridden at startup:
-//
-//	UPSTREAM_USER_SERVICE_URL=http://user-svc:8080
-//	UPSTREAM_ORDERS_URL=http://orders-svc:8080/data
 //
 // OpenTelemetry tracing is configured via standard OTEL_* environment variables.
 // Set OTEL_SDK_DISABLED=true or OTEL_TRACES_EXPORTER=none to disable tracing.
@@ -54,7 +49,7 @@ var baseTransport = &http.Transport{
 	}).DialContext,
 }
 
-// sharedHTTPClient is used by both filter-mode fetchers and the aggregator.
+// sharedHTTPClient is used by the aggregator for all upstream calls.
 // In main(), after OTel is initialized, its Transport is replaced with an
 // otelhttp-wrapped version so every upstream call gets a trace span.
 var sharedHTTPClient = &http.Client{
@@ -115,7 +110,7 @@ func main() {
 		otelfiber.WithPropagators(downstreamPropagator()),
 	))
 
-	RegisterRoutes(app, defaultFetch, agg)
+	RegisterRoutes(app, agg)
 
 	app.Get("/health", func(c fiber.Ctx) error {
 		return c.SendString("ok")

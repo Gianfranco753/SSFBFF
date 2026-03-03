@@ -29,6 +29,12 @@ type QueryPlan struct {
 	OutputName     string        // Go type name for output struct
 	OutputFields   []OutputField // fields in the output struct
 	FuncName       string        // generated Go function name
+
+	// InputStructPrefix overrides the prefix used for the generated element
+	// struct type name. When empty, RootField is used. Set by callers that
+	// share a RootField across multiple services (e.g. fetchFilter plans where
+	// two different services use the same endpoint name like "data").
+	InputStructPrefix string
 }
 
 // StructField describes a field in the generated input struct.
@@ -954,13 +960,18 @@ type ProviderPlan struct {
 // the corresponding group.
 type ProviderField struct {
 	OutputKey string
-	Kind      string // "fetch", "service", "header", "cookie", "query", "param", "path", "method", "body", "static"
+	Kind      string // "fetch", "fetchFilter", "service", "header", "cookie", "query", "param", "path", "method", "body", "static"
 
 	// Kind="fetch": value comes from a pre-fetched upstream response.
 	Provider    string
 	Endpoint    string
 	JSONPath    []string
 	FetchConfig *FetchConfig // nil when $fetch() has only 2 args
+
+	// Kind="fetchFilter": fetch from upstream then stream-filter+project the result.
+	// Provider and Endpoint identify the upstream. FilterPlan holds the pipeline.
+	// The generated Execute function returns a JSON array (not wrapped in an object).
+	FilterPlan *QueryPlan
 
 	// Kind="service": value comes from another generated transform pipeline.
 	// JSONPath is reused for the path into the service result.
@@ -1087,8 +1098,9 @@ func (p *ProviderPlan) RequestFields() RequestFieldSet {
 }
 
 // AnalyzeFetchCalls walks a JSONata AST that uses $fetch() and/or $request()
-// calls, producing a ProviderPlan. It expects an ObjectNode at the root
-// where each value is one of:
+// calls, producing a ProviderPlan. It handles two top-level forms:
+//
+// 1. Object literal — each value is one of:
 //   - $fetch("provider", "endpoint").path             → Kind="fetch"
 //   - $fetch("provider", "endpoint", {config}).path   → Kind="fetch" + FetchConfig
 //   - $request().headers.Name                         → Kind="header"
@@ -1098,7 +1110,25 @@ func (p *ProviderPlan) RequestFields() RequestFieldSet {
 //   - $request().path                                 → Kind="path"
 //   - $request().method                               → Kind="method"
 //   - $request().body.field                            → Kind="body"
+//
+// 2. Fetch-filter pipeline:
+//   - $fetch("provider", "endpoint")[filter].{proj}   → Kind="fetchFilter"
+//     The Execute function returns a JSON array directly.
 func AnalyzeFetchCalls(root jparse.Node, funcName string) (*ProviderPlan, error) {
+	// Detect the $fetch(p,e)[filter].{projection} top-level pattern before
+	// attempting to unwrap an object literal.
+	if field, ok := tryAnalyzeFetchFilter(root, funcName); ok {
+		plan := &ProviderPlan{
+			FuncName: funcName,
+			Fields:   []ProviderField{field},
+			Deps: []ProviderDepEntry{{
+				Provider: field.Provider,
+				Endpoint: field.Endpoint,
+			}},
+		}
+		return plan, nil
+	}
+
 	obj := unwrapObject(root)
 	if obj == nil {
 		return nil, fmt.Errorf("expression must be an object literal, got %T", root)
@@ -1193,6 +1223,81 @@ func unwrapObject(root jparse.Node) *jparse.ObjectNode {
 		}
 	}
 	return nil
+}
+
+// tryAnalyzeFetchFilter detects the $fetch(provider, endpoint)[filter].{proj}
+// top-level pattern. If found it returns a ProviderField with Kind="fetchFilter"
+// and ok=true. Otherwise it returns ok=false and the caller falls through to the
+// standard object-literal path.
+//
+// jparse represents "$fetch(p,e)[filter].{proj}" as a PathNode with two steps:
+//   - Step 0: PredicateNode{Expr: FunctionCallNode($fetch), Filters: [...]}
+//   - Step 1: ObjectNode{...}
+//
+// To reuse the existing Analyze logic, we substitute a NameNode(endpoint) for
+// the $fetch call. This tells Analyze to expect the upstream response to be a
+// JSON object with the endpoint name as the root key — e.g. $fetch("svc", "data")
+// expects the upstream to return {"data": [...]}.
+func tryAnalyzeFetchFilter(root jparse.Node, funcName string) (ProviderField, bool) {
+	path, ok := root.(*jparse.PathNode)
+	if !ok || len(path.Steps) < 2 {
+		return ProviderField{}, false
+	}
+
+	// First step must be a PredicateNode whose Expr is a $fetch() call.
+	pred, ok := path.Steps[0].(*jparse.PredicateNode)
+	if !ok {
+		return ProviderField{}, false
+	}
+	fnCall, ok := pred.Expr.(*jparse.FunctionCallNode)
+	if !ok {
+		return ProviderField{}, false
+	}
+	fnVar, ok := fnCall.Func.(*jparse.VariableNode)
+	if !ok || fnVar.Name != "fetch" {
+		return ProviderField{}, false
+	}
+	if len(fnCall.Args) < 2 {
+		return ProviderField{}, false
+	}
+	provArg, ok1 := fnCall.Args[0].(*jparse.StringNode)
+	epArg, ok2 := fnCall.Args[1].(*jparse.StringNode)
+	if !ok1 || !ok2 {
+		return ProviderField{}, false
+	}
+
+	// Build a synthetic PathNode that replaces $fetch(...) with a NameNode
+	// using the endpoint name. This lets the existing Analyze function run
+	// cleanly: the endpoint name becomes the root JSON key the generated code
+	// will navigate to in the upstream response body.
+	syntheticPred := &jparse.PredicateNode{
+		Expr:    &jparse.NameNode{Value: epArg.Value},
+		Filters: pred.Filters,
+	}
+	syntheticPath := &jparse.PathNode{
+		Steps: append([]jparse.Node{syntheticPred}, path.Steps[1:]...),
+	}
+
+	queryPlan, err := Analyze(syntheticPath)
+	if err != nil {
+		return ProviderField{}, false
+	}
+
+	// Override the generated names with the outer function name so the filter
+	// function and its output type are scoped to the service, not the endpoint.
+	// InputStructPrefix avoids collisions when multiple services share the same
+	// endpoint name (e.g. both use "data") — each gets its own element struct.
+	baseName := strings.TrimPrefix(funcName, "Transform")
+	queryPlan.FuncName = funcName
+	queryPlan.OutputName = baseName + "Result"
+	queryPlan.InputStructPrefix = unexportedName(baseName)
+
+	return ProviderField{
+		Kind:       "fetchFilter",
+		Provider:   provArg.Value,
+		Endpoint:   epArg.Value,
+		FilterPlan: queryPlan,
+	}, true
 }
 
 // analyzeValueNode determines the kind of a value expression and extracts its
