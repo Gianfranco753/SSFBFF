@@ -373,6 +373,62 @@ func main() {
 		return c.SendString("ok")
 	})
 
+	// Scalar documentation endpoint (enabled via ENABLE_DOCS env var)
+	if getCachedEnableDocs() {
+		app.Get("/docs", func(c fiber.Ctx) error {
+			openAPIPath := filepath.Join(dataDir, "openapi.yaml")
+			specData, err := os.ReadFile(openAPIPath)
+			if err != nil {
+				logger.Error().Err(err).Str("path", openAPIPath).Msg("failed to read OpenAPI spec")
+				return c.Status(500).JSON(fiber.Map{
+					"error": "failed to load OpenAPI specification",
+				})
+			}
+
+			// Convert YAML to JSON for Scalar
+			var specObj interface{}
+			if err := yaml.Unmarshal(specData, &specObj); err != nil {
+				logger.Error().Err(err).Msg("failed to parse OpenAPI spec")
+				return c.Status(500).JSON(fiber.Map{
+					"error": "failed to parse OpenAPI specification",
+				})
+			}
+
+			specJSON, err := jsonv2.Marshal(specObj)
+			if err != nil {
+				logger.Error().Err(err).Msg("failed to marshal OpenAPI spec to JSON")
+				return c.Status(500).JSON(fiber.Map{
+					"error": "failed to convert OpenAPI specification",
+				})
+			}
+
+			// Escape JSON for embedding in HTML script tag
+			specJSONStr := string(specJSON)
+			specJSONEscaped := strings.ReplaceAll(specJSONStr, "</script>", "<\\/script>")
+
+			html := `<!doctype html>
+<html>
+  <head>
+    <title>API Documentation</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body {
+        margin: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <script id="api-reference" type="application/json">` + specJSONEscaped + `</script>
+    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@latest/dist/browser/standalone.js"></script>
+  </body>
+</html>`
+
+			c.Set("Content-Type", "text/html; charset=utf-8")
+			return c.SendString(html)
+		})
+	}
+
 	addr := listenAddr()
 	logger.Info().Str("address", addr).Msg("BFF server starting")
 

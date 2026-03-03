@@ -20,6 +20,9 @@ curl http://localhost:3000/health
 curl http://localhost:3000/ready
 curl http://localhost:3000/dashboard
 curl http://localhost:3000/api/v1/orders
+
+# 4. View API documentation
+# Open http://localhost:3000/docs in your browser
 ```
 
 ## How It Works
@@ -325,6 +328,7 @@ go run ./cmd/apigen --spec=<openapi.yaml> --jsonata-dir=<dir> [--proxies=<proxie
 | `SHUTDOWN_TIMEOUT` | Graceful shutdown timeout (e.g., `30s`) | `30s` |
 | `HEALTH_CHECK_TIMEOUT` | Health check timeout per provider (e.g., `500ms`) | `500ms` |
 | `HEALTH_CHECK_FAILURE_THRESHOLD` | Maximum allowed provider failures for health check (0 = all must be healthy) | `0` |
+| `ENABLE_DOCS` | Enable the `/docs` endpoint with interactive API documentation (Scalar) | `true` |
 
 ### Proxy
 
@@ -463,6 +467,16 @@ MAX_IDLE_CONNS_PER_HOST=5000 \
 MAX_CONNS_PER_HOST=10000 \
 GOEXPERIMENT=jsonv2 go run ./cmd/server/
 ```
+
+## API Documentation
+
+The server provides an interactive API documentation endpoint powered by [Scalar](https://scalar.com/):
+
+- `/docs` — Interactive API documentation showing all available endpoints from `data/openapi.yaml`
+
+The documentation endpoint is **enabled by default** and can be disabled by setting `ENABLE_DOCS=false`. When enabled, visit `/docs` in your browser to explore all available endpoints, request/response schemas, and test API calls directly from the documentation interface.
+
+The documentation is automatically generated from your OpenAPI specification (`data/openapi.yaml`) and reflects all endpoints defined there.
 
 ## Health Checks
 

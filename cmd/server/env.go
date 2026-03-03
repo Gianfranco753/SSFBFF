@@ -71,6 +71,9 @@ var (
 	// Shutdown configuration
 	shutdownTimeout          time.Duration
 
+	// Documentation configuration
+	enableDocs               bool
+
 	// Proxy configuration (cached to avoid http.ProxyFromEnvironment overhead)
 	httpProxy                *url.URL
 	httpsProxy               *url.URL
@@ -141,6 +144,9 @@ func initEnvCache() {
 
 	// Shutdown configuration
 	envCache.shutdownTimeout = getEnvDuration("SHUTDOWN_TIMEOUT", 30*time.Second)
+
+	// Documentation configuration
+	envCache.enableDocs = getEnvBool("ENABLE_DOCS", true)
 
 	// Proxy configuration - parse once and cache
 	envCache.httpProxy = parseProxyURL(getEnvString("HTTP_PROXY", ""))
@@ -430,6 +436,13 @@ func getCachedShutdownTimeout() time.Duration {
 	return envCache.shutdownTimeout
 }
 
+func getCachedEnableDocs() bool {
+	ensureCacheInitialized()
+	envCache.mu.RLock()
+	defer envCache.mu.RUnlock()
+	return envCache.enableDocs
+}
+
 func getCachedProxyFunc() func(*http.Request) (*url.URL, error) {
 	ensureCacheInitialized()
 	envCache.mu.RLock()
@@ -601,6 +614,7 @@ func resetEnvCacheForTesting() {
 	envCache.metricsBatchInterval = 0
 	envCache.metricsSampleRate = 0
 	envCache.useTraceIDAsRequestID = false
+	envCache.enableDocs = false
 	envCache.httpProxy = nil
 	envCache.httpsProxy = nil
 	envCache.noProxy = nil
