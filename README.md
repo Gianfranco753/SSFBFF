@@ -140,6 +140,8 @@ paths:
 
 The `x-service-name` value maps to `data/services/{service-name}.jsonata`.
 
+**Request Validation**: The server automatically generates validation functions from OpenAPI request schemas (parameters and requestBody). Validation happens at runtime before the JSONata transform executes, ensuring invalid requests are rejected early with HTTP 400 errors. See the [Request Validation](#request-validation) section for details.
+
 ### `data/proxies.yaml`
 
 Pass-through proxy routes that forward requests directly to downstream services without JSONata transformation:
@@ -231,6 +233,8 @@ In `data/openapi.yaml`:
                   type: object
 ```
 
+**Optional**: Add request validation by including `parameters` and/or `requestBody` in the operation. See the [Request Validation](#request-validation) section for details.
+
 ### 4. Define providers (fetch mode only)
 
 Create `data/providers/user_service.yaml` if it doesn't exist.
@@ -243,6 +247,158 @@ GOEXPERIMENT=jsonv2 go run ./cmd/server/
 ```
 
 The generator auto-detects the mode — if the expression contains `$fetch()` or `$service()`, it generates aggregator-aware routes; otherwise, single-upstream filter routes.
+
+## Request Validation
+
+The server automatically generates validation functions from OpenAPI request schemas. Validation runs at runtime before the JSONata transform executes, ensuring invalid requests are rejected early with HTTP 400 errors.
+
+### How It Works
+
+When you define request schemas in your OpenAPI specification (`data/openapi.yaml`), the code generator (`cmd/apigen`) automatically:
+
+1. Parses request schemas (parameters and requestBody)
+2. Generates validation functions that work directly with `RequestContext` (zero-allocation)
+3. Injects validation calls into route handlers
+
+Validation happens **before** the JSONata transform, so invalid requests never reach your business logic.
+
+### Defining Request Schemas
+
+Add `parameters` and `requestBody` to your OpenAPI operations:
+
+```yaml
+paths:
+  /api/v1/users:
+    post:
+      x-service-name: create_user
+      summary: Create a new user
+      parameters:
+        - name: X-Request-ID
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, name]
+              properties:
+                email:
+                  type: string
+                  format: email
+                name:
+                  type: string
+                  minLength: 1
+                  maxLength: 100
+      responses:
+        "200":
+          description: User created
+```
+
+### Supported Validation Features
+
+**Parameters (query, path, header):**
+- Required field validation
+- Type validation (string, integer, number, boolean)
+- Constraints: `minimum`, `maximum`, `minLength`, `maxLength`, `pattern`, `enum`
+- Format validation (e.g., `email`)
+
+**Request Body:**
+- Required field validation
+- Type validation for object properties
+- Constraints: `minLength`, `maxLength`, `minimum`, `maximum`, `pattern`, `enum`
+- Format validation (e.g., `email`)
+- Nested object validation
+
+**Schema References:**
+- Support for `$ref` references to `components/schemas`
+- Reusable schema definitions
+
+### Example: Complete Validation
+
+```yaml
+paths:
+  /api/v1/orders:
+    post:
+      x-service-name: create_order
+      parameters:
+        - name: Authorization
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id, items]
+              properties:
+                user_id:
+                  type: string
+                  pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                items:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [product_id, quantity]
+                    properties:
+                      product_id:
+                        type: string
+                      quantity:
+                        type: integer
+                        minimum: 1
+```
+
+This generates validation that:
+- Ensures `Authorization` header is present
+- Validates `page` query param is an integer between 1 and 1000 (if provided)
+- Ensures request body has required `user_id` and `items` fields
+- Validates `user_id` matches UUID pattern
+- Validates `items` array has at least one element
+- Validates each item has required `product_id` and `quantity` fields
+- Validates `quantity` is at least 1
+
+### Validation Errors
+
+When validation fails, the server returns HTTP 400 with a JSON error response:
+
+```json
+{
+  "error": "required header 'Authorization' is missing"
+}
+```
+
+Validation errors are also logged with the endpoint, method, and error details for debugging.
+
+### Performance
+
+Validation is designed for zero-allocation performance:
+
+- **Header/Query/Path validation**: Direct map lookups, no allocations
+- **Body validation**: Streaming JSON validation using `jsontext.Decoder` when possible, avoiding full unmarshaling
+- **No data conversion**: Validation works directly with `RequestContext` maps and `[]byte`
+- **Backward compatible**: Routes without schemas have zero validation overhead
+
+### Disabling Validation
+
+To disable validation for a route, simply omit `parameters` and `requestBody` from the OpenAPI operation. The route will work without validation (backward compatible).
 
 ## Project Structure
 
