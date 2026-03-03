@@ -314,11 +314,17 @@ go run ./cmd/apigen --spec=<openapi.yaml> --jsonata-dir=<dir> [--proxies=<proxie
 | `PORT` | Server listen port | `3000` |
 | `DATA_DIR` | Path to the data directory | `data` |
 | `UPSTREAM_<PROVIDER>_URL` | Override base URL for a provider | — |
-| `MAX_IDLE_CONNS_PER_HOST` | Maximum idle connections per host in connection pool | `1000` |
-| `MAX_CONNS_PER_HOST` | Maximum total connections per host in connection pool | `2000` |
+| `MAX_IDLE_CONNS_PER_HOST` | Maximum idle connections per host in connection pool | `2000` |
+| `MAX_CONNS_PER_HOST` | Maximum total connections per host in connection pool | `5000` |
+| `IDLE_CONN_TIMEOUT` | Idle connection timeout (e.g., `90s`) | `90s` |
+| `DIAL_TIMEOUT` | Dial timeout for new connections (e.g., `3s`) | `3s` |
+| `KEEP_ALIVE` | TCP keep-alive interval (e.g., `30s`) | `30s` |
 | `FIBER_PREFORK` | Enable prefork mode (multi-process, one per CPU core) | `true` |
 | `FIBER_CONCURRENCY` | Maximum concurrent connections per worker | `256 * CPU count` |
 | `FIBER_BODY_LIMIT` | Maximum request body size in bytes | `10485760` (10MB) |
+| `FIBER_READ_TIMEOUT` | Read timeout (e.g., `5s`) | `5s` |
+| `FIBER_WRITE_TIMEOUT` | Write timeout (e.g., `10s`) | `10s` |
+| `FIBER_IDLE_TIMEOUT` | Idle timeout (e.g., `120s`) | `120s` |
 
 ### Proxy
 
@@ -347,14 +353,60 @@ Tracing is configured via standard [OTEL environment variables](https://opentele
 | `OTEL_EXPORTER_OTLP_TRACES_HEADERS` | Traces-specific header override | — |
 | `OTEL_PROPAGATE_UPSTREAM` | Inject `traceparent`/`tracestate` into requests sent to upstream microservices | `true` |
 | `OTEL_PROPAGATE_DOWNSTREAM` | Inject `traceparent`/`tracestate` into HTTP responses sent back to clients | `true` |
+| `USE_TRACE_ID_AS_REQUEST_ID` | Use OpenTelemetry trace ID for `X-Request-ID` header instead of generating UUIDs | `true` |
 
 **Per-Request Tracing Override**: When `OTEL_DISABLE_TRACING=true`, you can still enable tracing for specific requests by including the `x-enable-trace: true` or `x-enable-trace: 1` header. This is useful for debugging high-load scenarios without impacting overall performance.
+
+### Performance Tuning
+
+The server includes several performance optimizations for high-throughput scenarios (650k+ RPS):
+
+| Variable | Description | Default |
+|---|---|---|
+| `ENABLE_METRICS` | Enable Prometheus metrics recording | `true` |
+| `ENABLE_ERROR_LOGGING` | Enable error logging | `true` |
+| `ENABLE_RESOURCE_METRICS` | Enable resource metrics (goroutines, memory) | `true` |
+| `RESOURCE_METRICS_INTERVAL` | Resource metrics collection interval (e.g., `10s`, `30s`) | `10s` |
+| `METRICS_CACHE_TTL` | Cache metrics endpoint output for N seconds (0 = no cache) | `0` |
+| `ASYNC_LOGGING` | Use async logging channel to avoid blocking request path | `false` |
+| `ASYNC_LOGGING_BUFFER_SIZE` | Size of async logging buffer | `1000` |
+
+**High-Throughput Configuration Example**:
+
+```bash
+# Optimize for maximum throughput (650k+ RPS)
+ENABLE_METRICS=false \
+ENABLE_ERROR_LOGGING=false \
+ENABLE_RESOURCE_METRICS=false \
+OTEL_SDK_DISABLED=true \
+FIBER_PREFORK=true \
+FIBER_CONCURRENCY=512 \
+MAX_IDLE_CONNS_PER_HOST=5000 \
+MAX_CONNS_PER_HOST=10000 \
+GOEXPERIMENT=jsonv2 go run ./cmd/server/
+```
+
+**Balanced Configuration** (observability + performance):
+
+```bash
+# Good balance for production
+ENABLE_METRICS=true \
+ENABLE_ERROR_LOGGING=true \
+ENABLE_RESOURCE_METRICS=true \
+RESOURCE_METRICS_INTERVAL=30s \
+METRICS_CACHE_TTL=5 \
+ASYNC_LOGGING=true \
+OTEL_DISABLE_TRACING=true \
+GOEXPERIMENT=jsonv2 go run ./cmd/server/
+```
 
 ## Tracing & Observability
 
 The server is fully OpenTelemetry compatible out of the box:
 
-- **Incoming requests** — the [Fiber OTel middleware](https://github.com/gofiber/contrib/tree/main/v3/otel) (`github.com/gofiber/contrib/v3/otel`) creates a server span for every request, records HTTP metrics, and extracts W3C TraceContext + Baggage headers from the incoming request so the BFF can join an existing distributed trace.
+- **Incoming requests** — the [Fiber OTel middleware](https://github.com/gofiber/contrib/tree/main/v3/otel) (`github.com/gofiber/contrib/v3/otel`) creates a server span for every request, records HTTP metrics, and extracts W3C TraceContext + Baggage headers from the incoming request so the BFF can join an existing distributed trace. When `OTEL_SDK_DISABLED=true`, the middleware is skipped entirely for maximum performance.
+
+- **Trace IDs instead of UUIDs** — The server uses OpenTelemetry trace IDs for request correlation instead of generating UUIDs. The `otelzerolog` wrapper automatically injects `trace_id` and `span_id` into all log entries, eliminating the need for separate request ID generation. When `USE_TRACE_ID_AS_REQUEST_ID=true` (default), the trace ID is also set as the `X-Request-ID` response header for client compatibility.
 
 - **Upstream calls** — every provider/upstream fetch becomes a child span of the active request trace via `otelhttp.NewTransport`. Span creation always happens (so the BFF records the call duration and status), while header propagation to the microservice is controlled separately (see below).
 

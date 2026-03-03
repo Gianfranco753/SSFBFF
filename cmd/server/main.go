@@ -49,25 +49,52 @@ import (
 
 // createProviderTransport creates an HTTP transport for a provider with configurable connection pool sizes.
 // It respects HTTP_PROXY, HTTPS_PROXY, and NO_PROXY environment variables.
+// For high-throughput scenarios, increase MAX_IDLE_CONNS_PER_HOST and MAX_CONNS_PER_HOST.
 func createProviderTransport(cfg aggregator.ProviderConfig) *http.Transport {
 	maxIdle := cfg.MaxIdleConnsPerHost
 	if maxIdle == 0 {
-		maxIdle = getEnvInt("MAX_IDLE_CONNS_PER_HOST", 1000)
+		// Default increased for high concurrency - can be tuned per deployment
+		maxIdle = getEnvInt("MAX_IDLE_CONNS_PER_HOST", 2000)
 	}
 	maxConns := cfg.MaxConnsPerHost
 	if maxConns == 0 {
-		maxConns = getEnvInt("MAX_CONNS_PER_HOST", 2000)
+		// Default increased for high concurrency - can be tuned per deployment
+		maxConns = getEnvInt("MAX_CONNS_PER_HOST", 5000)
+	}
+
+	// Connection pool tuning for high throughput
+	idleTimeout := 90 * time.Second
+	if timeoutStr := os.Getenv("IDLE_CONN_TIMEOUT"); timeoutStr != "" {
+		if parsed, err := time.ParseDuration(timeoutStr); err == nil && parsed > 0 {
+			idleTimeout = parsed
+		}
+	}
+
+	dialTimeout := 3 * time.Second
+	if timeoutStr := os.Getenv("DIAL_TIMEOUT"); timeoutStr != "" {
+		if parsed, err := time.ParseDuration(timeoutStr); err == nil && parsed > 0 {
+			dialTimeout = parsed
+		}
+	}
+
+	keepAlive := 30 * time.Second
+	if keepAliveStr := os.Getenv("KEEP_ALIVE"); keepAliveStr != "" {
+		if parsed, err := time.ParseDuration(keepAliveStr); err == nil && parsed > 0 {
+			keepAlive = parsed
+		}
 	}
 
 	return &http.Transport{
 		Proxy:               http.ProxyFromEnvironment,
 		MaxIdleConnsPerHost: maxIdle,
 		MaxConnsPerHost:     maxConns,
-		IdleConnTimeout:     90 * time.Second,
+		IdleConnTimeout:     idleTimeout,
 		DialContext: (&net.Dialer{
-			Timeout:   3 * time.Second,
-			KeepAlive: 30 * time.Second,
+			Timeout:   dialTimeout,
+			KeepAlive: keepAlive,
 		}).DialContext,
+		// Enable connection reuse for better performance
+		DisableKeepAlives: false,
 	}
 }
 
@@ -203,9 +230,34 @@ func main() {
 	serverAggregator = agg
 
 	// Configure Fiber for high performance
+	// Prefork can be disabled for single-process deployments (better for containerized environments)
 	prefork := getEnvBool("FIBER_PREFORK", true)
+	// Concurrency: higher values allow more concurrent connections per worker
+	// Default: 256 * CPU cores (tuned for high throughput)
 	concurrency := getEnvInt("FIBER_CONCURRENCY", 256*runtime.NumCPU())
 	bodyLimit := getEnvInt("FIBER_BODY_LIMIT", 10*1024*1024) // 10MB default
+
+	// Timeout configuration - can be tuned for high-throughput scenarios
+	readTimeout := 5 * time.Second
+	if timeoutStr := os.Getenv("FIBER_READ_TIMEOUT"); timeoutStr != "" {
+		if parsed, err := time.ParseDuration(timeoutStr); err == nil && parsed > 0 {
+			readTimeout = parsed
+		}
+	}
+
+	writeTimeout := 10 * time.Second
+	if timeoutStr := os.Getenv("FIBER_WRITE_TIMEOUT"); timeoutStr != "" {
+		if parsed, err := time.ParseDuration(timeoutStr); err == nil && parsed > 0 {
+			writeTimeout = parsed
+		}
+	}
+
+	idleTimeout := 120 * time.Second
+	if timeoutStr := os.Getenv("FIBER_IDLE_TIMEOUT"); timeoutStr != "" {
+		if parsed, err := time.ParseDuration(timeoutStr); err == nil && parsed > 0 {
+			idleTimeout = parsed
+		}
+	}
 
 	app := fiber.New(fiber.Config{
 		JSONEncoder: func(v any) ([]byte, error) { return jsonv2.Marshal(v) },
@@ -217,24 +269,29 @@ func main() {
 		ReduceMemoryUsage: true,
 		DisableKeepalive:  false,
 
-		ReadTimeout:  5 * time.Second,
-		WriteTimeout: 10 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		ReadTimeout:  readTimeout,
+		WriteTimeout: writeTimeout,
+		IdleTimeout:  idleTimeout,
 	})
 
 	// Add panic recovery middleware first (outermost)
 	app.Use(panicRecoveryMiddleware(logger))
 
-	// Add request ID middleware
-	app.Use(requestIDMiddleware(logger))
-
 	// Instrument all incoming requests with OpenTelemetry.
 	// The middleware creates server spans and extracts W3C TraceContext/Baggage.
+	// When OTEL_SDK_DISABLED=true, this middleware is skipped entirely.
 	// When OTEL_DISABLE_TRACING=true, spans are still created but can be enabled
 	// per-request via x-enable-trace header (requires custom sampler implementation).
-	app.Use(otelfiber.Middleware(
-		otelfiber.WithPropagators(downstreamPropagator()),
-	))
+	if os.Getenv("OTEL_SDK_DISABLED") != "true" && os.Getenv("OTEL_TRACES_EXPORTER") != "none" {
+		app.Use(otelfiber.Middleware(
+			otelfiber.WithPropagators(downstreamPropagator()),
+		))
+	}
+
+	// Extract trace ID from OTel span context and set as X-Request-ID header.
+	// This replaces UUID generation since OTel already provides trace IDs.
+	// trace_id and span_id are automatically injected into logs via otelzerolog.
+	app.Use(traceIDMiddleware())
 
 	// Add error handler middleware
 	app.Use(errorHandlerMiddleware(logger))
@@ -248,31 +305,84 @@ func main() {
 	// The generated code will call SetRouteLogger if it exists
 	setRouteLoggerIfAvailable(logger)
 
-	// Start resource metrics collection
-	go func() {
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			updateResourceMetrics()
+	// Start resource metrics collection (if enabled)
+	// Collection interval can be increased via RESOURCE_METRICS_INTERVAL env var (default: 10s)
+	resourceMetricsInterval := 10 * time.Second
+	if intervalStr := os.Getenv("RESOURCE_METRICS_INTERVAL"); intervalStr != "" {
+		if parsed, err := time.ParseDuration(intervalStr); err == nil && parsed > 0 {
+			resourceMetricsInterval = parsed
 		}
-	}()
+	}
+
+	if resourceMetricsEnabled {
+		go func() {
+			ticker := time.NewTicker(resourceMetricsInterval)
+			defer ticker.Stop()
+			for range ticker.C {
+				updateResourceMetrics()
+			}
+		}()
+	}
 
 	app.Get("/health", func(c fiber.Ctx) error {
 		return c.SendString("ok")
 	})
 
+	// Metrics endpoint optimization: use sync.Pool for buffers and optional caching
+	var (
+		metricsCacheTTL = getEnvInt("METRICS_CACHE_TTL", 0) // seconds, 0 = no cache
+		metricsCache    struct {
+			mu      sync.RWMutex
+			content []byte
+			expires time.Time
+		}
+		bufferPool = sync.Pool{
+			New: func() interface{} {
+				return &bytes.Buffer{}
+			},
+		}
+	)
+
 	app.Get("/metrics", func(c fiber.Ctx) error {
+		// Check cache if enabled
+		if metricsCacheTTL > 0 {
+			metricsCache.mu.RLock()
+			if time.Now().Before(metricsCache.expires) && len(metricsCache.content) > 0 {
+				content := metricsCache.content
+				metricsCache.mu.RUnlock()
+				c.Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+				return c.Send(content)
+			}
+			metricsCache.mu.RUnlock()
+		}
+
 		// Gather metrics from default registry (includes promauto custom metrics)
 		// OTel metrics are exported via the Prometheus exporter and available through the meter provider
 		handler := promhttp.HandlerFor(prometheus.DefaultGatherer, promhttp.HandlerOpts{})
 
+		// Get buffer from pool
+		buf := bufferPool.Get().(*bytes.Buffer)
+		buf.Reset()
+		defer bufferPool.Put(buf)
+
 		// Create a mock HTTP request and response writer to capture metrics output.
 		req, _ := http.NewRequest("GET", "/metrics", nil)
-		var buf bytes.Buffer
-		handler.ServeHTTP(&mockResponseWriter{Writer: &buf}, req)
+		handler.ServeHTTP(&mockResponseWriter{Writer: buf}, req)
+
+		content := buf.Bytes()
+		contentCopy := make([]byte, len(content))
+		copy(contentCopy, content)
+
+		// Update cache if enabled
+		if metricsCacheTTL > 0 {
+			metricsCache.mu.Lock()
+			metricsCache.content = contentCopy
+			metricsCache.expires = time.Now().Add(time.Duration(metricsCacheTTL) * time.Second)
+			metricsCache.mu.Unlock()
+		}
 
 		c.Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-		return c.SendString(buf.String())
+		return c.Send(contentCopy)
 	})
 
 	app.Get("/ready", func(c fiber.Ctx) error {

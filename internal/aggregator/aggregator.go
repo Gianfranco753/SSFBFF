@@ -66,6 +66,13 @@ type Aggregator struct {
 	providers map[string]ProviderConfig
 	clients   map[string]*http.Client // Per-provider clients with isolated connection pools
 	obsConfig *ObservabilityConfig   // Optional observability configuration
+	
+	// Feature flags set at initialization to avoid nil checks in hot path
+	hasObservability      bool
+	hasLogger             bool
+	hasRecordUpstreamCall bool
+	hasRecordUpstreamError bool
+	hasRecordAggregatorOp bool
 }
 
 // LookupEnv is the function used to read environment variables during New().
@@ -100,11 +107,22 @@ func NewWithObservability(providers map[string]ProviderConfig, createClient func
 		clients[name] = createClient(prov)
 	}
 
-	return &Aggregator{
+	agg := &Aggregator{
 		providers: resolved,
 		clients:   clients,
 		obsConfig: obsConfig,
 	}
+	
+	// Set feature flags once at initialization to avoid repeated nil checks
+	if obsConfig != nil {
+		agg.hasObservability = true
+		agg.hasLogger = true // Logger is always set if obsConfig is provided
+		agg.hasRecordUpstreamCall = obsConfig.RecordUpstreamCall != nil
+		agg.hasRecordUpstreamError = obsConfig.RecordUpstreamError != nil
+		agg.hasRecordAggregatorOp = obsConfig.RecordAggregatorOp != nil
+	}
+	
+	return agg
 }
 
 // GetProviders returns a copy of the provider configurations.
@@ -132,14 +150,14 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 		g.Go(func() error {
 			url, timeout, optional, err := a.resolveURL(dep)
 			if err != nil {
-				if a.observabilityEnabled() {
+				if a.hasLogger {
 					a.obsConfig.Logger.Error().
 						Str("provider", dep.Provider).
 						Str("endpoint", dep.Endpoint).
 						Err(err).
 						Msg("failed to resolve upstream URL")
-					a.recordUpstreamError(dep.Provider, dep.Endpoint, "resolve_error")
 				}
+				a.recordUpstreamError(dep.Provider, dep.Endpoint, "resolve_error")
 				if optional {
 					mu.Lock()
 					results[dep.Key()] = []byte("null")
@@ -167,7 +185,7 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 					errorType = "client_error"
 				}
 				
-				if a.observabilityEnabled() {
+				if a.hasLogger {
 					logEvent := a.obsConfig.Logger.Error().
 						Str("provider", dep.Provider).
 						Str("endpoint", dep.Endpoint).
@@ -178,15 +196,15 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 						logEvent = logEvent.Int("status_code", statusCode)
 					}
 					logEvent.Msg("upstream request failed")
-					a.recordUpstreamError(dep.Provider, dep.Endpoint, errorType)
 				}
+				a.recordUpstreamError(dep.Provider, dep.Endpoint, errorType)
 				a.recordUpstreamCall(dep.Provider, dep.Endpoint, callDuration, status)
 				
 				if optional {
 					mu.Lock()
 					results[dep.Key()] = []byte("null")
 					mu.Unlock()
-					if a.observabilityEnabled() {
+					if a.hasLogger {
 						a.obsConfig.Logger.Warn().
 							Str("provider", dep.Provider).
 							Str("endpoint", dep.Endpoint).
@@ -215,7 +233,7 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 	}
 	
 	a.recordAggregatorOperation("success")
-	if a.observabilityEnabled() && totalDuration > 1*time.Second {
+	if a.hasLogger && totalDuration > 1*time.Second {
 		a.obsConfig.Logger.Warn().
 			Dur("total_duration_ms", totalDuration).
 			Int("dependencies", len(deps)).

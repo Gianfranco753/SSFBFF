@@ -3,39 +3,120 @@
 package main
 
 import (
-	"github.com/google/uuid"
+	"context"
+	"os"
+	"strconv"
+	"sync"
+
 	"github.com/gofiber/fiber/v3"
 	"github.com/rs/zerolog"
+	"go.opentelemetry.io/otel/trace"
 )
 
-// requestIDMiddleware generates a unique request ID and adds it to the context and response headers.
-func requestIDMiddleware(logger zerolog.Logger) fiber.Handler {
-	return func(c fiber.Ctx) error {
-		requestID := c.Get("X-Request-ID")
-		if requestID == "" {
-			requestID = uuid.New().String()
+// logEntry represents a log entry to be processed asynchronously.
+type logEntry struct {
+	level     zerolog.Level
+	event     *zerolog.Event
+	msg       string
+	ctx       context.Context
+	processed chan struct{}
+}
+
+var (
+	asyncLoggingEnabled = getEnvBool("ASYNC_LOGGING", false)
+	errorLoggingEnabled = getEnvBool("ENABLE_ERROR_LOGGING", true)
+	logChan             chan *logEntry
+	logWorkerOnce        sync.Once
+)
+
+// initAsyncLogging initializes the async logging worker if enabled.
+func initAsyncLogging(logger zerolog.Logger) {
+	if !asyncLoggingEnabled {
+		return
+	}
+
+	logWorkerOnce.Do(func() {
+		bufferSize := 1000
+		if size := os.Getenv("ASYNC_LOGGING_BUFFER_SIZE"); size != "" {
+			if parsed, err := strconv.Atoi(size); err == nil && parsed > 0 {
+				bufferSize = parsed
+			}
 		}
-		
-		c.Set("X-Request-ID", requestID)
-		
-		c.Locals("request_id", requestID)
-		
+		logChan = make(chan *logEntry, bufferSize)
+
+		go func() {
+			for entry := range logChan {
+				if entry.processed != nil {
+					defer close(entry.processed)
+				}
+				entry.event.Msg(entry.msg)
+			}
+		}()
+	})
+}
+
+// logAsync logs an entry asynchronously if async logging is enabled, otherwise synchronously.
+func logAsync(level zerolog.Level, event *zerolog.Event, msg string, ctx context.Context) {
+	if !errorLoggingEnabled {
+		return
+	}
+
+	if asyncLoggingEnabled && logChan != nil {
+		processed := make(chan struct{})
+		select {
+		case logChan <- &logEntry{level: level, event: event, msg: msg, ctx: ctx, processed: processed}:
+			// Non-blocking send - if channel is full, fall through to sync logging
+			<-processed
+		default:
+			// Channel full, log synchronously to avoid blocking
+			event.Msg(msg)
+		}
+	} else {
+		event.Msg(msg)
+	}
+}
+
+// traceIDMiddleware extracts trace ID from OpenTelemetry span context and sets it as X-Request-ID header.
+// This replaces UUID generation since OTel already provides trace IDs, and otelzerolog injects trace_id/span_id into logs.
+func traceIDMiddleware() fiber.Handler {
+	useTraceIDAsRequestID := getEnvBool("USE_TRACE_ID_AS_REQUEST_ID", true)
+	if !useTraceIDAsRequestID {
+		// Middleware is a no-op if disabled
+		return func(c fiber.Ctx) error {
+			return c.Next()
+		}
+	}
+
+	return func(c fiber.Ctx) error {
+		// Check if X-Request-ID is already set by client
+		if requestID := c.Get("X-Request-ID"); requestID != "" {
+			return c.Next()
+		}
+
+		// Extract trace ID from OpenTelemetry span context
+		span := trace.SpanFromContext(c.Context())
+		if span.SpanContext().IsValid() {
+			traceID := span.SpanContext().TraceID().String()
+			c.Set("X-Request-ID", traceID)
+		}
+
 		return c.Next()
 	}
 }
 
 // panicRecoveryMiddleware recovers from panics, logs them with context, and returns 500 errors.
+// Note: trace_id and span_id are automatically injected into logs via otelzerolog, so we don't need request_id.
 func panicRecoveryMiddleware(logger zerolog.Logger) fiber.Handler {
+	initAsyncLogging(logger)
 	return func(c fiber.Ctx) error {
 		defer func() {
 			if r := recover(); r != nil {
-				requestID := c.Get("X-Request-ID", "")
-				logger.Error().
-					Str("request_id", requestID).
+				logEvent := logger.Error().
 					Str("endpoint", c.Path()).
 					Str("method", c.Method()).
-					Interface("panic", r).
-					Msg("panic recovered")
+					Interface("panic", r)
+				
+				logAsync(zerolog.ErrorLevel, logEvent, "panic recovered", c.Context())
 				
 				recordHTTPError(c.Path(), c.Method(), fiber.StatusInternalServerError)
 				c.Status(fiber.StatusInternalServerError)
@@ -48,11 +129,12 @@ func panicRecoveryMiddleware(logger zerolog.Logger) fiber.Handler {
 }
 
 // errorHandlerMiddleware handles errors returned by handlers and logs them.
+// Note: trace_id and span_id are automatically injected into logs via otelzerolog, so we don't need request_id.
 func errorHandlerMiddleware(logger zerolog.Logger) fiber.Handler {
+	initAsyncLogging(logger)
 	return func(c fiber.Ctx) error {
 		err := c.Next()
 		if err != nil {
-			requestID := c.Get("X-Request-ID", "")
 			statusCode := fiber.StatusInternalServerError
 			
 			if e, ok := err.(*fiber.Error); ok {
@@ -60,13 +142,13 @@ func errorHandlerMiddleware(logger zerolog.Logger) fiber.Handler {
 			}
 			
 			if statusCode >= 400 {
-				logger.Error().
-					Str("request_id", requestID).
+				logEvent := logger.Error().
 					Str("endpoint", c.Path()).
 					Str("method", c.Method()).
 					Int("status_code", statusCode).
-					Err(err).
-					Msg("request error")
+					Err(err)
+				
+				logAsync(zerolog.ErrorLevel, logEvent, "request error", c.Context())
 				
 				recordHTTPError(c.Path(), c.Method(), statusCode)
 			}

@@ -15,27 +15,31 @@ type ObservabilityConfig struct {
 }
 
 // observabilityEnabled returns true if observability is configured.
+// Uses feature flag to avoid nil check overhead.
 func (a *Aggregator) observabilityEnabled() bool {
-	return a.obsConfig != nil
+	return a.hasObservability
 }
 
 // recordUpstreamCall records metrics for an upstream call.
+// Uses feature flag to avoid nil check overhead.
 func (a *Aggregator) recordUpstreamCall(provider, endpoint string, duration time.Duration, status string) {
-	if a.observabilityEnabled() && a.obsConfig.RecordUpstreamCall != nil {
+	if a.hasRecordUpstreamCall {
 		a.obsConfig.RecordUpstreamCall(provider, endpoint, duration, status)
 	}
 }
 
 // recordUpstreamError records an upstream error.
+// Uses feature flag to avoid nil check overhead.
 func (a *Aggregator) recordUpstreamError(provider, endpoint, errorType string) {
-	if a.observabilityEnabled() && a.obsConfig.RecordUpstreamError != nil {
+	if a.hasRecordUpstreamError {
 		a.obsConfig.RecordUpstreamError(provider, endpoint, errorType)
 	}
 }
 
 // recordAggregatorOperation records aggregator operation status.
+// Uses feature flag to avoid nil check overhead.
 func (a *Aggregator) recordAggregatorOperation(status string) {
-	if a.observabilityEnabled() && a.obsConfig.RecordAggregatorOp != nil {
+	if a.hasRecordAggregatorOp {
 		a.obsConfig.RecordAggregatorOp(status)
 	}
 }

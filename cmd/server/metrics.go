@@ -4,7 +4,9 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"runtime"
+	"strconv"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -73,28 +75,64 @@ var (
 	)
 )
 
+// getEnvBool reads a boolean environment variable, returning defaultValue if not set or invalid.
+func getEnvBool(key string, defaultValue bool) bool {
+	val := os.Getenv(key)
+	if val == "" {
+		return defaultValue
+	}
+	parsed, err := strconv.ParseBool(val)
+	if err != nil {
+		return defaultValue
+	}
+	return parsed
+}
+
+// metricsEnabled returns true if metrics recording is enabled.
+var metricsEnabled = getEnvBool("ENABLE_METRICS", true)
+
 // recordHTTPError records an HTTP error with endpoint, method, and status code.
 func recordHTTPError(endpoint, method string, statusCode int) {
+	if !metricsEnabled {
+		return
+	}
 	httpErrorsTotal.WithLabelValues(endpoint, method, fmt.Sprintf("%d", statusCode)).Inc()
 }
 
 // recordUpstreamCall records upstream call metrics.
 func recordUpstreamCall(provider, endpoint string, duration time.Duration, status string) {
+	if !metricsEnabled {
+		return
+	}
 	upstreamCallDuration.WithLabelValues(provider, endpoint, status).Observe(duration.Seconds())
 }
 
 // recordUpstreamError records an upstream error.
 func recordUpstreamError(provider, endpoint, errorType string) {
+	if !metricsEnabled {
+		return
+	}
 	upstreamErrorsTotal.WithLabelValues(provider, endpoint, errorType).Inc()
 }
 
 // recordAggregatorOperation records aggregator operation status.
 func recordAggregatorOperation(status string) {
+	if !metricsEnabled {
+		return
+	}
 	aggregatorOperationsTotal.WithLabelValues(status).Inc()
 }
 
+// resourceMetricsEnabled returns true if resource metrics collection is enabled.
+var resourceMetricsEnabled = getEnvBool("ENABLE_RESOURCE_METRICS", true)
+
 // updateResourceMetrics updates resource metrics (goroutines, memory).
+// Uses runtime.ReadMemStats which is expensive (stop-the-world), so this should be called infrequently.
 func updateResourceMetrics() {
+	if !resourceMetricsEnabled {
+		return
+	}
+
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 	goRoutines.Set(float64(runtime.NumGoroutine()))
