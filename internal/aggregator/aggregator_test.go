@@ -182,34 +182,6 @@ func TestFetchContextCancellation(t *testing.T) {
 	}
 }
 
-func TestFetchEnvOverride(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"from":"env"}`))
-	}))
-	defer srv.Close()
-
-	// Env overrides are now resolved at startup in New(). We set the env var
-	// before calling New() so the override is applied.
-	t.Setenv("UPSTREAM_MY_SVC_URL", srv.URL)
-
-	agg := New(map[string]ProviderConfig{
-		"my_svc": {
-			BaseURL:   "http://should-not-be-used:1234",
-			Timeout:   5 * time.Second,
-			Endpoints: makeEndpoints(map[string]string{"ep": "/ep"}),
-		},
-	}, testClientFactory)
-
-	deps := []runtime.ProviderDep{{Provider: "my_svc", Endpoint: "ep"}}
-	results, err := agg.Fetch(context.Background(), deps)
-	if err != nil {
-		t.Fatalf("Fetch error: %v", err)
-	}
-	if got := string(results["my_svc.ep"]); got != `{"from":"env"}` {
-		t.Errorf("got %q, want %q", got, `{"from":"env"}`)
-	}
-}
-
 func TestFetchDefaultTimeout(t *testing.T) {
 	agg := New(map[string]ProviderConfig{
 		"svc": {BaseURL: "http://localhost", Endpoints: makeEndpoints(map[string]string{"ep": "/ep"})},

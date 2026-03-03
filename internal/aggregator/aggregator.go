@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -75,14 +74,9 @@ type Aggregator struct {
 	hasRecordAggregatorOp bool
 }
 
-// LookupEnv is the function used to read environment variables during New().
-// Tests can replace it to avoid depending on real env vars.
-var LookupEnv = os.LookupEnv
-
 // New creates an Aggregator from a provider config map and a client factory function.
 // The factory function is called for each provider to create a dedicated HTTP client
-// with its own connection pool. It resolves UPSTREAM_<PROVIDER>_URL environment overrides
-// once at startup so that per-request lookups are just map reads with zero allocation.
+// with its own connection pool.
 func New(providers map[string]ProviderConfig, createClient func(ProviderConfig) *http.Client) *Aggregator {
 	return NewWithObservability(providers, createClient, nil)
 }
@@ -93,10 +87,6 @@ func NewWithObservability(providers map[string]ProviderConfig, createClient func
 	clients := make(map[string]*http.Client, len(providers))
 
 	for name, prov := range providers {
-		envKey := "UPSTREAM_" + strings.ToUpper(name) + "_URL"
-		if override, ok := LookupEnv(envKey); ok && override != "" {
-			prov.BaseURL = override
-		}
 		// Normalize: strip trailing slash so endpoint paths join cleanly.
 		prov.BaseURL = strings.TrimRight(prov.BaseURL, "/")
 		// Apply default timeout once.
@@ -245,7 +235,7 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 
 // resolveURL builds the full URL for a dep and returns the endpoint-specific timeout
 // and whether the provider is optional. Timeout precedence: endpoint > provider > global default.
-// Env overrides and default timeouts were already applied at startup in New().
+// Default timeouts were already applied at startup in New().
 func (a *Aggregator) resolveURL(dep runtime.ProviderDep) (url string, timeout time.Duration, optional bool, err error) {
 	prov, ok := a.providers[dep.Provider]
 	if !ok {

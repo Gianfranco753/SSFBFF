@@ -13,9 +13,6 @@ A code-generation pipeline that compiles [JSONata](https://jsonata.org/) express
 GOEXPERIMENT=jsonv2 go generate ./internal/generated/
 
 # 2. Start the server
-UPSTREAM_USER_SERVICE_URL=http://user-svc:8080 \
-UPSTREAM_BANK_SERVICE_URL=http://bank-svc:8080 \
-UPSTREAM_ORDERS_URL=http://orders-svc:8080/data \
 GOEXPERIMENT=jsonv2 go run ./cmd/server/
 
 # 3. Test
@@ -174,8 +171,6 @@ endpoints:
 
 **Timeout precedence**: Endpoint-level timeout > Provider-level timeout > Global default (10s)
 
-Provider base URLs can be overridden at runtime: `UPSTREAM_USER_SERVICE_URL=http://...`
-
 Mark a provider as non-critical with `optional: true` — failures store `null` instead of aborting:
 
 ```yaml
@@ -313,7 +308,6 @@ go run ./cmd/apigen --spec=<openapi.yaml> --jsonata-dir=<dir> [--proxies=<proxie
 |---|---|---|
 | `PORT` | Server listen port | `3000` |
 | `DATA_DIR` | Path to the data directory | `data` |
-| `UPSTREAM_<PROVIDER>_URL` | Override base URL for a provider | — |
 | `MAX_IDLE_CONNS_PER_HOST` | Maximum idle connections per host in connection pool | `2000` |
 | `MAX_CONNS_PER_HOST` | Maximum total connections per host in connection pool | `5000` |
 | `IDLE_CONN_TIMEOUT` | Idle connection timeout (e.g., `90s`) | `90s` |
@@ -487,10 +481,7 @@ docker build -t bff-app .
 docker compose -f examples/docker-compose.yaml up --build
 
 # Or run standalone
-docker run -p 3000:3000 \
-  -e UPSTREAM_USER_SERVICE_URL=http://host.docker.internal:9999 \
-  -e UPSTREAM_BANK_SERVICE_URL=http://host.docker.internal:9999 \
-  bff-app
+docker run -p 3000:3000 bff-app
 ```
 
 The build copies `data/` into the build stage, runs `go generate` to transpile all JSONata into Go, compiles the binary, then copies only the binary and `data/providers/` into the runtime image. Routes and service logic are compiled into the binary.
