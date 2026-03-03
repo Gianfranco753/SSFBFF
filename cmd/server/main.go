@@ -34,7 +34,6 @@ import (
 	"time"
 
 	"github.com/gcossani/ssfbff/internal/aggregator"
-	otelfiber "github.com/gofiber/contrib/v3/otel"
 	"github.com/gofiber/fiber/v3"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -290,21 +289,13 @@ func main() {
 	// Add panic recovery middleware first (outermost)
 	app.Use(panicRecoveryMiddleware(logger))
 
-	// Instrument all incoming requests with OpenTelemetry.
-	// The middleware creates server spans and extracts W3C TraceContext/Baggage.
-	// When OTEL_SDK_DISABLED=true, this middleware is skipped entirely.
+	// Combined OpenTelemetry instrumentation and trace ID extraction.
+	// This middleware creates server spans, extracts W3C TraceContext/Baggage,
+	// and sets X-Request-ID header from the trace ID.
+	// When OTEL_SDK_DISABLED=true or OTEL_TRACES_EXPORTER=none, this is a no-op.
 	// When OTEL_DISABLE_TRACING=true, spans are still created but can be enabled
 	// per-request via x-enable-trace header (requires custom sampler implementation).
-	if !getCachedOtelSDKDisabled() && getCachedOtelTracesExporter() != "none" {
-		app.Use(otelfiber.Middleware(
-			otelfiber.WithPropagators(downstreamPropagator()),
-		))
-	}
-
-	// Extract trace ID from OTel span context and set as X-Request-ID header.
-	// This replaces UUID generation since OTel already provides trace IDs.
-	// trace_id and span_id are automatically injected into logs via otelzerolog.
-	app.Use(traceIDMiddleware())
+	app.Use(otelWithTraceIDMiddleware())
 
 	// Add error handler middleware
 	app.Use(errorHandlerMiddleware(logger))

@@ -3,10 +3,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"strconv"
 	"sync"
 	"time"
 
+	otelfiber "github.com/gofiber/contrib/v3/otel"
 	"github.com/gofiber/fiber/v3"
 	"github.com/rs/zerolog"
 	"go.opentelemetry.io/otel/trace"
@@ -114,40 +117,44 @@ func shutdownAsyncLogging(timeout time.Duration) bool {
 	}
 }
 
-// traceIDMiddleware extracts trace ID from OpenTelemetry span context and sets it as X-Request-ID header.
-// This replaces UUID generation since OTel already provides trace IDs, and otelzerolog injects trace_id/span_id into logs.
-func traceIDMiddleware() fiber.Handler {
+// otelWithTraceIDMiddleware combines OpenTelemetry instrumentation with trace ID extraction.
+// This reduces middleware overhead by combining two related operations into one.
+// When OTEL_SDK_DISABLED=true or OTEL_TRACES_EXPORTER=none, returns a no-op middleware.
+func otelWithTraceIDMiddleware() fiber.Handler {
+	// If OTel is completely disabled, return no-op
+	if getCachedOtelSDKDisabled() || getCachedOtelTracesExporter() == "none" {
+		return func(c fiber.Ctx) error {
+			return c.Next()
+		}
+	}
+
 	useTraceIDAsRequestID := getCachedUseTraceIDAsRequestID()
-	if !useTraceIDAsRequestID {
-		// Middleware is a no-op if disabled
-		return func(c fiber.Ctx) error {
-			return c.Next()
-		}
+	tracingDisabled := getCachedOtelDisableTracing()
+
+	// Create OTel middleware
+	otelMiddleware := otelfiber.Middleware(
+		otelfiber.WithPropagators(downstreamPropagator()),
+	)
+
+	// If trace ID as request ID is disabled or tracing is disabled, just use OTel middleware
+	if !useTraceIDAsRequestID || tracingDisabled {
+		return otelMiddleware
 	}
 
-	// Check if tracing is disabled globally - if so, skip span context extraction
-	tracingDisabled := getCachedOtelDisableTracing() || 
-		getCachedOtelSDKDisabled() ||
-		getCachedOtelTracesExporter() == "none"
-	
-	if tracingDisabled {
-		// No-op when tracing is disabled to avoid span context extraction overhead
-		return func(c fiber.Ctx) error {
-			return c.Next()
-		}
-	}
-
+	// Combined middleware: OTel instrumentation + trace ID extraction
 	return func(c fiber.Ctx) error {
-		// Check if X-Request-ID is already set by client
-		if requestID := c.Get("X-Request-ID"); requestID != "" {
-			return c.Next()
+		// Run OTel middleware first (creates span and extracts trace context)
+		if err := otelMiddleware(c); err != nil {
+			return err
 		}
 
-		// Extract trace ID from OpenTelemetry span context
-		span := trace.SpanFromContext(c.Context())
-		if span.SpanContext().IsValid() {
-			traceID := span.SpanContext().TraceID().String()
-			c.Set("X-Request-ID", traceID)
+		// Extract trace ID and set as X-Request-ID if not already set
+		if requestID := c.Get("X-Request-ID"); requestID == "" {
+			span := trace.SpanFromContext(c.Context())
+			if span.SpanContext().IsValid() {
+				traceID := span.SpanContext().TraceID().String()
+				c.Set("X-Request-ID", traceID)
+			}
 		}
 
 		return c.Next()
@@ -158,6 +165,14 @@ func traceIDMiddleware() fiber.Handler {
 // Note: trace_id and span_id are automatically injected into logs via otelzerolog, so we don't need request_id.
 func panicRecoveryMiddleware(logger zerolog.Logger) fiber.Handler {
 	initAsyncLogging(logger)
+	
+	// Use sync.Pool for error response buffers to avoid allocations
+	errorResponsePool := sync.Pool{
+		New: func() interface{} {
+			return &bytes.Buffer{}
+		},
+	}
+	
 	return func(c fiber.Ctx) error {
 		defer func() {
 			if r := recover(); r != nil {
@@ -169,10 +184,15 @@ func panicRecoveryMiddleware(logger zerolog.Logger) fiber.Handler {
 				logAsync(zerolog.ErrorLevel, logEvent, "panic recovered", c.Context())
 				
 				recordHTTPError(c.Path(), c.Method(), fiber.StatusInternalServerError)
-				_ = c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-					"error":  "Internal Server Error",
-					"status": fiber.StatusInternalServerError,
-				})
+				
+				// Use sync.Pool buffer instead of fiber.Map to avoid allocation
+				buf := errorResponsePool.Get().(*bytes.Buffer)
+				buf.Reset()
+				defer errorResponsePool.Put(buf)
+				
+				buf.WriteString(`{"error":"Internal Server Error","status":500}`)
+				c.Set("Content-Type", "application/json")
+				_ = c.Status(fiber.StatusInternalServerError).Send(buf.Bytes())
 			}
 		}()
 		
