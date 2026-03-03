@@ -65,6 +65,7 @@ type ProviderConfig struct {
 type Aggregator struct {
 	providers map[string]ProviderConfig
 	clients   map[string]*http.Client // Per-provider clients with isolated connection pools
+	obsConfig *ObservabilityConfig   // Optional observability configuration
 }
 
 // LookupEnv is the function used to read environment variables during New().
@@ -76,6 +77,11 @@ var LookupEnv = os.LookupEnv
 // with its own connection pool. It resolves UPSTREAM_<PROVIDER>_URL environment overrides
 // once at startup so that per-request lookups are just map reads with zero allocation.
 func New(providers map[string]ProviderConfig, createClient func(ProviderConfig) *http.Client) *Aggregator {
+	return NewWithObservability(providers, createClient, nil)
+}
+
+// NewWithObservability creates an Aggregator with optional observability configuration.
+func NewWithObservability(providers map[string]ProviderConfig, createClient func(ProviderConfig) *http.Client, obsConfig *ObservabilityConfig) *Aggregator {
 	resolved := make(map[string]ProviderConfig, len(providers))
 	clients := make(map[string]*http.Client, len(providers))
 
@@ -97,22 +103,43 @@ func New(providers map[string]ProviderConfig, createClient func(ProviderConfig) 
 	return &Aggregator{
 		providers: resolved,
 		clients:   clients,
+		obsConfig: obsConfig,
 	}
+}
+
+// GetProviders returns a copy of the provider configurations.
+// This is used for health checks and observability.
+func (a *Aggregator) GetProviders() map[string]ProviderConfig {
+	result := make(map[string]ProviderConfig, len(a.providers))
+	for k, v := range a.providers {
+		result[k] = v
+	}
+	return result
 }
 
 // Fetch calls all endpoints listed in deps concurrently and returns their raw
 // JSON bodies keyed by "provider.endpoint". Each call respects the provider's
 // configured timeout.
 func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map[string][]byte, error) {
+	startTime := time.Now()
 	results := make(map[string][]byte, len(deps))
 	var mu sync.Mutex
 
 	g, gctx := errgroup.WithContext(ctx)
 
 	for _, dep := range deps {
+		dep := dep // capture loop variable
 		g.Go(func() error {
 			url, timeout, optional, err := a.resolveURL(dep)
 			if err != nil {
+				if a.observabilityEnabled() {
+					a.obsConfig.Logger.Error().
+						Str("provider", dep.Provider).
+						Str("endpoint", dep.Endpoint).
+						Err(err).
+						Msg("failed to resolve upstream URL")
+					a.recordUpstreamError(dep.Provider, dep.Endpoint, "resolve_error")
+				}
 				if optional {
 					mu.Lock()
 					results[dep.Key()] = []byte("null")
@@ -125,17 +152,53 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 			reqCtx, cancel := context.WithTimeout(gctx, timeout)
 			defer cancel()
 
-			body, err := a.doRequest(reqCtx, dep, url)
+			callStart := time.Now()
+			body, statusCode, err := a.doRequest(reqCtx, dep, url)
+			callDuration := time.Since(callStart)
+			
 			if err != nil {
+				status := "error"
+				errorType := "request_error"
+				if statusCode >= 500 {
+					errorType = "server_error"
+				} else if statusCode == 408 || statusCode == 504 {
+					errorType = "timeout"
+				} else if statusCode >= 400 {
+					errorType = "client_error"
+				}
+				
+				if a.observabilityEnabled() {
+					logEvent := a.obsConfig.Logger.Error().
+						Str("provider", dep.Provider).
+						Str("endpoint", dep.Endpoint).
+						Str("url", url).
+						Dur("duration_ms", callDuration).
+						Err(err)
+					if statusCode > 0 {
+						logEvent = logEvent.Int("status_code", statusCode)
+					}
+					logEvent.Msg("upstream request failed")
+					a.recordUpstreamError(dep.Provider, dep.Endpoint, errorType)
+				}
+				a.recordUpstreamCall(dep.Provider, dep.Endpoint, callDuration, status)
+				
 				if optional {
 					mu.Lock()
 					results[dep.Key()] = []byte("null")
 					mu.Unlock()
+					if a.observabilityEnabled() {
+						a.obsConfig.Logger.Warn().
+							Str("provider", dep.Provider).
+							Str("endpoint", dep.Endpoint).
+							Msg("optional provider failed, using null")
+					}
 					return nil
 				}
 				return fmt.Errorf("%s/%s: %w", dep.Provider, dep.Endpoint, err)
 			}
 
+			a.recordUpstreamCall(dep.Provider, dep.Endpoint, callDuration, "success")
+			
 			mu.Lock()
 			results[dep.Key()] = body
 			mu.Unlock()
@@ -143,9 +206,22 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 		})
 	}
 
-	if err := g.Wait(); err != nil {
+	err := g.Wait()
+	totalDuration := time.Since(startTime)
+	
+	if err != nil {
+		a.recordAggregatorOperation("failure")
 		return nil, err
 	}
+	
+	a.recordAggregatorOperation("success")
+	if a.observabilityEnabled() && totalDuration > 1*time.Second {
+		a.obsConfig.Logger.Warn().
+			Dur("total_duration_ms", totalDuration).
+			Int("dependencies", len(deps)).
+			Msg("slow aggregation detected")
+	}
+	
 	return results, nil
 }
 
@@ -177,10 +253,11 @@ func (a *Aggregator) resolveURL(dep runtime.ProviderDep) (url string, timeout ti
 
 // doRequest makes an HTTP request respecting dep.Method, dep.Headers, and
 // dep.Body. If Method is empty it defaults to GET. Uses the provider-specific client.
-func (a *Aggregator) doRequest(ctx context.Context, dep runtime.ProviderDep, url string) ([]byte, error) {
+// Returns body, statusCode, error. statusCode is 0 if the request didn't reach the server.
+func (a *Aggregator) doRequest(ctx context.Context, dep runtime.ProviderDep, url string) ([]byte, int, error) {
 	client, ok := a.clients[dep.Provider]
 	if !ok {
-		return nil, fmt.Errorf("no client configured for provider %q", dep.Provider)
+		return nil, 0, fmt.Errorf("no client configured for provider %q", dep.Provider)
 	}
 
 	method := dep.Method
@@ -195,7 +272,7 @@ func (a *Aggregator) doRequest(ctx context.Context, dep runtime.ProviderDep, url
 
 	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
 	if err != nil {
-		return nil, fmt.Errorf("building request: %w", err)
+		return nil, 0, fmt.Errorf("building request: %w", err)
 	}
 
 	for k, v := range dep.Headers {
@@ -204,13 +281,18 @@ func (a *Aggregator) doRequest(ctx context.Context, dep runtime.ProviderDep, url
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("request to %s: %w", url, err)
+		return nil, 0, fmt.Errorf("request to %s: %w", url, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("%s returned %d", url, resp.StatusCode)
+		return nil, resp.StatusCode, fmt.Errorf("%s returned %d", url, resp.StatusCode)
 	}
 
-	return io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, resp.StatusCode, fmt.Errorf("reading response body: %w", err)
+	}
+	
+	return body, resp.StatusCode, nil
 }
