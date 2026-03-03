@@ -220,7 +220,10 @@ func main() {
 	serverAggregator = agg
 
 	// Configure Fiber for high performance
-	// Prefork can be disabled for single-process deployments (better for containerized environments)
+	// Prefork: disabled by default for containerized deployments (Docker/Kubernetes).
+	// In containerized environments, scale horizontally (multiple containers) rather than
+	// vertically (multiple processes per container). Enable prefork only if you have
+	// multiple dedicated CPU cores per container and aren't using an orchestrator.
 	prefork := getCachedFiberPrefork()
 	// Concurrency: higher values allow more concurrent connections per worker
 	// Default: 256 * CPU cores (tuned for high throughput)
@@ -248,11 +251,6 @@ func main() {
 		WriteTimeout: writeTimeout,
 		IdleTimeout:  idleTimeout,
 	})
-
-	// Prefork is not available in Fiber v3 as a config option
-	// It's handled differently or may have been removed
-	// Keeping the prefork variable for potential future use but not applying it
-	_ = prefork
 
 	// Add panic recovery middleware first (outermost)
 	app.Use(panicRecoveryMiddleware(logger))
@@ -378,9 +376,31 @@ func main() {
 	addr := listenAddr()
 	logger.Info().Str("address", addr).Msg("BFF server starting")
 
+	// When prefork is enabled, app.Listen() manages child processes.
+	// The parent process blocks to manage children, so we run it in a goroutine
+	// to allow the main function to handle shutdown signals.
 	go func() {
-		if err := app.Listen(addr); err != nil {
-			logger.Fatal().Err(err).Msg("server error")
+		defer func() {
+			if r := recover(); r != nil {
+				logger.Error().
+					Interface("panic", r).
+					Msg("panic in server goroutine")
+				os.Exit(1)
+			}
+		}()
+
+		listenConfig := fiber.ListenConfig{
+			EnablePrefork: prefork,
+		}
+		if err := app.Listen(addr, listenConfig); err != nil {
+			// In prefork mode, errors from child processes are handled by Fiber.
+			// This error typically indicates the parent process failed to start or manage children.
+			logger.Error().
+				Err(err).
+				Bool("prefork", prefork).
+				Str("address", addr).
+				Msg("server listen error")
+			os.Exit(1)
 		}
 	}()
 

@@ -316,7 +316,7 @@ go run ./cmd/apigen --spec=<openapi.yaml> --jsonata-dir=<dir> [--proxies=<proxie
 | `IDLE_CONN_TIMEOUT` | Idle connection timeout (e.g., `90s`) | `90s` |
 | `DIAL_TIMEOUT` | Dial timeout for new connections (e.g., `3s`) | `3s` |
 | `KEEP_ALIVE` | TCP keep-alive interval (e.g., `30s`) | `30s` |
-| `FIBER_PREFORK` | Enable prefork mode (multi-process, one per CPU core) | `true` |
+| `FIBER_PREFORK` | Enable prefork mode (multi-process, one per CPU core). **Disabled by default for containerized deployments** - scale horizontally (multiple containers) instead. Enable only if you have multiple dedicated CPU cores per container and aren't using an orchestrator | `false` |
 | `FIBER_CONCURRENCY` | Maximum concurrent connections per worker | `256 * CPU count` |
 | `FIBER_BODY_LIMIT` | Maximum request body size in bytes | `10485760` (10MB) |
 | `FIBER_READ_TIMEOUT` | Read timeout (e.g., `5s`) | `5s` |
@@ -612,14 +612,14 @@ Multi-stage build: generates all code, compiles a static binary, produces a mini
 # Build
 docker build -t bff-app .
 
-# Run with Docker Compose (includes mock upstreams)
-docker compose -f examples/docker-compose.yaml up --build
+# Run standalone (mount data directory as volume)
+docker run -p 3000:3000 -v $(pwd)/data:/data bff-app
 
-# Or run standalone
-docker run -p 3000:3000 bff-app
+# Or run with Docker Compose (includes mock upstreams)
+docker compose -f examples/docker-compose.yaml up --build
 ```
 
-The build copies `data/` into the build stage, runs `go generate` to transpile all JSONata into Go, compiles the binary, then copies only the binary and `data/providers/` into the runtime image. Routes and service logic are compiled into the binary.
+The build copies `data/` into the build stage, runs `go generate` to transpile all JSONata into Go, compiles the binary, then copies only the binary into the runtime image. Routes and service logic are compiled into the binary. The `data/` directory (specifically `data/providers/`) must be mounted as a volume at runtime.
 
 ## JSONata Coverage — 71% of spec
 

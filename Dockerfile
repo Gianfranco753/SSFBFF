@@ -31,12 +31,12 @@ RUN go build -ldflags="-s -w" -o /bff ./cmd/server/
 
 # ---- Runtime stage ----
 # Distroless contains nothing but the binary — no shell, no package manager.
-# Only data/providers/ is needed at runtime (routes and services are compiled in).
+# Routes and services are compiled into the binary.
+# Data directory (providers) should be mounted as a volume at runtime.
 FROM gcr.io/distroless/static-debian12:nonroot
 
-# Copy binary and runtime data
+# Copy binary only - data directory should be mounted at runtime
 COPY --from=builder /bff /bff
-COPY --from=builder /app/data/providers/ /data/providers/
 
 ENV DATA_DIR=/data
 

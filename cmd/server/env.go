@@ -96,7 +96,10 @@ func initEnvCache() {
 	envCache.keepAlive = getEnvDuration("KEEP_ALIVE", 30*time.Second)
 
 	// Fiber configuration
-	envCache.fiberPrefork = getEnvBool("FIBER_PREFORK", true)
+	// Prefork disabled by default for containerized deployments.
+	// In Docker/Kubernetes, scale horizontally (multiple containers) rather than vertically (multiple processes).
+	// Enable prefork only if you have multiple dedicated CPU cores per container and aren't using an orchestrator.
+	envCache.fiberPrefork = getEnvBool("FIBER_PREFORK", false)
 	envCache.fiberConcurrency = getEnvInt("FIBER_CONCURRENCY", 0) // 0 means use default calculation
 	envCache.fiberBodyLimit = getEnvInt("FIBER_BODY_LIMIT", 10*1024*1024)
 	envCache.fiberReadTimeout = getEnvDuration("FIBER_READ_TIMEOUT", 5*time.Second)
