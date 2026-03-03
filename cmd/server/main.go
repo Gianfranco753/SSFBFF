@@ -241,6 +241,22 @@ func main() {
 	app := fiber.New(fiber.Config{
 		JSONEncoder: func(v any) ([]byte, error) { return jsonv2.Marshal(v) },
 		JSONDecoder: func(data []byte, v any) error { return jsonv2.Unmarshal(data, v) },
+		ErrorHandler: func(c fiber.Ctx, err error) error {
+			code := fiber.StatusInternalServerError
+			message := "Internal Server Error"
+
+			if e, ok := err.(*fiber.Error); ok {
+				code = e.Code
+				message = e.Message
+			} else {
+				message = err.Error()
+			}
+
+			return c.Status(code).JSON(fiber.Map{
+				"error":  message,
+				"status": code,
+			})
+		},
 
 		Concurrency:       concurrency,
 		BodyLimit:         bodyLimit,

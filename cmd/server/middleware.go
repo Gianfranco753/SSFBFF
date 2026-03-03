@@ -169,8 +169,10 @@ func panicRecoveryMiddleware(logger zerolog.Logger) fiber.Handler {
 				logAsync(zerolog.ErrorLevel, logEvent, "panic recovered", c.Context())
 				
 				recordHTTPError(c.Path(), c.Method(), fiber.StatusInternalServerError)
-				c.Status(fiber.StatusInternalServerError)
-				c.SendString("Internal Server Error")
+				_ = c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+					"error":  "Internal Server Error",
+					"status": fiber.StatusInternalServerError,
+				})
 			}
 		}()
 		
