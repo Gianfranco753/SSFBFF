@@ -104,10 +104,9 @@ func isTracingEnabledGlobally() bool {
 	return !getCachedOtelDisableTracing()
 }
 
-// initLogger configures and returns a zerolog logger with OpenTelemetry trace ID integration.
+// initLogger configures and returns a zerolog logger.
 // It reads LOG_LEVEL (default: info) and LOG_FORMAT (default: json) environment variables (cached at startup).
-// The logger is wrapped with otelzerolog to automatically inject trace_id and span_id
-// from OpenTelemetry span context when available.
+// Trace IDs are manually injected in the async logging worker from the stored context.
 func initLogger() zerolog.Logger {
 	levelStr := getCachedLogLevel()
 	logLevel, err := zerolog.ParseLevel(levelStr)
@@ -126,9 +125,8 @@ func initLogger() zerolog.Logger {
 		Timestamp().
 		Logger()
 
-	// otelzerolog works by decorating log events with AddTracingContext
-	// The logger itself doesn't need to be wrapped - tracing context is added
-	// when logging via middleware or explicit AddTracingContext calls
+	// Trace IDs are manually injected in async logging worker
+	// No hook needed since all logging is async
 	return logger
 }
 
@@ -150,6 +148,9 @@ var serverAggregator *aggregator.Aggregator
 
 func main() {
 	logger := initLogger()
+	
+	// Initialize async logging worker early so all logging is asynchronous
+	initAsyncLogging(logger)
 
 	// Initialize OpenTelemetry first so the instrumented transport and Fiber
 	// middleware can register spans under the correct global TracerProvider.
@@ -160,7 +161,7 @@ func main() {
 	}
 	defer func() {
 		if err := shutdownTracing(ctx); err != nil {
-			logger.Error().Err(err).Msg("tracing shutdown failed")
+			logError(ctx, logger, "tracing shutdown failed", func(e *zerolog.Event) { e.Err(err) })
 		}
 	}()
 
@@ -182,13 +183,13 @@ func main() {
 	// This provides go_goroutines, go_memstats_*, and other Go runtime metrics
 	// Use Register instead of MustRegister to avoid panic if already registered
 	// (e.g., by the OpenTelemetry Prometheus exporter)
-	if err := prometheusRegistry.Register(collectors.NewGoCollector()); err != nil {
-		// Collector may already be registered, which is fine - ignore duplicate registration errors
-		errStr := err.Error()
-		if !strings.Contains(errStr, "duplicate") && !strings.Contains(errStr, "already registered") {
-			logger.Warn().Err(err).Msg("failed to register Go collector")
+		if err := prometheusRegistry.Register(collectors.NewGoCollector()); err != nil {
+			// Collector may already be registered, which is fine - ignore duplicate registration errors
+			errStr := err.Error()
+			if !strings.Contains(errStr, "duplicate") && !strings.Contains(errStr, "already registered") {
+				logWarn(ctx, logger, "failed to register Go collector", func(e *zerolog.Event) { e.Err(err) })
+			}
 		}
-	}
 
 	meterProvider := metric.NewMeterProvider(
 		metric.WithReader(promExporter),
@@ -196,7 +197,7 @@ func main() {
 	otel.SetMeterProvider(meterProvider)
 	defer func() {
 		if err := meterProvider.Shutdown(ctx); err != nil {
-			logger.Error().Err(err).Msg("meter provider shutdown failed")
+			logError(ctx, logger, "meter provider shutdown failed", func(e *zerolog.Event) { e.Err(err) })
 		}
 		shutdownMetricsBatcher()
 	}()
@@ -211,7 +212,33 @@ func main() {
 	// Create aggregator with per-provider clients (each with its own connection pool)
 	// Create aggregator with observability
 	obsConfig := &aggregator.ObservabilityConfig{
-		Logger:              logger,
+		Logger: logger,
+		LogFunc: func(ctx context.Context, level zerolog.Level, msg string, fields ...func(*zerolog.Event)) {
+			buildEvent := func(l zerolog.Logger) *zerolog.Event {
+				var event *zerolog.Event
+				switch level {
+				case zerolog.DebugLevel:
+					event = l.Debug()
+				case zerolog.InfoLevel:
+					event = l.Info()
+				case zerolog.WarnLevel:
+					event = l.Warn()
+				case zerolog.ErrorLevel:
+					event = l.Error()
+				case zerolog.FatalLevel:
+					event = l.Fatal()
+				case zerolog.PanicLevel:
+					event = l.Panic()
+				default:
+					event = l.Info()
+				}
+				for _, f := range fields {
+					f(event)
+				}
+				return event
+			}
+			logAsync(level, buildEvent, msg, ctx, logger)
+		},
 		RecordUpstreamCall:  recordUpstreamCall,
 		RecordUpstreamError: recordUpstreamError,
 		RecordAggregatorOp:  recordAggregatorOperation,
@@ -405,7 +432,8 @@ func main() {
 			openAPIPath := filepath.Join(dataDir, "openapi.yaml")
 			specData, err := os.ReadFile(openAPIPath)
 			if err != nil {
-				logger.Error().Err(err).Str("path", openAPIPath).Msg("failed to read OpenAPI spec")
+				logError(c.Context(), logger, "failed to read OpenAPI spec",
+					func(e *zerolog.Event) { e.Err(err).Str("path", openAPIPath) })
 				return c.Status(500).JSON(fiber.Map{
 					"error": "failed to load OpenAPI specification",
 				})
@@ -414,7 +442,8 @@ func main() {
 			// Convert YAML to JSON for Scalar
 			var specObj interface{}
 			if err := yaml.Unmarshal(specData, &specObj); err != nil {
-				logger.Error().Err(err).Msg("failed to parse OpenAPI spec")
+				logError(c.Context(), logger, "failed to parse OpenAPI spec",
+					func(e *zerolog.Event) { e.Err(err) })
 				return c.Status(500).JSON(fiber.Map{
 					"error": "failed to parse OpenAPI specification",
 				})
@@ -422,7 +451,8 @@ func main() {
 
 			specJSON, err := jsonv2.Marshal(specObj)
 			if err != nil {
-				logger.Error().Err(err).Msg("failed to marshal OpenAPI spec to JSON")
+				logError(c.Context(), logger, "failed to marshal OpenAPI spec to JSON",
+					func(e *zerolog.Event) { e.Err(err) })
 				return c.Status(500).JSON(fiber.Map{
 					"error": "failed to convert OpenAPI specification",
 				})
@@ -456,17 +486,16 @@ func main() {
 	}
 
 	addr := listenAddr()
-	logger.Info().Str("address", addr).Msg("BFF server starting")
+	logInfo(ctx, logger, "BFF server starting", func(e *zerolog.Event) { e.Str("address", addr) })
 
 	// When prefork is enabled, app.Listen() manages child processes.
 	// The parent process blocks to manage children, so we run it in a goroutine
 	// to allow the main function to handle shutdown signals.
-	go func() {
+		go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				logger.Error().
-					Interface("panic", r).
-					Msg("panic in server goroutine")
+				logError(ctx, logger, "panic in server goroutine",
+					func(e *zerolog.Event) { e.Interface("panic", r) })
 				os.Exit(1)
 			}
 		}()
@@ -477,11 +506,10 @@ func main() {
 		if err := app.Listen(addr, listenConfig); err != nil {
 			// In prefork mode, errors from child processes are handled by Fiber.
 			// This error typically indicates the parent process failed to start or manage children.
-			logger.Error().
-				Err(err).
-				Bool("prefork", prefork).
-				Str("address", addr).
-				Msg("server listen error")
+			logError(ctx, logger, "server listen error",
+				func(e *zerolog.Event) {
+					e.Err(err).Bool("prefork", prefork).Str("address", addr)
+				})
 			os.Exit(1)
 		}
 	}()
@@ -491,12 +519,12 @@ func main() {
 	serverReadyMu.Lock()
 	serverReady = true
 	serverReadyMu.Unlock()
-	logger.Info().Msg("server ready")
+	logInfo(ctx, logger, "server ready")
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-quit
-	logger.Info().Str("signal", sig.String()).Msg("received signal, shutting down")
+	logInfo(ctx, logger, "received signal, shutting down", func(e *zerolog.Event) { e.Str("signal", sig.String()) })
 
 	shutdownStart := time.Now()
 	shutdownTimeout := getCachedShutdownTimeout()
@@ -504,31 +532,31 @@ func main() {
 	defer shutdownCancel()
 
 	// Step 1: Stop accepting new requests (Fiber shutdown)
-	logger.Info().Msg("stopping HTTP server")
+	logInfo(shutdownCtx, logger, "stopping HTTP server")
 	if err := app.ShutdownWithTimeout(10 * time.Second); err != nil {
-		logger.Error().Err(err).Msg("HTTP server shutdown error")
+		logError(shutdownCtx, logger, "HTTP server shutdown error", func(e *zerolog.Event) { e.Err(err) })
 	}
 
 	// Step 2: Wait for in-flight aggregator requests
 	// The aggregator uses context cancellation, so in-flight requests will be cancelled
 	// when shutdownCtx is cancelled. We give them a moment to finish.
-	logger.Info().Msg("waiting for in-flight requests")
+	logInfo(shutdownCtx, logger, "waiting for in-flight requests")
 	select {
 	case <-shutdownCtx.Done():
-		logger.Warn().Msg("shutdown timeout reached while waiting for in-flight requests")
+		logWarn(shutdownCtx, logger, "shutdown timeout reached while waiting for in-flight requests")
 	case <-time.After(1 * time.Second):
 		// Brief pause for in-flight requests to complete
 	}
 
 	// Step 3: Drain metrics batcher
-	logger.Info().Msg("draining metrics batcher")
+	logInfo(shutdownCtx, logger, "draining metrics batcher")
 	shutdownMetricsBatcher()
 
 	// Step 4: Shutdown async logging worker
-	logger.Info().Msg("shutting down async logging worker")
+	logInfo(shutdownCtx, logger, "shutting down async logging worker")
 	asyncLogTimeout := 5 * time.Second
 	if !shutdownAsyncLogging(asyncLogTimeout) {
-		logger.Warn().Msg("async logging worker did not finish in time")
+		logWarn(shutdownCtx, logger, "async logging worker did not finish in time")
 	}
 
 	// Step 5 & 6: OpenTelemetry and metrics shutdown are handled by defer functions
@@ -536,7 +564,7 @@ func main() {
 
 	shutdownDuration := time.Since(shutdownStart)
 	recordShutdownDuration(shutdownDuration)
-	logger.Info().Dur("duration", shutdownDuration).Msg("server stopped")
+	logInfo(shutdownCtx, logger, "server stopped", func(e *zerolog.Event) { e.Dur("duration", shutdownDuration) })
 }
 
 // loadProviders reads all .yaml files from a directory.

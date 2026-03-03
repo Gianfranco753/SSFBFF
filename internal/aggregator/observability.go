@@ -1,14 +1,19 @@
 package aggregator
 
 import (
+	"context"
 	"time"
 
 	"github.com/rs/zerolog"
 )
 
+// LogFunc is a function that logs with trace context from the provided context.
+type LogFunc func(ctx context.Context, level zerolog.Level, msg string, fields ...func(*zerolog.Event))
+
 // ObservabilityConfig holds observability settings for the aggregator.
 type ObservabilityConfig struct {
 	Logger                zerolog.Logger
+	LogFunc               LogFunc // Optional: if provided, uses async logging with trace IDs
 	RecordUpstreamCall    func(provider, endpoint string, duration time.Duration, status string)
 	RecordUpstreamError   func(provider, endpoint, errorType string)
 	RecordAggregatorOp    func(status string)

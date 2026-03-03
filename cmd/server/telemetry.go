@@ -48,6 +48,8 @@ func initTracing(ctx context.Context, logger zerolog.Logger) (shutdown func(cont
 		otelEndpoint = getCachedOtelExporterOTLPEndpoint()
 	}
 	if strings.TrimSpace(otelEndpoint) == "" {
+		// Use direct logger call here since this is during initialization before async worker is ready
+		// and we don't have a request context anyway
 		logger.Warn().
 			Msg("OpenTelemetry tracing disabled: no OTEL_EXPORTER_OTLP_ENDPOINT or OTEL_EXPORTER_OTLP_TRACES_ENDPOINT configured. Set one of these environment variables to enable tracing.")
 		return noop, nil

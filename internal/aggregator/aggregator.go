@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gcossani/ssfbff/runtime"
+	"github.com/rs/zerolog"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -180,17 +181,26 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 
 	g, gctx := errgroup.WithContext(ctx)
 
-	for _, dep := range deps {
+		for _, dep := range deps {
 		dep := dep // capture loop variable
 		g.Go(func() error {
 			url, timeout, optional, err := a.resolveURL(dep)
 			if err != nil {
 				if a.hasLogger {
-					a.obsConfig.Logger.Error().
-						Str("provider", dep.Provider).
-						Str("endpoint", dep.Endpoint).
-						Err(err).
-						Msg("failed to resolve upstream URL")
+					if a.obsConfig.LogFunc != nil {
+						a.obsConfig.LogFunc(gctx, zerolog.ErrorLevel, "failed to resolve upstream URL",
+							func(e *zerolog.Event) {
+								e.Str("provider", dep.Provider).
+									Str("endpoint", dep.Endpoint).
+									Err(err)
+							})
+					} else {
+						a.obsConfig.Logger.Error().
+							Str("provider", dep.Provider).
+							Str("endpoint", dep.Endpoint).
+							Err(err).
+							Msg("failed to resolve upstream URL")
+					}
 				}
 				a.recordUpstreamError(dep.Provider, dep.Endpoint, "resolve_error")
 				if optional {
@@ -221,16 +231,30 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 				}
 				
 				if a.hasLogger {
-					logEvent := a.obsConfig.Logger.Error().
-						Str("provider", dep.Provider).
-						Str("endpoint", dep.Endpoint).
-						Str("url", url).
-						Dur("duration_ms", callDuration).
-						Err(err)
-					if statusCode > 0 {
-						logEvent = logEvent.Int("status_code", statusCode)
+					if a.obsConfig.LogFunc != nil {
+						a.obsConfig.LogFunc(reqCtx, zerolog.ErrorLevel, "upstream request failed",
+							func(e *zerolog.Event) {
+								e.Str("provider", dep.Provider).
+									Str("endpoint", dep.Endpoint).
+									Str("url", url).
+									Dur("duration_ms", callDuration).
+									Err(err)
+								if statusCode > 0 {
+									e.Int("status_code", statusCode)
+								}
+							})
+					} else {
+						logEvent := a.obsConfig.Logger.Error().
+							Str("provider", dep.Provider).
+							Str("endpoint", dep.Endpoint).
+							Str("url", url).
+							Dur("duration_ms", callDuration).
+							Err(err)
+						if statusCode > 0 {
+							logEvent = logEvent.Int("status_code", statusCode)
+						}
+						logEvent.Msg("upstream request failed")
 					}
-					logEvent.Msg("upstream request failed")
 				}
 				a.recordUpstreamError(dep.Provider, dep.Endpoint, errorType)
 				a.recordUpstreamCall(dep.Provider, dep.Endpoint, callDuration, status)
@@ -240,10 +264,18 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 					results[dep.Key()] = []byte("null")
 					mu.Unlock()
 					if a.hasLogger {
-						a.obsConfig.Logger.Warn().
-							Str("provider", dep.Provider).
-							Str("endpoint", dep.Endpoint).
-							Msg("optional provider failed, using null")
+						if a.obsConfig.LogFunc != nil {
+							a.obsConfig.LogFunc(reqCtx, zerolog.WarnLevel, "optional provider failed, using null",
+								func(e *zerolog.Event) {
+									e.Str("provider", dep.Provider).
+										Str("endpoint", dep.Endpoint)
+								})
+						} else {
+							a.obsConfig.Logger.Warn().
+								Str("provider", dep.Provider).
+								Str("endpoint", dep.Endpoint).
+								Msg("optional provider failed, using null")
+						}
 					}
 					return nil
 				}
@@ -269,10 +301,18 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 	
 	a.recordAggregatorOperation("success")
 	if a.hasLogger && totalDuration > 1*time.Second {
-		a.obsConfig.Logger.Warn().
-			Dur("total_duration_ms", totalDuration).
-			Int("dependencies", len(deps)).
-			Msg("slow aggregation detected")
+		if a.obsConfig.LogFunc != nil {
+			a.obsConfig.LogFunc(ctx, zerolog.WarnLevel, "slow aggregation detected",
+				func(e *zerolog.Event) {
+					e.Dur("total_duration_ms", totalDuration).
+						Int("dependencies", len(deps))
+				})
+		} else {
+			a.obsConfig.Logger.Warn().
+				Dur("total_duration_ms", totalDuration).
+				Int("dependencies", len(deps)).
+				Msg("slow aggregation detected")
+		}
 	}
 	
 	return results, nil

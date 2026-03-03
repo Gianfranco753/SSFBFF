@@ -113,7 +113,7 @@ func initEnvCache() {
 	// Logging configuration
 	envCache.logLevel = getEnvString("LOG_LEVEL", "info")
 	envCache.logFormat = getEnvString("LOG_FORMAT", "json")
-	envCache.asyncLogging = getEnvBool("ASYNC_LOGGING", false)
+	envCache.asyncLogging = getEnvBool("ASYNC_LOGGING", true) // Always async by default
 	envCache.enableErrorLogging = getEnvBool("ENABLE_ERROR_LOGGING", true)
 	envCache.asyncLoggingBufferSize = getEnvInt("ASYNC_LOGGING_BUFFER_SIZE", 1000)
 
