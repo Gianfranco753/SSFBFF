@@ -48,44 +48,27 @@ import (
 )
 
 // createProviderTransport creates an HTTP transport for a provider with configurable connection pool sizes.
-// It respects HTTP_PROXY, HTTPS_PROXY, and NO_PROXY environment variables.
+// It respects HTTP_PROXY, HTTPS_PROXY, and NO_PROXY environment variables (cached at startup).
 // For high-throughput scenarios, increase MAX_IDLE_CONNS_PER_HOST and MAX_CONNS_PER_HOST.
 func createProviderTransport(cfg aggregator.ProviderConfig) *http.Transport {
 	maxIdle := cfg.MaxIdleConnsPerHost
 	if maxIdle == 0 {
 		// Default increased for high concurrency - can be tuned per deployment
-		maxIdle = getEnvInt("MAX_IDLE_CONNS_PER_HOST", 2000)
+		maxIdle = getCachedMaxIdleConnsPerHost()
 	}
 	maxConns := cfg.MaxConnsPerHost
 	if maxConns == 0 {
 		// Default increased for high concurrency - can be tuned per deployment
-		maxConns = getEnvInt("MAX_CONNS_PER_HOST", 5000)
+		maxConns = getCachedMaxConnsPerHost()
 	}
 
-	// Connection pool tuning for high throughput
-	idleTimeout := 90 * time.Second
-	if timeoutStr := os.Getenv("IDLE_CONN_TIMEOUT"); timeoutStr != "" {
-		if parsed, err := time.ParseDuration(timeoutStr); err == nil && parsed > 0 {
-			idleTimeout = parsed
-		}
-	}
-
-	dialTimeout := 3 * time.Second
-	if timeoutStr := os.Getenv("DIAL_TIMEOUT"); timeoutStr != "" {
-		if parsed, err := time.ParseDuration(timeoutStr); err == nil && parsed > 0 {
-			dialTimeout = parsed
-		}
-	}
-
-	keepAlive := 30 * time.Second
-	if keepAliveStr := os.Getenv("KEEP_ALIVE"); keepAliveStr != "" {
-		if parsed, err := time.ParseDuration(keepAliveStr); err == nil && parsed > 0 {
-			keepAlive = parsed
-		}
-	}
+	// Connection pool tuning for high throughput - use cached values
+	idleTimeout := getCachedIdleConnTimeout()
+	dialTimeout := getCachedDialTimeout()
+	keepAlive := getCachedKeepAlive()
 
 	return &http.Transport{
-		Proxy:               http.ProxyFromEnvironment,
+		Proxy:               getCachedProxyFunc(),
 		MaxIdleConnsPerHost: maxIdle,
 		MaxConnsPerHost:     maxConns,
 		IdleConnTimeout:     idleTimeout,
@@ -117,27 +100,24 @@ func createProviderClient(cfg aggregator.ProviderConfig) *http.Client {
 	}
 }
 
-// isTracingEnabledGlobally checks if tracing is enabled globally via environment variable.
+// isTracingEnabledGlobally checks if tracing is enabled globally via cached environment variable.
 func isTracingEnabledGlobally() bool {
-	return os.Getenv("OTEL_DISABLE_TRACING") != "true"
+	return !getCachedOtelDisableTracing()
 }
 
 // initLogger configures and returns a zerolog logger with OpenTelemetry trace ID integration.
-// It reads LOG_LEVEL (default: info) and LOG_FORMAT (default: json) environment variables.
+// It reads LOG_LEVEL (default: info) and LOG_FORMAT (default: json) environment variables (cached at startup).
 // The logger is wrapped with otelzerolog to automatically inject trace_id and span_id
 // from OpenTelemetry span context when available.
 func initLogger() zerolog.Logger {
-	levelStr := os.Getenv("LOG_LEVEL")
-	if levelStr == "" {
-		levelStr = "info"
-	}
+	levelStr := getCachedLogLevel()
 	logLevel, err := zerolog.ParseLevel(levelStr)
 	if err != nil {
 		logLevel = zerolog.InfoLevel
 	}
 	zerolog.SetGlobalLevel(logLevel)
 
-	format := os.Getenv("LOG_FORMAT")
+	format := getCachedLogFormat()
 	var writer io.Writer = os.Stdout
 	if format == "console" {
 		writer = zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339}
@@ -209,10 +189,7 @@ func main() {
 		shutdownMetricsBatcher()
 	}()
 
-	dataDir := os.Getenv("DATA_DIR")
-	if dataDir == "" {
-		dataDir = "data"
-	}
+	dataDir := getCachedDataDir()
 
 	providers, err := loadProviders(filepath.Join(dataDir, "providers"))
 	if err != nil {
@@ -232,33 +209,19 @@ func main() {
 
 	// Configure Fiber for high performance
 	// Prefork can be disabled for single-process deployments (better for containerized environments)
-	prefork := getEnvBool("FIBER_PREFORK", true)
+	prefork := getCachedFiberPrefork()
 	// Concurrency: higher values allow more concurrent connections per worker
 	// Default: 256 * CPU cores (tuned for high throughput)
-	concurrency := getEnvInt("FIBER_CONCURRENCY", 256*runtime.NumCPU())
-	bodyLimit := getEnvInt("FIBER_BODY_LIMIT", 10*1024*1024) // 10MB default
-
-	// Timeout configuration - can be tuned for high-throughput scenarios
-	readTimeout := 5 * time.Second
-	if timeoutStr := os.Getenv("FIBER_READ_TIMEOUT"); timeoutStr != "" {
-		if parsed, err := time.ParseDuration(timeoutStr); err == nil && parsed > 0 {
-			readTimeout = parsed
-		}
+	concurrency := getCachedFiberConcurrency()
+	if concurrency == 0 {
+		concurrency = 256 * runtime.NumCPU()
 	}
+	bodyLimit := getCachedFiberBodyLimit()
 
-	writeTimeout := 10 * time.Second
-	if timeoutStr := os.Getenv("FIBER_WRITE_TIMEOUT"); timeoutStr != "" {
-		if parsed, err := time.ParseDuration(timeoutStr); err == nil && parsed > 0 {
-			writeTimeout = parsed
-		}
-	}
-
-	idleTimeout := 120 * time.Second
-	if timeoutStr := os.Getenv("FIBER_IDLE_TIMEOUT"); timeoutStr != "" {
-		if parsed, err := time.ParseDuration(timeoutStr); err == nil && parsed > 0 {
-			idleTimeout = parsed
-		}
-	}
+	// Timeout configuration - use cached values
+	readTimeout := getCachedFiberReadTimeout()
+	writeTimeout := getCachedFiberWriteTimeout()
+	idleTimeout := getCachedFiberIdleTimeout()
 
 	app := fiber.New(fiber.Config{
 		JSONEncoder: func(v any) ([]byte, error) { return jsonv2.Marshal(v) },
@@ -283,7 +246,7 @@ func main() {
 	// When OTEL_SDK_DISABLED=true, this middleware is skipped entirely.
 	// When OTEL_DISABLE_TRACING=true, spans are still created but can be enabled
 	// per-request via x-enable-trace header (requires custom sampler implementation).
-	if os.Getenv("OTEL_SDK_DISABLED") != "true" && os.Getenv("OTEL_TRACES_EXPORTER") != "none" {
+	if !getCachedOtelSDKDisabled() && getCachedOtelTracesExporter() != "none" {
 		app.Use(otelfiber.Middleware(
 			otelfiber.WithPropagators(downstreamPropagator()),
 		))
@@ -308,12 +271,7 @@ func main() {
 
 	// Start resource metrics collection (if enabled)
 	// Collection interval can be increased via RESOURCE_METRICS_INTERVAL env var (default: 10s)
-	resourceMetricsInterval := 10 * time.Second
-	if intervalStr := os.Getenv("RESOURCE_METRICS_INTERVAL"); intervalStr != "" {
-		if parsed, err := time.ParseDuration(intervalStr); err == nil && parsed > 0 {
-			resourceMetricsInterval = parsed
-		}
-	}
+	resourceMetricsInterval := getCachedResourceMetricsInterval()
 
 	if resourceMetricsEnabled {
 		go func() {
@@ -331,7 +289,7 @@ func main() {
 
 	// Metrics endpoint optimization: use sync.Pool for buffers and optional caching
 	var (
-		metricsCacheTTL = getEnvInt("METRICS_CACHE_TTL", 0) // seconds, 0 = no cache
+		metricsCacheTTL = getCachedMetricsCacheTTL() // seconds, 0 = no cache
 		metricsCache    struct {
 			mu      sync.RWMutex
 			content []byte
@@ -466,37 +424,68 @@ func loadProviders(dir string) (map[string]aggregator.ProviderConfig, error) {
 }
 
 func listenAddr() string {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "3000"
-	}
+	port := getCachedPort()
 	return fmt.Sprintf(":%s", port)
 }
 
-// getEnvInt reads an integer environment variable, returning defaultValue if not set or invalid.
+// getEnvInt reads an integer environment variable from cache, returning defaultValue if not set or invalid.
+// This function is kept for backward compatibility but now uses cached values.
 func getEnvInt(key string, defaultValue int) int {
-	val := os.Getenv(key)
-	if val == "" {
+	// Map known keys to cached getters
+	switch key {
+	case "MAX_IDLE_CONNS_PER_HOST":
+		return getCachedMaxIdleConnsPerHost()
+	case "MAX_CONNS_PER_HOST":
+		return getCachedMaxConnsPerHost()
+	case "FIBER_CONCURRENCY":
+		return getCachedFiberConcurrency()
+	case "FIBER_BODY_LIMIT":
+		return getCachedFiberBodyLimit()
+	case "METRICS_CACHE_TTL":
+		return getCachedMetricsCacheTTL()
+	case "ASYNC_LOGGING_BUFFER_SIZE":
+		return getCachedAsyncLoggingBufferSize()
+	case "METRICS_BATCH_SIZE":
+		return getCachedMetricsBatchSize()
+	default:
+		// Fallback for unknown keys (shouldn't happen in practice)
 		return defaultValue
 	}
-	parsed, err := strconv.Atoi(val)
-	if err != nil {
-		return defaultValue
-	}
-	return parsed
 }
 
-// getEnvBool reads a boolean environment variable, returning defaultValue if not set or invalid.
+// getEnvBool reads a boolean environment variable from cache, returning defaultValue if not set or invalid.
+// This function is kept for backward compatibility but now uses cached values.
 func getEnvBool(key string, defaultValue bool) bool {
-	val := os.Getenv(key)
-	if val == "" {
+	// Map known keys to cached getters
+	switch key {
+	case "FIBER_PREFORK":
+		return getCachedFiberPrefork()
+	case "ASYNC_LOGGING":
+		return getCachedAsyncLogging()
+	case "ENABLE_ERROR_LOGGING":
+		return getCachedEnableErrorLogging()
+	case "OTEL_SDK_DISABLED":
+		return getCachedOtelSDKDisabled()
+	case "OTEL_DISABLE_TRACING":
+		return getCachedOtelDisableTracing()
+	case "OTEL_PROPAGATE_UPSTREAM":
+		return getCachedOtelPropagateUpstream()
+	case "OTEL_PROPAGATE_DOWNSTREAM":
+		return getCachedOtelPropagateDownstream()
+	case "ENABLE_METRICS":
+		return getCachedEnableMetrics()
+	case "METRICS_LABEL_CACHE_ENABLED":
+		return getCachedMetricsLabelCacheEnabled()
+	case "ENABLE_RESOURCE_METRICS":
+		return getCachedEnableResourceMetrics()
+	case "METRICS_BATCHING_ENABLED":
+		return getCachedMetricsBatchingEnabled()
+	case "USE_TRACE_ID_AS_REQUEST_ID":
+		return getCachedUseTraceIDAsRequestID()
+	default:
+		// Fallback for unknown keys (shouldn't happen in practice)
 		return defaultValue
 	}
-	parsed, err := strconv.ParseBool(val)
-	if err != nil {
-		return defaultValue
-	}
-	return parsed
 }
 
 // mockResponseWriter implements http.ResponseWriter to capture Prometheus metrics output.

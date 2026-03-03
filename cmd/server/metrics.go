@@ -5,7 +5,6 @@ package main
 import (
 	"fmt"
 	"hash/fnv"
-	"os"
 	"runtime"
 	"strconv"
 	"sync"
@@ -109,24 +108,11 @@ func hashLabels(labels []string) uint64 {
 	return h.Sum64()
 }
 
-// getEnvBool reads a boolean environment variable, returning defaultValue if not set or invalid.
-func getEnvBool(key string, defaultValue bool) bool {
-	val := os.Getenv(key)
-	if val == "" {
-		return defaultValue
-	}
-	parsed, err := strconv.ParseBool(val)
-	if err != nil {
-		return defaultValue
-	}
-	return parsed
-}
-
 // metricsEnabled returns true if metrics recording is enabled.
-var metricsEnabled = getEnvBool("ENABLE_METRICS", true)
+var metricsEnabled = getCachedEnableMetrics()
 
 func init() {
-	labelCacheEnabled = getEnvBool("METRICS_LABEL_CACHE_ENABLED", true)
+	labelCacheEnabled = getCachedMetricsLabelCacheEnabled()
 	initMetricsBatcher()
 }
 
@@ -260,7 +246,7 @@ func recordAggregatorOperation(status string) {
 }
 
 // resourceMetricsEnabled returns true if resource metrics collection is enabled.
-var resourceMetricsEnabled = getEnvBool("ENABLE_RESOURCE_METRICS", true)
+var resourceMetricsEnabled = getCachedEnableResourceMetrics()
 
 // updateResourceMetrics updates resource metrics (goroutines, memory).
 // Uses runtime.ReadMemStats which is expensive (stop-the-world), so this should be called infrequently.

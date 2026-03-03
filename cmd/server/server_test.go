@@ -94,12 +94,14 @@ func TestLoadProvidersInvalidYAML(t *testing.T) {
 func TestListenAddr(t *testing.T) {
 	// Default port.
 	t.Setenv("PORT", "")
+	resetEnvCacheForTesting()
 	if got := listenAddr(); got != ":3000" {
 		t.Errorf("listenAddr() = %q, want :3000", got)
 	}
 
 	// Custom port.
 	t.Setenv("PORT", "8080")
+	resetEnvCacheForTesting()
 	if got := listenAddr(); got != ":8080" {
 		t.Errorf("listenAddr() = %q, want :8080", got)
 	}
@@ -107,11 +109,12 @@ func TestListenAddr(t *testing.T) {
 
 // --- transport / proxy tests ---
 
-func TestBaseTransportProxySupport(t *testing.T) {
-	// baseTransport must have http.ProxyFromEnvironment configured so that
+func TestProviderTransportProxySupport(t *testing.T) {
+	// createProviderTransport must have a proxy function configured so that
 	// HTTP_PROXY / HTTPS_PROXY / NO_PROXY env vars are honoured.
-	if baseTransport.Proxy == nil {
-		t.Error("baseTransport.Proxy should be set to http.ProxyFromEnvironment")
+	transport := createProviderTransport(aggregator.ProviderConfig{})
+	if transport.Proxy == nil {
+		t.Error("createProviderTransport() should return a transport with Proxy function set")
 	}
 }
 
@@ -119,6 +122,7 @@ func TestBaseTransportProxySupport(t *testing.T) {
 
 func TestInitTracingDisabledSDK(t *testing.T) {
 	t.Setenv("OTEL_SDK_DISABLED", "true")
+	resetEnvCacheForTesting()
 	shutdown, err := initTracing(context.Background())
 	if err != nil {
 		t.Fatalf("initTracing error: %v", err)
@@ -130,6 +134,7 @@ func TestInitTracingDisabledSDK(t *testing.T) {
 
 func TestInitTracingExporterNone(t *testing.T) {
 	t.Setenv("OTEL_TRACES_EXPORTER", "none")
+	resetEnvCacheForTesting()
 	shutdown, err := initTracing(context.Background())
 	if err != nil {
 		t.Fatalf("initTracing error: %v", err)
@@ -141,6 +146,7 @@ func TestInitTracingExporterNone(t *testing.T) {
 
 func TestOtelServiceNameDefault(t *testing.T) {
 	t.Setenv("OTEL_SERVICE_NAME", "")
+	resetEnvCacheForTesting()
 	if got := otelServiceName(); got != "ssfbff" {
 		t.Errorf("otelServiceName() = %q, want %q", got, "ssfbff")
 	}
@@ -148,6 +154,7 @@ func TestOtelServiceNameDefault(t *testing.T) {
 
 func TestOtelServiceNameFromEnv(t *testing.T) {
 	t.Setenv("OTEL_SERVICE_NAME", "my-bff")
+	resetEnvCacheForTesting()
 	if got := otelServiceName(); got != "my-bff" {
 		t.Errorf("otelServiceName() = %q, want %q", got, "my-bff")
 	}
@@ -166,6 +173,7 @@ func isNoop(p propagation.TextMapPropagator) bool {
 
 func TestUpstreamPropagatorDefault(t *testing.T) {
 	t.Setenv("OTEL_PROPAGATE_UPSTREAM", "")
+	resetEnvCacheForTesting()
 	// Default is the global propagator, which may or may not be noop depending
 	// on whether initTracing has run. We only assert it is not nil.
 	if upstreamPropagator() == nil {
@@ -175,6 +183,7 @@ func TestUpstreamPropagatorDefault(t *testing.T) {
 
 func TestUpstreamPropagatorDisabled(t *testing.T) {
 	t.Setenv("OTEL_PROPAGATE_UPSTREAM", "false")
+	resetEnvCacheForTesting()
 	if !isNoop(upstreamPropagator()) {
 		t.Error("upstreamPropagator() should be noop when OTEL_PROPAGATE_UPSTREAM=false")
 	}
@@ -182,6 +191,7 @@ func TestUpstreamPropagatorDisabled(t *testing.T) {
 
 func TestDownstreamPropagatorDefault(t *testing.T) {
 	t.Setenv("OTEL_PROPAGATE_DOWNSTREAM", "")
+	resetEnvCacheForTesting()
 	if downstreamPropagator() == nil {
 		t.Error("downstreamPropagator() should never return nil")
 	}
@@ -189,6 +199,7 @@ func TestDownstreamPropagatorDefault(t *testing.T) {
 
 func TestDownstreamPropagatorDisabled(t *testing.T) {
 	t.Setenv("OTEL_PROPAGATE_DOWNSTREAM", "false")
+	resetEnvCacheForTesting()
 	if !isNoop(downstreamPropagator()) {
 		t.Error("downstreamPropagator() should be noop when OTEL_PROPAGATE_DOWNSTREAM=false")
 	}

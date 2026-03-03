@@ -4,8 +4,6 @@ package main
 
 import (
 	"context"
-	"os"
-	"strconv"
 	"sync"
 	"time"
 
@@ -45,26 +43,14 @@ var (
 )
 
 func initMetricsBatcher() {
-	batcherEnabled = getEnvBool("METRICS_BATCHING_ENABLED", true)
+	batcherEnabled = getCachedMetricsBatchingEnabled()
 	if !batcherEnabled || !metricsEnabled {
 		return
 	}
 
-	batchSize := getEnvInt("METRICS_BATCH_SIZE", 1000)
-	batchInterval := 100 * time.Millisecond
-	if intervalStr := os.Getenv("METRICS_BATCH_INTERVAL"); intervalStr != "" {
-		if parsed, err := time.ParseDuration(intervalStr); err == nil && parsed > 0 {
-			batchInterval = parsed
-		}
-	}
-
-	sampleRate := 1.0
-	if rateStr := os.Getenv("METRICS_SAMPLE_RATE"); rateStr != "" {
-		if parsed, err := strconv.ParseFloat(rateStr, 64); err == nil && parsed >= 0 && parsed <= 1 {
-			sampleRate = parsed
-		}
-	}
-	metricsSampleRate = sampleRate
+	batchSize := getCachedMetricsBatchSize()
+	batchInterval := getCachedMetricsBatchInterval()
+	metricsSampleRate = getCachedMetricsSampleRate()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	batcher := &metricsBatcher{

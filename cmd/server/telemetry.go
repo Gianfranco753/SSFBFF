@@ -5,7 +5,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
@@ -37,14 +36,14 @@ import (
 func initTracing(ctx context.Context) (shutdown func(context.Context) error, err error) {
 	noop := func(_ context.Context) error { return nil }
 
-	if os.Getenv("OTEL_SDK_DISABLED") == "true" || os.Getenv("OTEL_TRACES_EXPORTER") == "none" {
+	if getCachedOtelSDKDisabled() || getCachedOtelTracesExporter() == "none" {
 		return noop, nil
 	}
 
 	// Check if tracing is disabled via OTEL_DISABLE_TRACING.
 	// We still create a TracerProvider (for per-request override support),
 	// but use a noop exporter.
-	disableTracing := os.Getenv("OTEL_DISABLE_TRACING") == "true"
+	disableTracing := getCachedOtelDisableTracing()
 
 	// resource.WithFromEnv reads OTEL_SERVICE_NAME and OTEL_RESOURCE_ATTRIBUTES.
 	// We also supply a default service name in case OTEL_SERVICE_NAME is not set.
@@ -102,17 +101,14 @@ func initTracing(ctx context.Context) (shutdown func(context.Context) error, err
 
 // otelServiceName returns OTEL_SERVICE_NAME, falling back to "ssfbff".
 func otelServiceName() string {
-	if name := os.Getenv("OTEL_SERVICE_NAME"); name != "" {
-		return name
-	}
-	return "ssfbff"
+	return getCachedOtelServiceName()
 }
 
 // upstreamPropagator returns the propagator used when injecting trace headers
 // into outgoing upstream HTTP requests. Set OTEL_PROPAGATE_UPSTREAM=false to
 // disable propagation (useful when upstream services don't support W3C tracing).
 func upstreamPropagator() propagation.TextMapPropagator {
-	if os.Getenv("OTEL_PROPAGATE_UPSTREAM") == "false" {
+	if !getCachedOtelPropagateUpstream() {
 		return propagation.NewCompositeTextMapPropagator() // noop
 	}
 	return otel.GetTextMapPropagator()
@@ -122,7 +118,7 @@ func upstreamPropagator() propagation.TextMapPropagator {
 // into BFF HTTP responses. Set OTEL_PROPAGATE_DOWNSTREAM=false to omit
 // traceparent/tracestate from responses sent to frontend clients.
 func downstreamPropagator() propagation.TextMapPropagator {
-	if os.Getenv("OTEL_PROPAGATE_DOWNSTREAM") == "false" {
+	if !getCachedOtelPropagateDownstream() {
 		return propagation.NewCompositeTextMapPropagator() // noop
 	}
 	return otel.GetTextMapPropagator()

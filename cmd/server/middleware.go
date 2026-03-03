@@ -4,8 +4,6 @@ package main
 
 import (
 	"context"
-	"os"
-	"strconv"
 	"sync"
 
 	"github.com/gofiber/fiber/v3"
@@ -22,8 +20,8 @@ type logEntry struct {
 }
 
 var (
-	asyncLoggingEnabled = getEnvBool("ASYNC_LOGGING", false)
-	errorLoggingEnabled = getEnvBool("ENABLE_ERROR_LOGGING", true)
+	asyncLoggingEnabled = getCachedAsyncLogging()
+	errorLoggingEnabled = getCachedEnableErrorLogging()
 	logChan             chan *logEntry
 	logWorkerOnce        sync.Once
 )
@@ -35,12 +33,7 @@ func initAsyncLogging(logger zerolog.Logger) {
 	}
 
 	logWorkerOnce.Do(func() {
-		bufferSize := 1000
-		if size := os.Getenv("ASYNC_LOGGING_BUFFER_SIZE"); size != "" {
-			if parsed, err := strconv.Atoi(size); err == nil && parsed > 0 {
-				bufferSize = parsed
-			}
-		}
+		bufferSize := getCachedAsyncLoggingBufferSize()
 		logChan = make(chan *logEntry, bufferSize)
 
 		go func() {
@@ -74,7 +67,7 @@ func logAsync(level zerolog.Level, event *zerolog.Event, msg string, ctx context
 // traceIDMiddleware extracts trace ID from OpenTelemetry span context and sets it as X-Request-ID header.
 // This replaces UUID generation since OTel already provides trace IDs, and otelzerolog injects trace_id/span_id into logs.
 func traceIDMiddleware() fiber.Handler {
-	useTraceIDAsRequestID := getEnvBool("USE_TRACE_ID_AS_REQUEST_ID", true)
+	useTraceIDAsRequestID := getCachedUseTraceIDAsRequestID()
 	if !useTraceIDAsRequestID {
 		// Middleware is a no-op if disabled
 		return func(c fiber.Ctx) error {
@@ -83,9 +76,9 @@ func traceIDMiddleware() fiber.Handler {
 	}
 
 	// Check if tracing is disabled globally - if so, skip span context extraction
-	tracingDisabled := os.Getenv("OTEL_DISABLE_TRACING") == "true" || 
-		os.Getenv("OTEL_SDK_DISABLED") == "true" ||
-		os.Getenv("OTEL_TRACES_EXPORTER") == "none"
+	tracingDisabled := getCachedOtelDisableTracing() || 
+		getCachedOtelSDKDisabled() ||
+		getCachedOtelTracesExporter() == "none"
 	
 	if tracingDisabled {
 		// No-op when tracing is disabled to avoid span context extraction overhead
