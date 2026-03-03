@@ -49,12 +49,12 @@ var (
 	otelServiceName          string
 	otelPropagateUpstream    bool
 	otelPropagateDownstream  bool
+	otelExporterOTLPEndpoint string
+	otelExporterOTLPTracesEndpoint string
 
 	// Metrics configuration
 	enableMetrics            bool
 	metricsLabelCacheEnabled bool
-	enableResourceMetrics    bool
-	resourceMetricsInterval  time.Duration
 	metricsCacheTTL          int
 	metricsBatchingEnabled   bool
 	metricsBatchSize         int
@@ -117,12 +117,12 @@ func initEnvCache() {
 	envCache.otelServiceName = getEnvString("OTEL_SERVICE_NAME", "ssfbff")
 	envCache.otelPropagateUpstream = getEnvBool("OTEL_PROPAGATE_UPSTREAM", true)
 	envCache.otelPropagateDownstream = getEnvBool("OTEL_PROPAGATE_DOWNSTREAM", true)
+	envCache.otelExporterOTLPEndpoint = getEnvString("OTEL_EXPORTER_OTLP_ENDPOINT", "")
+	envCache.otelExporterOTLPTracesEndpoint = getEnvString("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "")
 
 	// Metrics configuration
 	envCache.enableMetrics = getEnvBool("ENABLE_METRICS", true)
 	envCache.metricsLabelCacheEnabled = getEnvBool("METRICS_LABEL_CACHE_ENABLED", true)
-	envCache.enableResourceMetrics = getEnvBool("ENABLE_RESOURCE_METRICS", true)
-	envCache.resourceMetricsInterval = getEnvDuration("RESOURCE_METRICS_INTERVAL", 10*time.Second)
 	envCache.metricsCacheTTL = getEnvInt("METRICS_CACHE_TTL", 0)
 	envCache.metricsBatchingEnabled = getEnvBool("METRICS_BATCHING_ENABLED", true)
 	envCache.metricsBatchSize = getEnvInt("METRICS_BATCH_SIZE", 1000)
@@ -336,6 +336,20 @@ func getCachedOtelPropagateDownstream() bool {
 	return envCache.otelPropagateDownstream
 }
 
+func getCachedOtelExporterOTLPEndpoint() string {
+	ensureCacheInitialized()
+	envCache.mu.RLock()
+	defer envCache.mu.RUnlock()
+	return envCache.otelExporterOTLPEndpoint
+}
+
+func getCachedOtelExporterOTLPTracesEndpoint() string {
+	ensureCacheInitialized()
+	envCache.mu.RLock()
+	defer envCache.mu.RUnlock()
+	return envCache.otelExporterOTLPTracesEndpoint
+}
+
 func getCachedEnableMetrics() bool {
 	ensureCacheInitialized()
 	envCache.mu.RLock()
@@ -348,20 +362,6 @@ func getCachedMetricsLabelCacheEnabled() bool {
 	envCache.mu.RLock()
 	defer envCache.mu.RUnlock()
 	return envCache.metricsLabelCacheEnabled
-}
-
-func getCachedEnableResourceMetrics() bool {
-	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
-	return envCache.enableResourceMetrics
-}
-
-func getCachedResourceMetricsInterval() time.Duration {
-	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
-	return envCache.resourceMetricsInterval
 }
 
 func getCachedMetricsCacheTTL() int {
@@ -588,10 +588,10 @@ func resetEnvCacheForTesting() {
 	envCache.otelServiceName = ""
 	envCache.otelPropagateUpstream = false
 	envCache.otelPropagateDownstream = false
+	envCache.otelExporterOTLPEndpoint = ""
+	envCache.otelExporterOTLPTracesEndpoint = ""
 	envCache.enableMetrics = false
 	envCache.metricsLabelCacheEnabled = false
-	envCache.enableResourceMetrics = false
-	envCache.resourceMetricsInterval = 0
 	envCache.metricsCacheTTL = 0
 	envCache.metricsBatchingEnabled = false
 	envCache.metricsBatchSize = 0

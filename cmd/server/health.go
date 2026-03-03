@@ -4,10 +4,10 @@ package main
 
 import (
 	"context"
-	"time"
 
 	"github.com/gcossani/ssfbff/internal/aggregator"
 	"github.com/gcossani/ssfbff/runtime"
+	"github.com/rs/zerolog"
 )
 
 // ProviderHealth represents the health status of a single provider.

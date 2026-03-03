@@ -36,6 +36,7 @@ import (
 	otelfiber "github.com/gofiber/contrib/v3/otel"
 	"github.com/gofiber/fiber/v3"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	promhttp "github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -153,7 +154,7 @@ func main() {
 	// Initialize OpenTelemetry first so the instrumented transport and Fiber
 	// middleware can register spans under the correct global TracerProvider.
 	ctx := context.Background()
-	shutdownTracing, err := initTracing(ctx)
+	shutdownTracing, err := initTracing(ctx, logger)
 	if err != nil {
 		logger.Fatal().Err(err).Msg("tracing setup failed")
 	}
@@ -176,6 +177,18 @@ func main() {
 	// OTel metrics are exported via the Prometheus exporter's meter provider
 	// Both will be available through prometheus.DefaultGatherer at /metrics endpoint
 	prometheusRegistry = prometheus.DefaultRegisterer.(*prometheus.Registry)
+
+	// Register Prometheus Go collector for built-in Go runtime metrics
+	// This provides go_goroutines, go_memstats_*, and other Go runtime metrics
+	// Use Register instead of MustRegister to avoid panic if already registered
+	// (e.g., by the OpenTelemetry Prometheus exporter)
+	if err := prometheusRegistry.Register(collectors.NewGoCollector()); err != nil {
+		// Collector may already be registered, which is fine - ignore duplicate registration errors
+		errStr := err.Error()
+		if !strings.Contains(errStr, "duplicate") && !strings.Contains(errStr, "already registered") {
+			logger.Warn().Err(err).Msg("failed to register Go collector")
+		}
+	}
 
 	meterProvider := metric.NewMeterProvider(
 		metric.WithReader(promExporter),
@@ -271,20 +284,6 @@ func main() {
 	// This will be available after running go generate
 	// The generated code will call SetRouteLogger if it exists
 	setRouteLoggerIfAvailable(logger)
-
-	// Start resource metrics collection (if enabled)
-	// Collection interval can be increased via RESOURCE_METRICS_INTERVAL env var (default: 10s)
-	resourceMetricsInterval := getCachedResourceMetricsInterval()
-
-	if resourceMetricsEnabled {
-		go func() {
-			ticker := time.NewTicker(resourceMetricsInterval)
-			defer ticker.Stop()
-			for range ticker.C {
-				updateResourceMetrics()
-			}
-		}()
-	}
 
 	app.Get("/health", func(c fiber.Ctx) error {
 		return c.SendString("ok")
@@ -412,7 +411,12 @@ func main() {
 	// The aggregator uses context cancellation, so in-flight requests will be cancelled
 	// when shutdownCtx is cancelled. We give them a moment to finish.
 	logger.Info().Msg("waiting for in-flight requests")
-	time.Sleep(1 * time.Second) // Brief pause for in-flight requests to complete
+	select {
+	case <-shutdownCtx.Done():
+		logger.Warn().Msg("shutdown timeout reached while waiting for in-flight requests")
+	case <-time.After(1 * time.Second):
+		// Brief pause for in-flight requests to complete
+	}
 
 	// Step 3: Drain metrics batcher
 	logger.Info().Msg("draining metrics batcher")

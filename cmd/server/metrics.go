@@ -4,7 +4,6 @@ package main
 
 import (
 	"hash/fnv"
-	"runtime"
 	"strconv"
 	"sync"
 	"time"
@@ -90,28 +89,6 @@ var (
 			Name:    "shutdown_duration_seconds",
 			Help:    "Duration of graceful shutdown in seconds",
 			Buckets: []float64{0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0},
-		},
-	)
-
-	// Resource metrics
-	goRoutines = promauto.NewGauge(
-		prometheus.GaugeOpts{
-			Name: "go_goroutines",
-			Help: "Number of goroutines that currently exist",
-		},
-	)
-
-	goMemoryAllocBytes = promauto.NewGauge(
-		prometheus.GaugeOpts{
-			Name: "go_memstats_alloc_bytes",
-			Help: "Number of bytes allocated and still in use",
-		},
-	)
-
-	goMemorySysBytes = promauto.NewGauge(
-		prometheus.GaugeOpts{
-			Name: "go_memstats_sys_bytes",
-			Help: "Number of bytes obtained from system",
 		},
 	)
 
@@ -285,9 +262,6 @@ func recordAggregatorOperation(status string) {
 	}
 }
 
-// resourceMetricsEnabled returns true if resource metrics collection is enabled.
-var resourceMetricsEnabled = getCachedEnableResourceMetrics()
-
 // recordAsyncLogsDropped records dropped async log entries.
 func recordAsyncLogsDropped(count int) {
 	if !metricsEnabled {
@@ -335,18 +309,4 @@ func recordShutdownDuration(duration time.Duration) {
 		return
 	}
 	shutdownDuration.Observe(duration.Seconds())
-}
-
-// updateResourceMetrics updates resource metrics (goroutines, memory).
-// Uses runtime.ReadMemStats which is expensive (stop-the-world), so this should be called infrequently.
-func updateResourceMetrics() {
-	if !resourceMetricsEnabled {
-		return
-	}
-
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	goRoutines.Set(float64(runtime.NumGoroutine()))
-	goMemoryAllocBytes.Set(float64(m.Alloc))
-	goMemorySysBytes.Set(float64(m.Sys))
 }

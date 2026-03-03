@@ -5,7 +5,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 
+	"github.com/rs/zerolog"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/propagation"
@@ -33,10 +35,21 @@ import (
 // When OTEL_DISABLE_TRACING=true, a TracerProvider is still created (to support
 // per-request override via x-enable-trace header), but uses a noop exporter.
 // See https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/
-func initTracing(ctx context.Context) (shutdown func(context.Context) error, err error) {
+func initTracing(ctx context.Context, logger zerolog.Logger) (shutdown func(context.Context) error, err error) {
 	noop := func(_ context.Context) error { return nil }
 
 	if getCachedOtelSDKDisabled() || getCachedOtelTracesExporter() == "none" {
+		return noop, nil
+	}
+
+	// Check if OTEL endpoint is configured. If not, disable tracing and log a message.
+	otelEndpoint := getCachedOtelExporterOTLPTracesEndpoint()
+	if otelEndpoint == "" {
+		otelEndpoint = getCachedOtelExporterOTLPEndpoint()
+	}
+	if strings.TrimSpace(otelEndpoint) == "" {
+		logger.Warn().
+			Msg("OpenTelemetry tracing disabled: no OTEL_EXPORTER_OTLP_ENDPOINT or OTEL_EXPORTER_OTLP_TRACES_ENDPOINT configured. Set one of these environment variables to enable tracing.")
 		return noop, nil
 	}
 
