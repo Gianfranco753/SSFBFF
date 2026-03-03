@@ -3,7 +3,6 @@
 package main
 
 import (
-	"fmt"
 	"hash/fnv"
 	"runtime"
 	"strconv"
@@ -13,7 +12,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
-
 
 var (
 	// HTTP error counter by endpoint and status code

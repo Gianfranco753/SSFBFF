@@ -27,7 +27,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -39,7 +38,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	promhttp "github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
-	"github.com/vincentfree/opentelemetry/otelzerolog"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	promexp "go.opentelemetry.io/otel/exporters/prometheus"
@@ -85,18 +83,18 @@ func createProviderTransport(cfg aggregator.ProviderConfig) *http.Transport {
 // The transport is always wrapped with otelhttp, but tracing behavior is controlled by
 // OTEL_DISABLE_TRACING and per-request x-enable-trace header (handled via context).
 func createProviderClient(cfg aggregator.ProviderConfig) *http.Client {
-	transport := createProviderTransport(cfg)
+	baseTransport := createProviderTransport(cfg)
 
 	// Always wrap with OpenTelemetry instrumentation.
 	// The TracerProvider will respect OTEL_DISABLE_TRACING and per-request overrides.
-	transport = otelhttp.NewTransport(
-		transport,
+	instrumentedTransport := otelhttp.NewTransport(
+		baseTransport,
 		otelhttp.WithPropagators(upstreamPropagator()),
 	)
 
 	return &http.Client{
 		Timeout:   30 * time.Second, // Client-level timeout (should be >= provider timeout)
-		Transport: transport,
+		Transport: instrumentedTransport,
 	}
 }
 
@@ -127,8 +125,9 @@ func initLogger() zerolog.Logger {
 		Timestamp().
 		Logger()
 
-	logger = otelzerolog.New(logger)
-
+	// otelzerolog works by decorating log events with AddTracingContext
+	// The logger itself doesn't need to be wrapped - tracing context is added
+	// when logging via middleware or explicit AddTracingContext calls
 	return logger
 }
 
@@ -227,7 +226,6 @@ func main() {
 		JSONEncoder: func(v any) ([]byte, error) { return jsonv2.Marshal(v) },
 		JSONDecoder: func(data []byte, v any) error { return jsonv2.Unmarshal(data, v) },
 
-		Prefork:           prefork,
 		Concurrency:       concurrency,
 		BodyLimit:         bodyLimit,
 		ReduceMemoryUsage: true,
@@ -237,6 +235,11 @@ func main() {
 		WriteTimeout: writeTimeout,
 		IdleTimeout:  idleTimeout,
 	})
+
+	// Prefork is not available in Fiber v3 as a config option
+	// It's handled differently or may have been removed
+	// Keeping the prefork variable for potential future use but not applying it
+	_ = prefork
 
 	// Add panic recovery middleware first (outermost)
 	app.Use(panicRecoveryMiddleware(logger))
@@ -426,66 +429,6 @@ func loadProviders(dir string) (map[string]aggregator.ProviderConfig, error) {
 func listenAddr() string {
 	port := getCachedPort()
 	return fmt.Sprintf(":%s", port)
-}
-
-// getEnvInt reads an integer environment variable from cache, returning defaultValue if not set or invalid.
-// This function is kept for backward compatibility but now uses cached values.
-func getEnvInt(key string, defaultValue int) int {
-	// Map known keys to cached getters
-	switch key {
-	case "MAX_IDLE_CONNS_PER_HOST":
-		return getCachedMaxIdleConnsPerHost()
-	case "MAX_CONNS_PER_HOST":
-		return getCachedMaxConnsPerHost()
-	case "FIBER_CONCURRENCY":
-		return getCachedFiberConcurrency()
-	case "FIBER_BODY_LIMIT":
-		return getCachedFiberBodyLimit()
-	case "METRICS_CACHE_TTL":
-		return getCachedMetricsCacheTTL()
-	case "ASYNC_LOGGING_BUFFER_SIZE":
-		return getCachedAsyncLoggingBufferSize()
-	case "METRICS_BATCH_SIZE":
-		return getCachedMetricsBatchSize()
-	default:
-		// Fallback for unknown keys (shouldn't happen in practice)
-		return defaultValue
-	}
-}
-
-// getEnvBool reads a boolean environment variable from cache, returning defaultValue if not set or invalid.
-// This function is kept for backward compatibility but now uses cached values.
-func getEnvBool(key string, defaultValue bool) bool {
-	// Map known keys to cached getters
-	switch key {
-	case "FIBER_PREFORK":
-		return getCachedFiberPrefork()
-	case "ASYNC_LOGGING":
-		return getCachedAsyncLogging()
-	case "ENABLE_ERROR_LOGGING":
-		return getCachedEnableErrorLogging()
-	case "OTEL_SDK_DISABLED":
-		return getCachedOtelSDKDisabled()
-	case "OTEL_DISABLE_TRACING":
-		return getCachedOtelDisableTracing()
-	case "OTEL_PROPAGATE_UPSTREAM":
-		return getCachedOtelPropagateUpstream()
-	case "OTEL_PROPAGATE_DOWNSTREAM":
-		return getCachedOtelPropagateDownstream()
-	case "ENABLE_METRICS":
-		return getCachedEnableMetrics()
-	case "METRICS_LABEL_CACHE_ENABLED":
-		return getCachedMetricsLabelCacheEnabled()
-	case "ENABLE_RESOURCE_METRICS":
-		return getCachedEnableResourceMetrics()
-	case "METRICS_BATCHING_ENABLED":
-		return getCachedMetricsBatchingEnabled()
-	case "USE_TRACE_ID_AS_REQUEST_ID":
-		return getCachedUseTraceIDAsRequestID()
-	default:
-		// Fallback for unknown keys (shouldn't happen in practice)
-		return defaultValue
-	}
 }
 
 // mockResponseWriter implements http.ResponseWriter to capture Prometheus metrics output.
