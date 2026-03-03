@@ -37,13 +37,7 @@ At runtime, each request either fans out to multiple upstreams in parallel or fe
 
 ## Expression Modes
 
-### Filter mode — single upstream
-
-Standard JSONata filtering and projection. Generates a streaming Go function:
-
-```jsonata
-orders[price > 100].{id: order_id, total: $sum(items.price)}
-```
+All expressions use provider mode with `$fetch()` to declare upstream dependencies. Filtering and projection can be applied to fetched data:
 
 ### Fetch mode — multiple upstreams
 
@@ -54,6 +48,14 @@ Uses `$fetch()` to declare upstream dependencies. All calls run in parallel at r
   "user": $fetch("user_service", "profile").name,
   "balance": $fetch("bank_service", "accounts").amount
 }
+```
+
+### Fetch with filtering
+
+You can filter and project fetched data using the pattern `$fetch("provider", "endpoint")[filter].{projection}`:
+
+```jsonata
+$fetch("orders_service", "data")[price > 100].{id: order_id, total: $sum(items.price)}
 ```
 
 ## JSONata Extensions

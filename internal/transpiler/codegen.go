@@ -7,22 +7,6 @@ import (
 	"strings"
 )
 
-// Generate produces formatted Go source code from a QueryPlan.
-// The generated code uses jsontext.Decoder for streaming JSON navigation
-// and json/v2.UnmarshalDecode for typed per-element deserialization.
-func Generate(plan *QueryPlan, packageName, sourceFile, expression string) ([]byte, error) {
-	var buf bytes.Buffer
-	w := func(format string, args ...any) {
-		fmt.Fprintf(&buf, format, args...)
-	}
-
-	writeHeader(&buf, w, packageName, sourceFile, expression, plan)
-	writeInputStructs(&buf, w, plan)
-	writeOutputStruct(&buf, w, plan)
-	writeTransformFunc(&buf, w, plan)
-
-	return format.Source(buf.Bytes())
-}
 
 func writeHeader(buf *bytes.Buffer, w func(string, ...any), pkg, sourceFile, expr string, plan *QueryPlan) {
 	w("//go:build goexperiment.jsonv2\n\n")

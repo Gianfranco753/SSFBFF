@@ -8,9 +8,10 @@ import (
 	"github.com/blues/jsonata-go/jparse"
 )
 
-// QueryPlan is the intermediate representation extracted from a JSONata AST.
-// It captures everything needed to generate Go code: which field to stream to,
-// what to filter, and how to project the output.
+// QueryPlan is the intermediate representation extracted from a JSONata AST
+// for filter+projection pipelines. It captures everything needed to generate
+// Go code: which field to stream to, what to filter, and how to project the output.
+// Used internally by fetchFilter mode: $fetch("provider", "endpoint")[filter].{proj}
 
 // SortTerm describes one sort key for ^() order-by.
 type SortTerm struct {
@@ -54,10 +55,10 @@ type OutputField struct {
 	Value    *Expr  // expression tree that computes this field's value
 }
 
-// Expr represents a value expression in the filter-mode pipeline.
+// Expr represents a value expression in a filter+projection pipeline.
 // It is a recursive tree that models field access, literals, function calls,
 // arithmetic, comparisons, boolean logic, string concatenation, conditionals,
-// and variable bindings.
+// and variable bindings. Used internally by fetchFilter mode.
 type Expr struct {
 	Kind   string // "field","arrayField","literal","funcCall","binary","unary","conditional","assign","varRef"
 	GoType string // inferred Go type: "float64","string","bool","any"
@@ -94,9 +95,11 @@ type Expr struct {
 	VarName string // variable name (without $ prefix)
 }
 
-// Analyze walks a parsed JSONata AST and produces a QueryPlan.
+// analyzeFilterPipeline walks a parsed JSONata AST and produces a QueryPlan.
 // It supports the pattern: rootField[predicate].{key: value, ...}
-func Analyze(root jparse.Node) (*QueryPlan, error) {
+// This is an internal function used only by fetchFilter mode to analyze
+// the filter and projection parts of $fetch("provider", "endpoint")[filter].{proj}
+func analyzeFilterPipeline(root jparse.Node) (*QueryPlan, error) {
 	path, ok := root.(*jparse.PathNode)
 	if !ok {
 		return nil, fmt.Errorf("expected a path expression at the top level, got %T", root)
@@ -1278,7 +1281,7 @@ func tryAnalyzeFetchFilter(root jparse.Node, funcName string) (ProviderField, bo
 		Steps: append([]jparse.Node{syntheticPred}, path.Steps[1:]...),
 	}
 
-	queryPlan, err := Analyze(syntheticPath)
+	queryPlan, err := analyzeFilterPipeline(syntheticPath)
 	if err != nil {
 		return ProviderField{}, false
 	}
