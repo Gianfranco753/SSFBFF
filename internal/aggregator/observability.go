@@ -1,3 +1,5 @@
+//go:build goexperiment.jsonv2
+
 package aggregator
 
 import (
@@ -12,11 +14,11 @@ type LogFunc func(ctx context.Context, level zerolog.Level, msg string, fields .
 
 // ObservabilityConfig holds observability settings for the aggregator.
 type ObservabilityConfig struct {
-	Logger                zerolog.Logger
-	LogFunc               LogFunc // Optional: if provided, uses async logging with trace IDs
-	RecordUpstreamCall    func(provider, endpoint string, duration time.Duration, status string)
-	RecordUpstreamError   func(provider, endpoint, errorType string)
-	RecordAggregatorOp    func(status string)
+	Logger              zerolog.Logger
+	LogFunc             LogFunc // Optional: if provided, uses async logging with trace IDs
+	RecordUpstreamCall  func(provider, endpoint string, duration time.Duration, status string)
+	RecordUpstreamError func(provider, endpoint, errorType string)
+	RecordAggregatorOp  func(status string)
 }
 
 // observabilityEnabled returns true if observability is configured.

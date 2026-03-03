@@ -1,3 +1,5 @@
+//go:build goexperiment.jsonv2
+
 // Package aggregator fetches data from multiple upstream providers in parallel.
 //
 // It reads provider configuration (base URLs, timeouts, endpoint paths) and
