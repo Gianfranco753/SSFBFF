@@ -27,6 +27,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -238,6 +239,13 @@ func main() {
 	writeTimeout := getCachedFiberWriteTimeout()
 	idleTimeout := getCachedFiberIdleTimeout()
 
+	// Pre-allocate common error response templates to avoid allocations
+	errorResponsePool := sync.Pool{
+		New: func() interface{} {
+			return &bytes.Buffer{}
+		},
+	}
+	
 	app := fiber.New(fiber.Config{
 		JSONEncoder: func(v any) ([]byte, error) { return jsonv2.Marshal(v) },
 		JSONDecoder: func(data []byte, v any) error { return jsonv2.Unmarshal(data, v) },
@@ -252,10 +260,21 @@ func main() {
 				message = err.Error()
 			}
 
-			return c.Status(code).JSON(fiber.Map{
-				"error":  message,
-				"status": code,
-			})
+			// Use sync.Pool buffer to avoid fiber.Map allocation
+			buf := errorResponsePool.Get().(*bytes.Buffer)
+			buf.Reset()
+			defer errorResponsePool.Put(buf)
+			
+			// Build JSON response directly
+			buf.WriteString(`{"error":`)
+			jsonBytes, _ := jsonv2.Marshal(message)
+			buf.Write(jsonBytes)
+			buf.WriteString(`,"status":`)
+			buf.WriteString(strconv.Itoa(code))
+			buf.WriteString(`}`)
+			
+			c.Set("Content-Type", "application/json")
+			return c.Status(code).Send(buf.Bytes())
 		},
 
 		Concurrency:       concurrency,

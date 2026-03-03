@@ -51,10 +51,16 @@ func initMetricsBatcher() {
 	batchSize := getCachedMetricsBatchSize()
 	batchInterval := getCachedMetricsBatchInterval()
 	metricsSampleRate = getCachedMetricsSampleRate()
+	
+	// Channel size: use configured value, or default to 10x batch size for high throughput
+	channelSize := getCachedMetricsBatcherChannelSize()
+	if channelSize == 0 {
+		channelSize = batchSize * 10
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	batcher := &metricsBatcher{
-		updates:       make(chan metricUpdate, batchSize*2),
+		updates:       make(chan metricUpdate, channelSize),
 		batchSize:     batchSize,
 		batchInterval: batchInterval,
 		ctx:           ctx,

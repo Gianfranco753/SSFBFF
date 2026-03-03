@@ -60,6 +60,7 @@ var (
 	metricsBatchSize         int
 	metricsBatchInterval     time.Duration
 	metricsSampleRate        float64
+	metricsBatcherChannelSize int
 
 	// Middleware configuration
 	useTraceIDAsRequestID    bool
@@ -134,6 +135,9 @@ func initEnvCache() {
 	envCache.metricsBatchSize = getEnvInt("METRICS_BATCH_SIZE", 1000)
 	envCache.metricsBatchInterval = getEnvDuration("METRICS_BATCH_INTERVAL", 100*time.Millisecond)
 	envCache.metricsSampleRate = getEnvFloat("METRICS_SAMPLE_RATE", 1.0)
+	// Default channel size is 10x batch size to handle high throughput (650k req/s)
+	// This prevents channel saturation and fallback to synchronous recording
+	envCache.metricsBatcherChannelSize = getEnvInt("METRICS_BATCHER_CHANNEL_SIZE", 0) // 0 means use default (batchSize * 10)
 
 	// Middleware configuration
 	envCache.useTraceIDAsRequestID = getEnvBool("USE_TRACE_ID_AS_REQUEST_ID", true)
@@ -175,278 +179,206 @@ func ensureCacheInitialized() {
 	envCacheOnce.Do(initEnvCache)
 }
 
-// Helper functions to get cached values (thread-safe)
+// Helper functions to get cached values.
+// Cache is read-only after init(), so no locks needed for reads.
 
 func getCachedPort() string {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.port
 }
 
 func getCachedDataDir() string {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.dataDir
 }
 
 func getCachedMaxIdleConnsPerHost() int {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.maxIdleConnsPerHost
 }
 
 func getCachedMaxConnsPerHost() int {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.maxConnsPerHost
 }
 
 func getCachedIdleConnTimeout() time.Duration {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.idleConnTimeout
 }
 
 func getCachedDialTimeout() time.Duration {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.dialTimeout
 }
 
 func getCachedKeepAlive() time.Duration {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.keepAlive
 }
 
 func getCachedFiberPrefork() bool {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.fiberPrefork
 }
 
 func getCachedFiberConcurrency() int {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.fiberConcurrency
 }
 
 func getCachedFiberBodyLimit() int {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.fiberBodyLimit
 }
 
 func getCachedFiberReadTimeout() time.Duration {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.fiberReadTimeout
 }
 
 func getCachedFiberWriteTimeout() time.Duration {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.fiberWriteTimeout
 }
 
 func getCachedFiberIdleTimeout() time.Duration {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.fiberIdleTimeout
 }
 
 func getCachedLogLevel() string {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.logLevel
 }
 
 func getCachedLogFormat() string {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.logFormat
 }
 
 func getCachedAsyncLogging() bool {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.asyncLogging
 }
 
 func getCachedEnableErrorLogging() bool {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.enableErrorLogging
 }
 
 func getCachedAsyncLoggingBufferSize() int {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.asyncLoggingBufferSize
 }
 
 func getCachedOtelSDKDisabled() bool {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.otelSDKDisabled
 }
 
 func getCachedOtelTracesExporter() string {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.otelTracesExporter
 }
 
 func getCachedOtelDisableTracing() bool {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.otelDisableTracing
 }
 
 func getCachedOtelServiceName() string {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.otelServiceName
 }
 
 func getCachedOtelPropagateUpstream() bool {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.otelPropagateUpstream
 }
 
 func getCachedOtelPropagateDownstream() bool {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.otelPropagateDownstream
 }
 
 func getCachedOtelExporterOTLPEndpoint() string {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.otelExporterOTLPEndpoint
 }
 
 func getCachedOtelExporterOTLPTracesEndpoint() string {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.otelExporterOTLPTracesEndpoint
 }
 
 func getCachedEnableMetrics() bool {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.enableMetrics
 }
 
 func getCachedMetricsLabelCacheEnabled() bool {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.metricsLabelCacheEnabled
 }
 
 func getCachedMetricsCacheTTL() int {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.metricsCacheTTL
 }
 
 func getCachedMetricsBatchingEnabled() bool {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.metricsBatchingEnabled
 }
 
 func getCachedMetricsBatchSize() int {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.metricsBatchSize
 }
 
 func getCachedMetricsBatchInterval() time.Duration {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.metricsBatchInterval
 }
 
 func getCachedMetricsSampleRate() float64 {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.metricsSampleRate
+}
+
+func getCachedMetricsBatcherChannelSize() int {
+	ensureCacheInitialized()
+	return envCache.metricsBatcherChannelSize
 }
 
 func getCachedUseTraceIDAsRequestID() bool {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.useTraceIDAsRequestID
 }
 
 func getCachedHealthCheckTimeout() time.Duration {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.healthCheckTimeout
 }
 
 func getCachedHealthCheckFailureThreshold() int {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.healthCheckFailureThreshold
 }
 
 func getCachedShutdownTimeout() time.Duration {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.shutdownTimeout
 }
 
 func getCachedEnableDocs() bool {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.enableDocs
 }
 
 func getCachedProxyFunc() func(*http.Request) (*url.URL, error) {
 	ensureCacheInitialized()
-	envCache.mu.RLock()
-	defer envCache.mu.RUnlock()
 	return envCache.proxyFunc
 }
 
@@ -619,6 +551,7 @@ func resetEnvCacheForTesting() {
 	envCache.httpsProxy = nil
 	envCache.noProxy = nil
 	envCache.proxyFunc = nil
+	envCache.metricsBatcherChannelSize = 0
 	envCache.mu.Unlock()
 	initEnvCache()
 }

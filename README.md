@@ -791,10 +791,10 @@ docker compose -f examples/docker-compose.yaml up --build
 
 The build copies `data/` into the build stage, runs `go generate` to transpile all JSONata into Go, compiles the binary, then copies only the binary into the runtime image. Routes and service logic are compiled into the binary. The `data/` directory (specifically `data/providers/`) must be mounted as a volume at runtime.
 
-## JSONata Coverage — 71% of spec
+## JSONata Coverage — 70% of spec
 
-**56 of 90** features from the [JSONata specification](https://docs.jsonata.org/) are supported.
-The remaining gaps are mainly higher-order functions, date/time, and regex.
+**56 of 80** core features from the [JSONata specification](https://docs.jsonata.org/) are supported.
+The remaining gaps are mainly higher-order functions, date/time, regex functions, and some utility functions.
 
 | Category | Supported | Total | Coverage |
 |---|:---:|:---:|:---:|
@@ -810,9 +810,9 @@ The remaining gaps are mainly higher-order functions, date/time, and regex.
 | Boolean Functions | 3 | 3 | 100% |
 | Array Functions | 4 | 6 | 67% |
 | Object Functions | 3 | 5 | 60% |
-| Higher-Order Functions | 0 | 5 | — |
-| Date/Time Functions | 0 | 4 | — |
-| Other | 0 | 3 | — |
+| Higher-Order Functions | 0 | 5 | 0% |
+| Date/Time Functions | 0 | 4 | 0% |
+| Other | 0 | 3 | 0% |
 
 <details>
 <summary>Full feature matrix</summary>
@@ -921,12 +921,84 @@ The remaining gaps are mainly higher-order functions, date/time, and regex.
 | `$values()` | ❌ | `$values({"a":1})` → `[1]` |
 | `$spread()` | ❌ | `$spread({"a":1})` |
 
-### Not yet implemented
-| Category | Features |
-|---|---|
-| Higher-Order | `$map()`, `$filter()`, `$reduce()`, `$sift()`, `$each()` |
-| Date/Time | `$now()`, `$millis()`, `$fromMillis()`, `$toMillis()` |
-| Other | Lambda expressions, `$eval()` |
+### Missing Functions
+
+#### String Functions (4 missing)
+| Function | Effort | Notes |
+|---|---|---|
+| `$pad()` | Low | Simple string padding with character |
+| `$split()` | Low | String splitting into array |
+| `$match()` | Medium | Requires regex support (depends on regex literal) |
+| `$replace()` | Medium | Requires regex support (depends on regex literal) |
+
+#### Numeric Functions (5 missing)
+| Function | Effort | Notes |
+|---|---|---|
+| `$power()` | Low | `math.Pow()` wrapper |
+| `$sqrt()` | Low | `math.Sqrt()` wrapper |
+| `$random()` | Low | `math/rand` wrapper |
+| `$formatNumber()` | High | Complex formatting patterns (e.g., `"#,###.00"`) |
+| `$parseInteger()` | Medium | Base conversion parsing |
+
+#### Array Functions (2 missing)
+| Function | Effort | Notes |
+|---|---|---|
+| `$shuffle()` | Low | Random array shuffling |
+| `$zip()` | Low | Combine multiple arrays into array of tuples |
+
+#### Object Functions (2 missing)
+| Function | Effort | Notes |
+|---|---|---|
+| `$values()` | Low | Extract all values from object as array |
+| `$spread()` | Low | Spread object properties into parent context |
+
+#### Higher-Order Functions (5 missing)
+| Function | Effort | Notes |
+|---|---|---|
+| `$map()` | High | Requires lambda expression support |
+| `$filter()` | Medium | Can be partially covered by `[predicate]` syntax |
+| `$reduce()` | High | Requires lambda expression support |
+| `$sift()` | High | Requires lambda expression support |
+| `$each()` | High | Requires lambda expression support |
+
+**Higher-Order Functions Effort**: These require implementing lambda expressions (anonymous functions), which is a significant architectural change. Estimated effort: **High** (2-3 weeks for full lambda support).
+
+#### Date/Time Functions (4 missing)
+| Function | Effort | Notes |
+|---|---|---|
+| `$now()` | Low | Current timestamp |
+| `$millis()` | Low | Current time in milliseconds |
+| `$fromMillis()` | Low | Convert milliseconds to date object |
+| `$toMillis()` | Low | Convert date object to milliseconds |
+
+**Date/Time Functions Effort**: All are straightforward wrappers around Go's `time` package. Estimated effort: **Low** (1-2 days).
+
+#### Other Missing Features
+| Feature | Effort | Notes |
+|---|---|---|
+| Regex literals (`/pattern/i`) | Medium | Requires regex parsing and compilation |
+| Lambda expressions | High | Required for higher-order functions |
+| `$eval()` | High | Dynamic expression evaluation (security concerns) |
+
+### Implementation Priority Recommendations
+
+**Quick Wins (Low effort, high value):**
+1. Date/Time functions (4 functions, ~1-2 days)
+2. `$values()`, `$spread()`, `$shuffle()`, `$zip()` (4 functions, ~1 day)
+3. `$power()`, `$sqrt()`, `$random()` (3 functions, ~1 day)
+4. `$pad()`, `$split()` (2 functions, ~1 day)
+
+**Medium Priority:**
+1. `$match()`, `$replace()` (requires regex literal support first)
+2. `$parseInteger()` (base conversion)
+
+**High Priority (Architectural):**
+1. Lambda expressions (enables all higher-order functions)
+2. Regex literal support (enables `$match()`, `$replace()`)
+
+**Not Recommended:**
+- `$eval()` - Security risk, dynamic evaluation conflicts with compile-time generation model
+- `$formatNumber()` - Complex formatting patterns, low usage
 
 </details>
 
