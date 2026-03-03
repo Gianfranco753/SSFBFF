@@ -11,7 +11,6 @@ package runtime
 import (
 	"bytes"
 	"encoding/json/jsontext"
-	jsonv2 "encoding/json/v2"
 	"fmt"
 	"math"
 	"sort"
@@ -51,8 +50,8 @@ type RequestFieldSet struct {
 // the fan-out plan. Method/Headers/Body are optional and allow $fetch()
 // configs to shape the outgoing request (e.g. POST with a custom body).
 type ProviderDep struct {
-	Provider string // e.g. "user_service"
-	Endpoint string // e.g. "profile"
+	Provider string            // e.g. "user_service"
+	Endpoint string            // e.g. "profile"
 	Method   string            // HTTP method (default "GET")
 	Headers  map[string]string // custom headers for this upstream call
 	Body     []byte            // request body (pre-serialized JSON)
