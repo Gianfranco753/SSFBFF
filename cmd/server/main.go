@@ -16,10 +16,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	jsonv2 "encoding/json/v2"
 	"fmt"
-	"log"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -30,16 +31,13 @@ import (
 	"syscall"
 	"time"
 
-	"bytes"
-	"io"
-
 	"github.com/gcossani/ssfbff/internal/aggregator"
 	otelfiber "github.com/gofiber/contrib/v3/otel"
 	"github.com/gofiber/fiber/v3"
-
 	"github.com/prometheus/client_golang/prometheus"
 	promhttp "github.com/prometheus/client_golang/prometheus/promhttp"
-
+	"github.com/rs/zerolog"
+	"github.com/vincentfree/opentelemetry/otelzerolog"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	promexp "go.opentelemetry.io/otel/exporters/prometheus"
@@ -68,6 +66,36 @@ var sharedHTTPClient = &http.Client{
 	Transport: baseTransport,
 }
 
+// initLogger configures and returns a zerolog logger with OpenTelemetry trace ID integration.
+// It reads LOG_LEVEL (default: info) and LOG_FORMAT (default: json) environment variables.
+// The logger is wrapped with otelzerolog to automatically inject trace_id and span_id
+// from OpenTelemetry span context when available.
+func initLogger() zerolog.Logger {
+	levelStr := os.Getenv("LOG_LEVEL")
+	if levelStr == "" {
+		levelStr = "info"
+	}
+	logLevel, err := zerolog.ParseLevel(levelStr)
+	if err != nil {
+		logLevel = zerolog.InfoLevel
+	}
+	zerolog.SetGlobalLevel(logLevel)
+
+	format := os.Getenv("LOG_FORMAT")
+	var writer io.Writer = os.Stdout
+	if format == "console" {
+		writer = zerolog.ConsoleWriter{Out: os.Stdout, TimeFormat: time.RFC3339}
+	}
+
+	logger := zerolog.New(writer).With().
+		Timestamp().
+		Logger()
+
+	logger = otelzerolog.New(logger)
+
+	return logger
+}
+
 // serverReady tracks whether the server has finished initialization and is listening.
 // It's set to true after the server starts listening in the goroutine.
 var (
@@ -85,16 +113,18 @@ var prometheusRegistry *prometheus.Registry
 var serverAggregator *aggregator.Aggregator
 
 func main() {
+	logger := initLogger()
+
 	// Initialize OpenTelemetry first so the instrumented transport and Fiber
 	// middleware can register spans under the correct global TracerProvider.
 	ctx := context.Background()
 	shutdownTracing, err := initTracing(ctx)
 	if err != nil {
-		log.Fatalf("tracing setup: %v", err)
+		logger.Fatal().Err(err).Msg("tracing setup failed")
 	}
 	defer func() {
 		if err := shutdownTracing(ctx); err != nil {
-			log.Printf("tracing shutdown: %v", err)
+			logger.Error().Err(err).Msg("tracing shutdown failed")
 		}
 	}()
 
@@ -102,14 +132,14 @@ func main() {
 	// This creates a meter provider that exports metrics in Prometheus format.
 	promExporter, err := promexp.New()
 	if err != nil {
-		log.Fatalf("prometheus exporter setup: %v", err)
+		logger.Fatal().Err(err).Msg("prometheus exporter setup failed")
 	}
 	prometheusExporter = promExporter
 
 	// Register the exporter's collector with a Prometheus registry.
 	prometheusRegistry = prometheus.NewRegistry()
 	if err := prometheusRegistry.Register(promExporter.Collector); err != nil {
-		log.Fatalf("registering prometheus collector: %v", err)
+		logger.Fatal().Err(err).Msg("registering prometheus collector failed")
 	}
 
 	meterProvider := metric.NewMeterProvider(
@@ -118,7 +148,7 @@ func main() {
 	otel.SetMeterProvider(meterProvider)
 	defer func() {
 		if err := meterProvider.Shutdown(ctx); err != nil {
-			log.Printf("meter provider shutdown: %v", err)
+			logger.Error().Err(err).Msg("meter provider shutdown failed")
 		}
 	}()
 
@@ -138,7 +168,7 @@ func main() {
 
 	providers, err := loadProviders(filepath.Join(dataDir, "providers"))
 	if err != nil {
-		log.Fatalf("loading providers: %v", err)
+		logger.Fatal().Err(err).Msg("loading providers failed")
 	}
 
 	agg := aggregator.New(providers, sharedHTTPClient)
@@ -201,11 +231,11 @@ func main() {
 	})
 
 	addr := listenAddr()
-	log.Printf("BFF server starting on %s", addr)
+	logger.Info().Str("address", addr).Msg("BFF server starting")
 
 	go func() {
 		if err := app.Listen(addr); err != nil {
-			log.Fatalf("server error: %v", err)
+			logger.Fatal().Err(err).Msg("server error")
 		}
 	}()
 
@@ -214,17 +244,17 @@ func main() {
 	serverReadyMu.Lock()
 	serverReady = true
 	serverReadyMu.Unlock()
-	log.Println("server ready")
+	logger.Info().Msg("server ready")
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-quit
-	log.Printf("received %v, shutting down...", sig)
+	logger.Info().Str("signal", sig.String()).Msg("received signal, shutting down")
 
 	if err := app.ShutdownWithTimeout(10 * time.Second); err != nil {
-		log.Fatalf("shutdown error: %v", err)
+		logger.Fatal().Err(err).Msg("shutdown error")
 	}
-	log.Println("server stopped")
+	logger.Info().Msg("server stopped")
 }
 
 // loadProviders reads all .yaml files from a directory.

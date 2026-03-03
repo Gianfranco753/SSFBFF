@@ -5,6 +5,8 @@ go 1.25.0
 require (
 	github.com/blues/jsonata-go v1.5.4
 	github.com/gofiber/fiber/v3 v3.1.0
+	github.com/rs/zerolog v1.33.0
+	github.com/vincentfree/opentelemetry/otelzerolog v0.0.0-20240809024635-0c3fcdf3c470
 	gopkg.in/yaml.v3 v3.0.1
 )
 
