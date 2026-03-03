@@ -47,8 +47,11 @@ endpoints:
 	if userCfg.BaseURL != "http://user-svc:8080" {
 		t.Errorf("user_service base_url = %q", userCfg.BaseURL)
 	}
-	if userCfg.Endpoints["profile"] != "/api/profile" {
-		t.Errorf("user_service profile endpoint = %q", userCfg.Endpoints["profile"])
+	profileEndpoint, ok := userCfg.Endpoints["profile"]
+	if !ok {
+		t.Error("user_service missing profile endpoint")
+	} else if profileEndpoint.Path != "/api/profile" {
+		t.Errorf("user_service profile endpoint path = %q, want /api/profile", profileEndpoint.Path)
 	}
 	if userCfg.Optional {
 		t.Error("user_service should not be optional")

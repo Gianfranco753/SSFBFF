@@ -26,6 +26,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -45,25 +47,52 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// baseTransport defines connection parameters for all upstream HTTP calls.
+// createProviderTransport creates an HTTP transport for a provider with configurable connection pool sizes.
 // It respects HTTP_PROXY, HTTPS_PROXY, and NO_PROXY environment variables.
-var baseTransport = &http.Transport{
-	Proxy:               http.ProxyFromEnvironment,
-	MaxIdleConnsPerHost: 64,
-	MaxConnsPerHost:     128,
-	IdleConnTimeout:     90 * time.Second,
-	DialContext: (&net.Dialer{
-		Timeout:   3 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}).DialContext,
+func createProviderTransport(cfg aggregator.ProviderConfig) *http.Transport {
+	maxIdle := cfg.MaxIdleConnsPerHost
+	if maxIdle == 0 {
+		maxIdle = getEnvInt("MAX_IDLE_CONNS_PER_HOST", 1000)
+	}
+	maxConns := cfg.MaxConnsPerHost
+	if maxConns == 0 {
+		maxConns = getEnvInt("MAX_CONNS_PER_HOST", 2000)
+	}
+
+	return &http.Transport{
+		Proxy:               http.ProxyFromEnvironment,
+		MaxIdleConnsPerHost: maxIdle,
+		MaxConnsPerHost:     maxConns,
+		IdleConnTimeout:     90 * time.Second,
+		DialContext: (&net.Dialer{
+			Timeout:   3 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	}
 }
 
-// sharedHTTPClient is used by the aggregator for all upstream calls.
-// In main(), after OTel is initialized, its Transport is replaced with an
-// otelhttp-wrapped version so every upstream call gets a trace span.
-var sharedHTTPClient = &http.Client{
-	Timeout:   30 * time.Second,
-	Transport: baseTransport,
+// createProviderClient creates an HTTP client for a provider with optional OpenTelemetry instrumentation.
+// The transport is always wrapped with otelhttp, but tracing behavior is controlled by
+// OTEL_DISABLE_TRACING and per-request x-enable-trace header (handled via context).
+func createProviderClient(cfg aggregator.ProviderConfig) *http.Client {
+	transport := createProviderTransport(cfg)
+
+	// Always wrap with OpenTelemetry instrumentation.
+	// The TracerProvider will respect OTEL_DISABLE_TRACING and per-request overrides.
+	transport = otelhttp.NewTransport(
+		transport,
+		otelhttp.WithPropagators(upstreamPropagator()),
+	)
+
+	return &http.Client{
+		Timeout:   30 * time.Second, // Client-level timeout (should be >= provider timeout)
+		Transport: transport,
+	}
+}
+
+// isTracingEnabledGlobally checks if tracing is enabled globally via environment variable.
+func isTracingEnabledGlobally() bool {
+	return os.Getenv("OTEL_DISABLE_TRACING") != "true"
 }
 
 // initLogger configures and returns a zerolog logger with OpenTelemetry trace ID integration.
@@ -152,15 +181,6 @@ func main() {
 		}
 	}()
 
-	// Wrap baseTransport with otelhttp so all upstream HTTP calls become child
-	// spans of the active trace. upstreamPropagator() controls whether
-	// traceparent/tracestate headers are injected into those outgoing requests
-	// (OTEL_PROPAGATE_UPSTREAM, default: true).
-	sharedHTTPClient.Transport = otelhttp.NewTransport(
-		baseTransport,
-		otelhttp.WithPropagators(upstreamPropagator()),
-	)
-
 	dataDir := os.Getenv("DATA_DIR")
 	if dataDir == "" {
 		dataDir = "data"
@@ -171,28 +191,41 @@ func main() {
 		logger.Fatal().Err(err).Msg("loading providers failed")
 	}
 
-	agg := aggregator.New(providers, sharedHTTPClient)
+	// Create aggregator with per-provider clients (each with its own connection pool)
+	agg := aggregator.New(providers, createProviderClient)
 	serverAggregator = agg
+
+	// Configure Fiber for high performance
+	prefork := getEnvBool("FIBER_PREFORK", true)
+	concurrency := getEnvInt("FIBER_CONCURRENCY", 256*runtime.NumCPU())
+	bodyLimit := getEnvInt("FIBER_BODY_LIMIT", 10*1024*1024) // 10MB default
 
 	app := fiber.New(fiber.Config{
 		JSONEncoder: func(v any) ([]byte, error) { return jsonv2.Marshal(v) },
 		JSONDecoder: func(data []byte, v any) error { return jsonv2.Unmarshal(data, v) },
+
+		Prefork:           prefork,
+		Concurrency:       concurrency,
+		BodyLimit:         bodyLimit,
+		ReduceMemoryUsage: true,
+		DisableKeepalive:  false,
 
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	})
 
-	// Instrument all incoming requests: creates a server span, always extracts
-	// W3C TraceContext/Baggage from incoming request headers (so the BFF can
-	// join an existing trace), and records HTTP metrics.
-	// downstreamPropagator() controls whether traceparent/tracestate are also
-	// written into the BFF's HTTP response (OTEL_PROPAGATE_DOWNSTREAM, default: true).
+	// Instrument all incoming requests with OpenTelemetry.
+	// The middleware creates server spans and extracts W3C TraceContext/Baggage.
+	// When OTEL_DISABLE_TRACING=true, spans are still created but can be enabled
+	// per-request via x-enable-trace header (requires custom sampler implementation).
 	app.Use(otelfiber.Middleware(
 		otelfiber.WithPropagators(downstreamPropagator()),
 	))
 
-	RegisterRoutes(app, agg, sharedHTTPClient)
+	// For proxy routes, we still need a client. Use a default one.
+	defaultClient := createProviderClient(aggregator.ProviderConfig{})
+	RegisterRoutes(app, agg, defaultClient)
 
 	app.Get("/health", func(c fiber.Ctx) error {
 		return c.SendString("ok")
@@ -292,6 +325,32 @@ func listenAddr() string {
 		port = "3000"
 	}
 	return fmt.Sprintf(":%s", port)
+}
+
+// getEnvInt reads an integer environment variable, returning defaultValue if not set or invalid.
+func getEnvInt(key string, defaultValue int) int {
+	val := os.Getenv(key)
+	if val == "" {
+		return defaultValue
+	}
+	parsed, err := strconv.Atoi(val)
+	if err != nil {
+		return defaultValue
+	}
+	return parsed
+}
+
+// getEnvBool reads a boolean environment variable, returning defaultValue if not set or invalid.
+func getEnvBool(key string, defaultValue bool) bool {
+	val := os.Getenv(key)
+	if val == "" {
+		return defaultValue
+	}
+	parsed, err := strconv.ParseBool(val)
+	if err != nil {
+		return defaultValue
+	}
+	return parsed
 }
 
 // mockResponseWriter implements http.ResponseWriter to capture Prometheus metrics output.

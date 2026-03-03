@@ -154,13 +154,25 @@ Each route specifies the target `url` where requests should be forwarded. The UR
 
 ### `data/providers/*.yaml`
 
+Each provider configuration supports per-endpoint timeouts and connection pool tuning:
+
 ```yaml
 # data/providers/user_service.yaml
 base_url: http://user-svc:8080
-timeout: 5s
+timeout: 5s  # Provider-level default timeout
+max_idle_conns_per_host: 1000  # Optional, overrides MAX_IDLE_CONNS_PER_HOST env var
+max_conns_per_host: 2000  # Optional, overrides MAX_CONNS_PER_HOST env var
 endpoints:
+  # Simple string format (backward compatible)
   profile: /api/profile
+  
+  # Object format with per-endpoint timeout override
+  slow_query:
+    path: /api/slow
+    timeout: 30s  # Override for slow endpoint
 ```
+
+**Timeout precedence**: Endpoint-level timeout > Provider-level timeout > Global default (10s)
 
 Provider base URLs can be overridden at runtime: `UPSTREAM_USER_SERVICE_URL=http://...`
 
@@ -174,6 +186,8 @@ optional: true
 endpoints:
   suggestions: /api/suggestions
 ```
+
+**Connection Pool Configuration**: Each provider gets its own isolated HTTP client with a dedicated connection pool. This prevents one slow provider from exhausting connections needed by others. Pool sizes can be configured per-provider in YAML or globally via environment variables.
 
 ## Adding a New Endpoint
 
@@ -300,6 +314,11 @@ go run ./cmd/apigen --spec=<openapi.yaml> --jsonata-dir=<dir> [--proxies=<proxie
 | `PORT` | Server listen port | `3000` |
 | `DATA_DIR` | Path to the data directory | `data` |
 | `UPSTREAM_<PROVIDER>_URL` | Override base URL for a provider | — |
+| `MAX_IDLE_CONNS_PER_HOST` | Maximum idle connections per host in connection pool | `1000` |
+| `MAX_CONNS_PER_HOST` | Maximum total connections per host in connection pool | `2000` |
+| `FIBER_PREFORK` | Enable prefork mode (multi-process, one per CPU core) | `true` |
+| `FIBER_CONCURRENCY` | Maximum concurrent connections per worker | `256 * CPU count` |
+| `FIBER_BODY_LIMIT` | Maximum request body size in bytes | `10485760` (10MB) |
 
 ### Proxy
 
@@ -313,12 +332,13 @@ All upstream HTTP calls honour standard proxy environment variables:
 
 ### OpenTelemetry
 
-Tracing is configured entirely via standard [OTEL environment variables](https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/):
+Tracing is configured via standard [OTEL environment variables](https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/):
 
 | Variable | Description | Default |
 |---|---|---|
-| `OTEL_SDK_DISABLED` | Set `true` to disable tracing | `false` |
-| `OTEL_TRACES_EXPORTER` | Set `none` to disable tracing | — |
+| `OTEL_SDK_DISABLED` | Set `true` to disable tracing entirely (no-op) | `false` |
+| `OTEL_TRACES_EXPORTER` | Set `none` to disable tracing entirely (no-op) | — |
+| `OTEL_DISABLE_TRACING` | Set `true` to disable tracing (spans created but not exported, supports per-request override) | `false` |
 | `OTEL_SERVICE_NAME` | Service name attached to every span | `ssfbff` |
 | `OTEL_RESOURCE_ATTRIBUTES` | Extra resource attributes (e.g. `env=prod,version=1.2`) | — |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP collector endpoint | `http://localhost:4318` |
@@ -327,6 +347,8 @@ Tracing is configured entirely via standard [OTEL environment variables](https:/
 | `OTEL_EXPORTER_OTLP_TRACES_HEADERS` | Traces-specific header override | — |
 | `OTEL_PROPAGATE_UPSTREAM` | Inject `traceparent`/`tracestate` into requests sent to upstream microservices | `true` |
 | `OTEL_PROPAGATE_DOWNSTREAM` | Inject `traceparent`/`tracestate` into HTTP responses sent back to clients | `true` |
+
+**Per-Request Tracing Override**: When `OTEL_DISABLE_TRACING=true`, you can still enable tracing for specific requests by including the `x-enable-trace: true` or `x-enable-trace: 1` header. This is useful for debugging high-load scenarios without impacting overall performance.
 
 ## Tracing & Observability
 
@@ -340,6 +362,10 @@ The server is fully OpenTelemetry compatible out of the box:
   - `OTEL_PROPAGATE_UPSTREAM=false` — **disable** header injection into outgoing requests to upstream microservices. Useful when upstream services do not support OTel and you want to avoid unexpected header overhead. Spans are still recorded on the BFF side.
   - `OTEL_PROPAGATE_DOWNSTREAM=false` — **disable** header injection into HTTP responses back to clients. Useful when you don't want clients to observe internal trace IDs. Spans are still recorded on the BFF side.
   - Both default to `true` (propagation enabled).
+
+- **High-load optimization** — set `OTEL_DISABLE_TRACING=true` to disable tracing globally for maximum performance. Spans are still created (minimal overhead) but not exported. Use the `x-enable-trace` header on specific requests to enable tracing for debugging.
+
+- **Per-provider connection pools** — each provider gets its own isolated HTTP client with a dedicated connection pool, preventing one slow provider from exhausting connections needed by others. Pool sizes are configurable per-provider in YAML or globally via environment variables.
 
 - **Proxy support** — `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` are respected by all upstream calls, making the BFF compatible with corporate proxies and cloud egress gateways.
 

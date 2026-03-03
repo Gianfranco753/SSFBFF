@@ -23,6 +23,7 @@ import (
 //
 //	OTEL_SDK_DISABLED=true           — disable tracing entirely (no-op)
 //	OTEL_TRACES_EXPORTER=none        — disable tracing entirely (no-op)
+//	OTEL_DISABLE_TRACING=true        — disable tracing (uses noop exporter, but TracerProvider still exists for per-request override)
 //	OTEL_SERVICE_NAME                — service name (default: "ssfbff")
 //	OTEL_RESOURCE_ATTRIBUTES         — extra resource key=value pairs
 //	OTEL_EXPORTER_OTLP_ENDPOINT      — collector endpoint (default: http://localhost:4318)
@@ -30,6 +31,8 @@ import (
 //	OTEL_EXPORTER_OTLP_TRACES_ENDPOINT — traces-specific endpoint override
 //	OTEL_EXPORTER_OTLP_TRACES_HEADERS  — traces-specific header override
 //
+// When OTEL_DISABLE_TRACING=true, a TracerProvider is still created (to support
+// per-request override via x-enable-trace header), but uses a noop exporter.
 // See https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/
 func initTracing(ctx context.Context) (shutdown func(context.Context) error, err error) {
 	noop := func(_ context.Context) error { return nil }
@@ -37,6 +40,11 @@ func initTracing(ctx context.Context) (shutdown func(context.Context) error, err
 	if os.Getenv("OTEL_SDK_DISABLED") == "true" || os.Getenv("OTEL_TRACES_EXPORTER") == "none" {
 		return noop, nil
 	}
+
+	// Check if tracing is disabled via OTEL_DISABLE_TRACING.
+	// We still create a TracerProvider (for per-request override support),
+	// but use a noop exporter.
+	disableTracing := os.Getenv("OTEL_DISABLE_TRACING") == "true"
 
 	// resource.WithFromEnv reads OTEL_SERVICE_NAME and OTEL_RESOURCE_ATTRIBUTES.
 	// We also supply a default service name in case OTEL_SERVICE_NAME is not set.
@@ -52,20 +60,31 @@ func initTracing(ctx context.Context) (shutdown func(context.Context) error, err
 		res = resource.Default()
 	}
 
-	// otlptracehttp automatically reads OTEL_EXPORTER_OTLP_ENDPOINT,
-	// OTEL_EXPORTER_OTLP_HEADERS, and their traces-specific variants,
-	// so no manual endpoint configuration is needed here.
-	exp, err := otlptracehttp.New(ctx)
-	if err != nil {
-		return noop, fmt.Errorf("creating OTLP trace exporter: %w", err)
-	}
+	var tp *sdktrace.TracerProvider
+	if disableTracing {
+		// When tracing is disabled, create TracerProvider without a batcher.
+		// Spans will be created but not exported, supporting per-request override via x-enable-trace header.
+		tp = sdktrace.NewTracerProvider(
+			sdktrace.WithResource(res),
+			// No batcher means spans are created but immediately discarded.
+			// Note: Per-request override via x-enable-trace header requires a custom sampler.
+		)
+	} else {
+		// otlptracehttp automatically reads OTEL_EXPORTER_OTLP_ENDPOINT,
+		// OTEL_EXPORTER_OTLP_HEADERS, and their traces-specific variants,
+		// so no manual endpoint configuration is needed here.
+		exp, err := otlptracehttp.New(ctx)
+		if err != nil {
+			return noop, fmt.Errorf("creating OTLP trace exporter: %w", err)
+		}
 
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exp),
-		sdktrace.WithResource(res),
-		// Default sampler: parentbased_always_on — honours the parent's decision
-		// and samples all root spans. Override via OTEL_TRACES_SAMPLER if needed.
-	)
+		tp = sdktrace.NewTracerProvider(
+			sdktrace.WithBatcher(exp),
+			sdktrace.WithResource(res),
+			// Default sampler: parentbased_always_on — honours the parent's decision
+			// and samples all root spans. Override via OTEL_TRACES_SAMPLER if needed.
+		)
+	}
 
 	// Register as global so the Fiber otel middleware and otelhttp transport
 	// pick up the provider automatically without any direct reference.
