@@ -110,7 +110,7 @@ func main() {
 		otelfiber.WithPropagators(downstreamPropagator()),
 	))
 
-	RegisterRoutes(app, agg)
+	RegisterRoutes(app, agg, sharedHTTPClient)
 
 	app.Get("/health", func(c fiber.Ctx) error {
 		return c.SendString("ok")

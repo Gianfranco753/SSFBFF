@@ -16,3 +16,11 @@ routes:
   - path: /api/v1/products
     method: GET
     jsonata: products.jsonata
+
+  - path: /proxy/*
+    method: ALL
+    proxy: downstream
+
+  - path: /api/legacy/*
+    method: ALL
+    proxy: legacy_service
