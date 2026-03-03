@@ -14,7 +14,7 @@ func TestShutdownAsyncLogging(t *testing.T) {
 	logWorkerWg = sync.WaitGroup{}
 
 	// Initialize async logging
-	asyncLoggingEnabled = true
+	errorLoggingEnabled = true
 	logChan = make(chan *logEntry, 10)
 	logWorkerWg.Add(1)
 	go func() {
@@ -37,7 +37,7 @@ func TestShutdownAsyncLogging(t *testing.T) {
 }
 
 func TestShutdownAsyncLogging_NotEnabled(t *testing.T) {
-	asyncLoggingEnabled = false
+	errorLoggingEnabled = false
 	logChan = nil
 
 	success := shutdownAsyncLogging(1 * time.Second)
@@ -54,7 +54,7 @@ func TestShutdownAsyncLogging_Timeout(t *testing.T) {
 	logChanClosed = false
 	logWorkerWg = sync.WaitGroup{}
 
-	asyncLoggingEnabled = true
+	errorLoggingEnabled = true
 	logChan = make(chan *logEntry, 10)
 
 	// Create a worker that takes longer than timeout

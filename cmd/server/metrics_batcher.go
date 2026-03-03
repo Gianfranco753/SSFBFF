@@ -107,11 +107,6 @@ func (mb *metricsBatcher) worker() {
 			return
 		case update := <-mb.updates:
 			batch = append(batch, update)
-			// Only update channel size gauge periodically to avoid hot path overhead
-			// Update every 10 items or on flush
-			if len(batch)%10 == 0 {
-				updateMetricsBatcherChannelSize(len(mb.updates))
-			}
 			if len(batch) >= mb.batchSize {
 				flush()
 			}

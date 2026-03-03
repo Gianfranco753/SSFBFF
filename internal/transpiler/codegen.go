@@ -272,6 +272,19 @@ func (em *exprEmitter) emit(e *Expr) string {
 		}
 		return fmt.Sprintf("[]any{%s}", strings.Join(items, ", "))
 
+	case "object":
+		// Object literal: convert key-value pairs to map[string]any
+		if len(e.FuncArgs)%2 != 0 {
+			return "map[string]any{}"
+		}
+		pairs := make([]string, 0, len(e.FuncArgs)/2)
+		for i := 0; i < len(e.FuncArgs); i += 2 {
+			key := em.emit(e.FuncArgs[i])
+			value := em.emit(e.FuncArgs[i+1])
+			pairs = append(pairs, fmt.Sprintf("%s: %s", key, value))
+		}
+		return fmt.Sprintf("map[string]any{%s}", strings.Join(pairs, ", "))
+
 	case "rootRef":
 		return "data"
 

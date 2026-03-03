@@ -376,10 +376,10 @@ func TestGenerateValidator(t *testing.T) {
 	}
 
 	mustContain := []string{
-		"func ValidatePostApiV1UsersRequest",
+		"func ValidatePostAPIV1UsersRequest",
 		"runtime.RequestContext",
 		"required header 'Authorization'",
-		"required query parameter",
+		"query parameter 'page'",
 		"request body is required",
 		"required field 'email'",
 		"required field 'name'",
@@ -397,8 +397,8 @@ func TestSanitizeRouteName(t *testing.T) {
 		want  string
 	}{
 		{"/dashboard", "Dashboard"},
-		{"/api/v1/users", "ApiV1Users"},
-		{"/api/v1/orders", "ApiV1Orders"},
+		{"/api/v1/users", "APIV1Users"},
+		{"/api/v1/orders", "APIV1Orders"},
 		{"/", "Root"},
 		{"", "Root"},
 		{"/user-profile", "UserProfile"},

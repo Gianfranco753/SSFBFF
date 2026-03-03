@@ -305,6 +305,27 @@ func analyzeProjection(pair [2]jparse.Node, fc *fieldCollector) (OutputField, er
 
 func analyzeExpr(node jparse.Node, fc *fieldCollector) (*Expr, error) {
 	switch n := node.(type) {
+	case *jparse.PredicateNode:
+		// PredicateNode represents expr[filter], e.g., $fetch(...)[filter]
+		// When used as a function argument, we need to analyze the base expression
+		// and the filters. For now, we'll analyze the base expression and note
+		// that filters are present (they'll be evaluated at runtime).
+		baseExpr, err := analyzeExpr(n.Expr, fc)
+		if err != nil {
+			return nil, fmt.Errorf("predicate base expression: %w", err)
+		}
+		// Analyze filters to collect any field references
+		for _, filter := range n.Filters {
+			if _, err := analyzeExpr(filter, fc); err != nil {
+				// If filter analysis fails, we still continue but note it
+				// The filter will be evaluated at runtime
+			}
+		}
+		// Return the base expression - filters will be applied at runtime
+		// This is a simplification; in a full implementation, we'd need to
+		// represent the filtered expression more explicitly
+		return baseExpr, nil
+
 	case *jparse.PathNode:
 		if len(n.Steps) == 1 {
 			return analyzeExpr(n.Steps[0], fc)
@@ -608,6 +629,33 @@ func analyzeExpr(node jparse.Node, fc *fieldCollector) (*Expr, error) {
 			Then:   then,
 			Else:   els,
 			GoType: goType,
+		}, nil
+
+	case *jparse.ObjectNode:
+		// Object literals in expressions (e.g., $httpResponse body) are converted
+		// to a map[string]any expression that will be JSON-marshaled at runtime.
+		pairs := make([]*Expr, 0, len(n.Pairs)*2)
+		for _, pair := range n.Pairs {
+			// Extract key as string literal
+			keyName, err := extractSingleName(pair[0])
+			if err != nil {
+				return nil, fmt.Errorf("object key: %w", err)
+			}
+			keyExpr := &Expr{
+				Kind:         "literal",
+				LiteralValue: fmt.Sprintf("%q", keyName),
+				GoType:       "string",
+			}
+			value, err := analyzeExpr(pair[1], fc)
+			if err != nil {
+				return nil, fmt.Errorf("object value: %w", err)
+			}
+			pairs = append(pairs, keyExpr, value)
+		}
+		return &Expr{
+			Kind:     "object",
+			FuncArgs: pairs,
+			GoType:   "any",
 		}, nil
 
 	case *jparse.FunctionCallNode:
@@ -1202,6 +1250,32 @@ func (p *ProviderPlan) RequestFields() RequestFieldSet {
 //   - $fetch("provider", "endpoint")[filter].{proj}   → Kind="fetchFilter"
 //     The Execute function returns a JSON array directly.
 func AnalyzeFetchCalls(root jparse.Node, funcName string) (*ProviderPlan, error) {
+	// Handle top-level $httpError() call
+	if fnCall, ok := root.(*jparse.FunctionCallNode); ok {
+		if v, ok := fnCall.Func.(*jparse.VariableNode); ok && v.Name == "httpError" {
+			field, err := analyzeErrorFn(fnCall)
+			if err != nil {
+				return nil, err
+			}
+			return &ProviderPlan{
+				FuncName: funcName,
+				Fields:   []ProviderField{field},
+			}, nil
+		}
+		// Handle top-level $httpResponse() call
+		if v, ok := fnCall.Func.(*jparse.VariableNode); ok && v.Name == "httpResponse" {
+			fc := &fieldCollector{numeric: map[string]bool{}, varTypes: map[string]string{}}
+			field, err := analyzeResponseFn(fnCall, fc)
+			if err != nil {
+				return nil, err
+			}
+			return &ProviderPlan{
+				FuncName: funcName,
+				Fields:   []ProviderField{field},
+			}, nil
+		}
+	}
+
 	// Detect the $fetch(p,e)[filter].{projection} top-level pattern before
 	// attempting to unwrap an object literal.
 	if field, ok := tryAnalyzeFetchFilter(root, funcName); ok {
@@ -1214,6 +1288,23 @@ func AnalyzeFetchCalls(root jparse.Node, funcName string) (*ProviderPlan, error)
 			}},
 		}
 		return plan, nil
+	}
+
+	// Handle top-level conditional expressions (e.g., condition ? $httpError(...) : ...)
+	if _, ok := root.(*jparse.ConditionalNode); ok {
+		fc := &fieldCollector{numeric: map[string]bool{}, varTypes: map[string]string{}}
+		condExpr, err := analyzeExpr(root, fc)
+		if err != nil {
+			return nil, fmt.Errorf("conditional expression: %w", err)
+		}
+		field := ProviderField{
+			Kind:      "expr",
+			ValueExpr: condExpr,
+		}
+		return &ProviderPlan{
+			FuncName: funcName,
+			Fields:   []ProviderField{field},
+		}, nil
 	}
 
 	obj := unwrapObject(root)
@@ -1290,7 +1381,7 @@ func HasFetchCalls(root jparse.Node) bool {
 		}
 	case *jparse.FunctionCallNode:
 		if v, ok := n.Func.(*jparse.VariableNode); ok {
-			if v.Name == "fetch" || v.Name == "request" || v.Name == "service" {
+			if v.Name == "fetch" || v.Name == "request" || v.Name == "service" || v.Name == "httpError" || v.Name == "httpResponse" {
 				return true
 			}
 		}

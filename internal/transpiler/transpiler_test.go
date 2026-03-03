@@ -421,16 +421,20 @@ func main() {
 	}
 
 	reqCtx := runtime.RequestContext{}
-	out, err := TransformDashboard(results, reqCtx)
+	resp, err := TransformDashboard(results, reqCtx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+	if resp == nil {
+		fmt.Fprintf(os.Stderr, "error: response is nil\n")
+		os.Exit(1)
+	}
 
-	fmt.Println(string(out))
+	fmt.Println(string(resp.Body))
 
 	var parsed map[string]any
-	if err := json.Unmarshal(out, &parsed); err != nil {
+	if err := json.Unmarshal(resp.Body, &parsed); err != nil {
 		fmt.Fprintf(os.Stderr, "parse output error: %v\n", err)
 		os.Exit(1)
 	}
@@ -449,6 +453,14 @@ func main() {
 `
 
 	writeTestFiles(t, dir, src, harness)
+
+	// Download dependencies
+	modCmd := exec.Command("go", "mod", "tidy")
+	modCmd.Dir = dir
+	modCmd.Env = append(os.Environ(), "GOEXPERIMENT=jsonv2")
+	if err := modCmd.Run(); err != nil {
+		t.Fatalf("go mod tidy failed: %v", err)
+	}
 
 	cmd := exec.Command("go", "run", ".")
 	cmd.Dir = dir
@@ -508,16 +520,20 @@ func main() {
 		Path:    "/api/v1/test",
 	}
 
-	out, err := TransformMixed(results, reqCtx)
+	resp, err := TransformMixed(results, reqCtx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+	if resp == nil {
+		fmt.Fprintf(os.Stderr, "error: response is nil\n")
+		os.Exit(1)
+	}
 
-	fmt.Println(string(out))
+	fmt.Println(string(resp.Body))
 
 	var parsed map[string]any
-	if err := json.Unmarshal(out, &parsed); err != nil {
+	if err := json.Unmarshal(resp.Body, &parsed); err != nil {
 		fmt.Fprintf(os.Stderr, "parse output error: %v\n", err)
 		os.Exit(1)
 	}
@@ -540,6 +556,14 @@ func main() {
 `
 
 	writeTestFiles(t, dir, src, harness)
+
+	// Download dependencies
+	modCmd := exec.Command("go", "mod", "tidy")
+	modCmd.Dir = dir
+	modCmd.Env = append(os.Environ(), "GOEXPERIMENT=jsonv2")
+	if err := modCmd.Run(); err != nil {
+		t.Fatalf("go mod tidy failed: %v", err)
+	}
 
 	cmd := exec.Command("go", "run", ".")
 	cmd.Dir = dir
@@ -735,30 +759,37 @@ func main() {
 		"user_svc": {
 			BaseURL:   os.Getenv("UPSTREAM_USER_SVC_URL"),
 			Timeout:   5 * time.Second,
-			Endpoints: map[string]string{"profile": "/profile"},
+			Endpoints: map[string]aggregator.EndpointConfig{"profile": {Path: "/profile"}},
 		},
 		"bank_svc": {
 			BaseURL:   os.Getenv("UPSTREAM_BANK_SVC_URL"),
 			Timeout:   5 * time.Second,
-			Endpoints: map[string]string{"accounts": "/accounts"},
+			Endpoints: map[string]aggregator.EndpointConfig{"accounts": {Path: "/accounts"}},
 		},
 	}
 
-	agg := aggregator.New(providers, http.DefaultClient)
+	clientFactory := func(cfg aggregator.ProviderConfig) *http.Client {
+		return http.DefaultClient
+	}
+	agg := aggregator.New(providers, clientFactory)
 	reqCtx := runtime.RequestContext{
 		Headers: map[string]string{"Authorization": "Bearer test"},
 	}
 
-	result, err := ExecuteDashboard(context.Background(), agg, reqCtx)
+	resp, err := ExecuteDashboard(context.Background(), agg, reqCtx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+	if resp == nil {
+		fmt.Fprintf(os.Stderr, "error: response is nil\n")
+		os.Exit(1)
+	}
 
-	fmt.Println(string(result))
+	fmt.Println(string(resp.Body))
 
 	var parsed map[string]any
-	if err := json.Unmarshal(result, &parsed); err != nil {
+	if err := json.Unmarshal(resp.Body, &parsed); err != nil {
 		fmt.Fprintf(os.Stderr, "parse error: %v\n", err)
 		os.Exit(1)
 	}
@@ -780,9 +811,24 @@ func main() {
 		t.Fatal(err)
 	}
 
-	gomod := "module testharness\n\ngo 1.26\n"
+	gomod := `module testharness
+
+go 1.26
+
+require (
+	github.com/rs/zerolog v1.33.0
+)
+`
 	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(gomod), 0o644); err != nil {
 		t.Fatal(err)
+	}
+
+	// Download dependencies
+	modCmd := exec.Command("go", "mod", "tidy")
+	modCmd.Dir = dir
+	modCmd.Env = append(os.Environ(), "GOEXPERIMENT=jsonv2")
+	if err := modCmd.Run(); err != nil {
+		t.Fatalf("go mod tidy failed: %v", err)
 	}
 
 	// Start a mock HTTP server that serves user and bank data.
@@ -979,6 +1025,14 @@ func main() {
 `
 	writeTestFiles(t, dir, src, harness)
 
+	// Download dependencies
+	modCmd := exec.Command("go", "mod", "tidy")
+	modCmd.Dir = dir
+	modCmd.Env = append(os.Environ(), "GOEXPERIMENT=jsonv2")
+	if err := modCmd.Run(); err != nil {
+		t.Fatalf("go mod tidy failed: %v", err)
+	}
+
 	cmd := exec.Command("go", "run", ".")
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "GOEXPERIMENT=jsonv2")
@@ -1016,6 +1070,7 @@ func copyAggregatorPackage(t *testing.T, dir string) {
 	if err := os.MkdirAll(aggDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// Copy aggregator.go
 	aggSrc, err := os.ReadFile("../../internal/aggregator/aggregator.go")
 	if err != nil {
 		t.Fatal(err)
@@ -1024,6 +1079,15 @@ func copyAggregatorPackage(t *testing.T, dir string) {
 	fixed := strings.ReplaceAll(string(aggSrc), `"github.com/gcossani/ssfbff/runtime"`, `"testharness/runtime"`)
 	fixed = strings.ReplaceAll(fixed, `"golang.org/x/sync/errgroup"`, `"testharness/errgroup"`)
 	if err := os.WriteFile(filepath.Join(aggDir, "aggregator.go"), []byte(fixed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Copy observability.go
+	obsSrc, err := os.ReadFile("../../internal/aggregator/observability.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	obsFixed := strings.ReplaceAll(string(obsSrc), `"github.com/gcossani/ssfbff/runtime"`, `"testharness/runtime"`)
+	if err := os.WriteFile(filepath.Join(aggDir, "observability.go"), []byte(obsFixed), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1278,7 +1342,14 @@ func writeTestFiles(t *testing.T, dir string, generatedSrc []byte, harness strin
 		t.Fatal(err)
 	}
 
-	gomod := "module testharness\n\ngo 1.26\n"
+	gomod := `module testharness
+
+go 1.26
+
+require (
+	github.com/rs/zerolog v1.33.0
+)
+`
 	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(gomod), 0o644); err != nil {
 		t.Fatal(err)
 	}

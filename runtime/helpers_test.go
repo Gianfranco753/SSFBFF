@@ -3,7 +3,9 @@
 package runtime
 
 import (
+	"reflect"
 	"testing"
+	"time"
 )
 
 func TestExtractPath(t *testing.T) {
@@ -495,7 +497,7 @@ func TestSpreadMap(t *testing.T) {
 	// SpreadMap returns the object itself
 	obj := map[string]any{"a": 1, "b": 2}
 	got := SpreadMap(obj)
-	if got != obj {
+	if !reflect.DeepEqual(got, obj) {
 		t.Errorf("SpreadMap should return the same object, got %v, want %v", got, obj)
 	}
 	// Non-object input is returned unchanged
@@ -589,19 +591,19 @@ func TestToMillis(t *testing.T) {
 			"RFC3339Nano format",
 			"2024-01-15T10:30:00.123456789Z",
 			nil,
-			1705315800123,
+			1705314600123,
 		},
 		{
 			"RFC3339 format",
 			"2024-01-15T10:30:00Z",
 			nil,
-			1705315800000,
+			1705314600000,
 		},
 		{
 			"with picture (ignored)",
 			"2024-01-15T10:30:00Z",
 			[]string{"YYYY-MM-DD"},
-			1705315800000,
+			1705314600000,
 		},
 		{
 			"invalid format returns 0",

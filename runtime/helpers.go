@@ -400,14 +400,13 @@ func Sqrt(v float64) float64 {
 	return math.Sqrt(v)
 }
 
+// globalRand is a seeded random number generator initialized at package load time.
+var globalRand = rand.New(rand.NewSource(time.Now().UnixNano()))
+
 // Random returns a random number between 0.0 and 1.0.
 // The random number generator is seeded once at package initialization.
 func Random() float64 {
-	return rand.Float64()
-}
-
-func init() {
-	rand.Seed(time.Now().UnixNano())
+	return globalRand.Float64()
 }
 
 // --- Boolean functions ---
@@ -975,14 +974,18 @@ func NewHTTPError(statusCode int, message string) *HTTPError {
 }
 
 // ToResponse converts an HTTPError to a Response.
-func (e *HTTPError) ToResponse() *Response {
-	body, _ := jsonv2.Marshal(map[string]any{
+// Returns an error if JSON marshaling fails.
+func (e *HTTPError) ToResponse() (*Response, error) {
+	body, err := jsonv2.Marshal(map[string]any{
 		"error":  e.Message,
 		"status": e.StatusCode,
 	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal HTTPError response: %w", err)
+	}
 	return &Response{
 		StatusCode: e.StatusCode,
 		Headers:    map[string]string{"Content-Type": "application/json"},
 		Body:       body,
-	}
+	}, nil
 }

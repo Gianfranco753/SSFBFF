@@ -293,7 +293,12 @@ func main() {
 			
 			// Build JSON response directly
 			buf.WriteString(`{"error":`)
-			jsonBytes, _ := jsonv2.Marshal(message)
+			jsonBytes, err := jsonv2.Marshal(message)
+			if err != nil {
+				// Fallback to a safe error message if marshaling fails
+				logError(c.Context(), logger, "failed to marshal error message", func(e *zerolog.Event) { e.Err(err) })
+				jsonBytes = []byte(`"Internal Server Error"`)
+			}
 			buf.Write(jsonBytes)
 			buf.WriteString(`,"status":`)
 			buf.WriteString(strconv.Itoa(code))
@@ -533,7 +538,18 @@ func main() {
 
 	// Step 1: Stop accepting new requests (Fiber shutdown)
 	logInfo(shutdownCtx, logger, "stopping HTTP server")
-	if err := app.ShutdownWithTimeout(10 * time.Second); err != nil {
+	// Calculate Fiber shutdown timeout (80% of total, min 5s, max remaining)
+	fiberShutdownTimeout := shutdownTimeout * 80 / 100
+	if fiberShutdownTimeout < 5*time.Second {
+		fiberShutdownTimeout = 5 * time.Second
+	}
+	if deadline, ok := shutdownCtx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining > 0 && fiberShutdownTimeout > remaining {
+			fiberShutdownTimeout = remaining
+		}
+	}
+	if err := app.ShutdownWithTimeout(fiberShutdownTimeout); err != nil {
 		logError(shutdownCtx, logger, "HTTP server shutdown error", func(e *zerolog.Event) { e.Err(err) })
 	}
 
@@ -541,11 +557,32 @@ func main() {
 	// The aggregator uses context cancellation, so in-flight requests will be cancelled
 	// when shutdownCtx is cancelled. We give them a moment to finish.
 	logInfo(shutdownCtx, logger, "waiting for in-flight requests")
-	select {
-	case <-shutdownCtx.Done():
-		logWarn(shutdownCtx, logger, "shutdown timeout reached while waiting for in-flight requests")
-	case <-time.After(1 * time.Second):
-		// Brief pause for in-flight requests to complete
+	if deadline, ok := shutdownCtx.Deadline(); ok {
+		remainingTime := time.Until(deadline)
+		if remainingTime > 0 {
+			// Use min of remaining time or a reasonable max (e.g., 5s)
+			waitTime := remainingTime
+			if waitTime > 5*time.Second {
+				waitTime = 5 * time.Second
+			}
+			select {
+			case <-shutdownCtx.Done():
+				logWarn(shutdownCtx, logger, "shutdown timeout reached while waiting for in-flight requests")
+			case <-time.After(waitTime):
+				// Wait completed
+			}
+		} else {
+			// Shutdown context already expired
+			logWarn(shutdownCtx, logger, "shutdown timeout reached while waiting for in-flight requests")
+		}
+	} else {
+		// No deadline set (shouldn't happen with WithTimeout, but handle gracefully)
+		select {
+		case <-shutdownCtx.Done():
+			logWarn(shutdownCtx, logger, "shutdown context cancelled while waiting for in-flight requests")
+		case <-time.After(1 * time.Second):
+			// Brief pause for in-flight requests to complete
+		}
 	}
 
 	// Step 3: Drain metrics batcher

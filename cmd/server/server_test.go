@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/gcossani/ssfbff/internal/aggregator"
+	"github.com/rs/zerolog"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -123,7 +125,8 @@ func TestProviderTransportProxySupport(t *testing.T) {
 func TestInitTracingDisabledSDK(t *testing.T) {
 	t.Setenv("OTEL_SDK_DISABLED", "true")
 	resetEnvCacheForTesting()
-	shutdown, err := initTracing(context.Background())
+	logger := zerolog.Nop()
+	shutdown, err := initTracing(context.Background(), logger)
 	if err != nil {
 		t.Fatalf("initTracing error: %v", err)
 	}
@@ -135,7 +138,8 @@ func TestInitTracingDisabledSDK(t *testing.T) {
 func TestInitTracingExporterNone(t *testing.T) {
 	t.Setenv("OTEL_TRACES_EXPORTER", "none")
 	resetEnvCacheForTesting()
-	shutdown, err := initTracing(context.Background())
+	logger := zerolog.Nop()
+	shutdown, err := initTracing(context.Background(), logger)
 	if err != nil {
 		t.Fatalf("initTracing error: %v", err)
 	}
@@ -204,4 +208,3 @@ func TestDownstreamPropagatorDisabled(t *testing.T) {
 		t.Error("downstreamPropagator() should be noop when OTEL_PROPAGATE_DOWNSTREAM=false")
 	}
 }
-

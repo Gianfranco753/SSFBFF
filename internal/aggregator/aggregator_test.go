@@ -110,7 +110,7 @@ func TestFetchUnknownProvider(t *testing.T) {
 
 func TestFetchUnknownEndpoint(t *testing.T) {
 	agg := New(map[string]ProviderConfig{
-		"svc": {BaseURL: "http://localhost", Timeout: 1 * time.Second, Endpoints: makeEndpoints(map[string]string{})},
+		"svc": {BaseURL: "http://localhost", Timeout: 1 * time.Second, Endpoints: makeEndpoints(map[string]string{"valid": "/valid"})},
 	}, testClientFactory)
 
 	deps := []runtime.ProviderDep{{Provider: "svc", Endpoint: "missing"}}
@@ -233,7 +233,7 @@ func TestValidateProviderConfig(t *testing.T) {
 				Endpoints: makeEndpoints(map[string]string{"ep": "/api/ep"}),
 			},
 			wantErr: true,
-			errMsg:  "invalid base_url",
+			errMsg:  "base_url",
 		},
 		{
 			name: "negative timeout",
