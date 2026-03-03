@@ -64,6 +64,13 @@ var (
 	// Middleware configuration
 	useTraceIDAsRequestID    bool
 
+	// Health check configuration
+	healthCheckTimeout        time.Duration
+	healthCheckFailureThreshold int
+
+	// Shutdown configuration
+	shutdownTimeout          time.Duration
+
 	// Proxy configuration (cached to avoid http.ProxyFromEnvironment overhead)
 	httpProxy                *url.URL
 	httpsProxy               *url.URL
@@ -124,6 +131,13 @@ func initEnvCache() {
 
 	// Middleware configuration
 	envCache.useTraceIDAsRequestID = getEnvBool("USE_TRACE_ID_AS_REQUEST_ID", true)
+
+	// Health check configuration
+	envCache.healthCheckTimeout = getEnvDuration("HEALTH_CHECK_TIMEOUT", 500*time.Millisecond)
+	envCache.healthCheckFailureThreshold = getEnvInt("HEALTH_CHECK_FAILURE_THRESHOLD", 0)
+
+	// Shutdown configuration
+	envCache.shutdownTimeout = getEnvDuration("SHUTDOWN_TIMEOUT", 30*time.Second)
 
 	// Proxy configuration - parse once and cache
 	envCache.httpProxy = parseProxyURL(getEnvString("HTTP_PROXY", ""))
@@ -390,6 +404,27 @@ func getCachedUseTraceIDAsRequestID() bool {
 	envCache.mu.RLock()
 	defer envCache.mu.RUnlock()
 	return envCache.useTraceIDAsRequestID
+}
+
+func getCachedHealthCheckTimeout() time.Duration {
+	ensureCacheInitialized()
+	envCache.mu.RLock()
+	defer envCache.mu.RUnlock()
+	return envCache.healthCheckTimeout
+}
+
+func getCachedHealthCheckFailureThreshold() int {
+	ensureCacheInitialized()
+	envCache.mu.RLock()
+	defer envCache.mu.RUnlock()
+	return envCache.healthCheckFailureThreshold
+}
+
+func getCachedShutdownTimeout() time.Duration {
+	ensureCacheInitialized()
+	envCache.mu.RLock()
+	defer envCache.mu.RUnlock()
+	return envCache.shutdownTimeout
 }
 
 func getCachedProxyFunc() func(*http.Request) (*url.URL, error) {

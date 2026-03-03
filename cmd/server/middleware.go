@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/gofiber/fiber/v3"
 	"github.com/rs/zerolog"
@@ -24,6 +25,9 @@ var (
 	errorLoggingEnabled = getCachedEnableErrorLogging()
 	logChan             chan *logEntry
 	logWorkerOnce        sync.Once
+	logWorkerWg          sync.WaitGroup
+	logChanClosed        bool
+	logChanMu            sync.Mutex
 )
 
 // initAsyncLogging initializes the async logging worker if enabled.
@@ -36,7 +40,9 @@ func initAsyncLogging(logger zerolog.Logger) {
 		bufferSize := getCachedAsyncLoggingBufferSize()
 		logChan = make(chan *logEntry, bufferSize)
 
+		logWorkerWg.Add(1)
 		go func() {
+			defer logWorkerWg.Done()
 			for entry := range logChan {
 				entry.event.Msg(entry.msg)
 			}
@@ -52,15 +58,59 @@ func logAsync(level zerolog.Level, event *zerolog.Event, msg string, ctx context
 	}
 
 	if asyncLoggingEnabled && logChan != nil {
+		logChanMu.Lock()
+		closed := logChanClosed
+		logChanMu.Unlock()
+
+		if closed {
+			// Channel is closed, log synchronously
+			event.Msg(msg)
+			return
+		}
+
 		select {
 		case logChan <- &logEntry{level: level, event: event, msg: msg, ctx: ctx}:
 			// Successfully queued, return immediately (fire-and-forget)
 		default:
 			// Channel full, drop log to avoid blocking request path
-			// Optionally could log synchronously here, but dropping is safer for high throughput
+			recordAsyncLogsDropped(1)
 		}
 	} else {
 		event.Msg(msg)
+	}
+}
+
+// shutdownAsyncLogging gracefully shuts down the async logging worker.
+// It closes the log channel, waits for the worker to finish processing remaining entries.
+// Returns true if shutdown completed successfully, false if timeout occurred.
+func shutdownAsyncLogging(timeout time.Duration) bool {
+	if !asyncLoggingEnabled || logChan == nil {
+		return true
+	}
+
+	logChanMu.Lock()
+	if logChanClosed {
+		logChanMu.Unlock()
+		return true
+	}
+	logChanClosed = true
+	close(logChan)
+	logChanMu.Unlock()
+
+	// Wait for worker to finish with timeout
+	done := make(chan struct{})
+	go func() {
+		logWorkerWg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Worker finished successfully
+		return true
+	case <-time.After(timeout):
+		// Timeout - worker didn't finish in time
+		return false
 	}
 }
 

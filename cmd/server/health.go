@@ -8,51 +8,108 @@ import (
 
 	"github.com/gcossani/ssfbff/internal/aggregator"
 	"github.com/gcossani/ssfbff/runtime"
-	"github.com/rs/zerolog"
 )
 
-// checkUpstreamHealth performs a quick health check on upstream services.
-// It attempts to connect to each provider's base URL to verify connectivity.
-// Only checks required (non-optional) providers - optional providers can fail without affecting health.
-func checkUpstreamHealth(agg *aggregator.Aggregator) bool {
-	if agg == nil {
-		return false
+// ProviderHealth represents the health status of a single provider.
+type ProviderHealth struct {
+	Healthy   bool   `json:"healthy"`
+	Status    string `json:"status"`    // "healthy", "unhealthy", "unchecked"
+	Error     string `json:"error,omitempty"`
+	Endpoint  string `json:"endpoint,omitempty"`
+}
+
+// HealthStatus represents the overall health status of the BFF and its upstream providers.
+type HealthStatus struct {
+	Healthy          bool                       `json:"healthy"`
+	FailureThreshold int                        `json:"failure_threshold"`
+	FailureCount     int                        `json:"failure_count"`
+	TotalRequired    int                        `json:"total_required"`
+	Providers        map[string]ProviderHealth `json:"providers"`
+}
+
+// checkUpstreamHealth performs a health check on upstream services and returns detailed status.
+// It checks each required (non-optional) provider individually and tracks per-provider status.
+// The overall health is determined by comparing failure count against the failure threshold.
+func checkUpstreamHealth(agg *aggregator.Aggregator) HealthStatus {
+	status := HealthStatus{
+		Healthy:          true,
+		FailureThreshold: getCachedHealthCheckFailureThreshold(),
+		Providers:        make(map[string]ProviderHealth),
 	}
-	
-	// Get a sample endpoint from each required provider to test connectivity
-	// This is a lightweight check - we just verify we can resolve and connect
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	
-	// Create a test dependency for each required (non-optional) provider
-	testDeps := make([]runtime.ProviderDep, 0)
+
+	if agg == nil {
+		status.Healthy = false
+		return status
+	}
+
 	providers := agg.GetProviders()
-	
+	timeout := getCachedHealthCheckTimeout()
+
+	// Check each required provider individually
 	for name, prov := range providers {
 		// Skip optional providers for health check
 		if prov.Optional {
+			status.Providers[name] = ProviderHealth{
+				Healthy: true,
+				Status:  "unchecked",
+			}
 			continue
 		}
-		
-		// Try to get the first endpoint for each required provider
-		for endpointName := range prov.Endpoints {
-			testDeps = append(testDeps, runtime.ProviderDep{
-				Provider: name,
+
+		// Skip providers with no endpoints (log warning, don't fail health check)
+		if len(prov.Endpoints) == 0 {
+			status.Providers[name] = ProviderHealth{
+				Healthy: true,
+				Status:  "unchecked",
+			}
+			continue
+		}
+
+		// Get the first endpoint for this provider
+		var endpointName string
+		for epName := range prov.Endpoints {
+			endpointName = epName
+			break
+		}
+
+		status.TotalRequired++
+
+		// Perform health check with short timeout
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		testDep := runtime.ProviderDep{
+			Provider: name,
+			Endpoint: endpointName,
+		}
+		_, err := agg.Fetch(ctx, []runtime.ProviderDep{testDep})
+		cancel()
+
+		if err != nil {
+			status.Providers[name] = ProviderHealth{
+				Healthy:  false,
+				Status:   "unhealthy",
+				Error:    err.Error(),
 				Endpoint: endpointName,
-			})
-			break // Just test one endpoint per provider
+			}
+			status.FailureCount++
+		} else {
+			status.Providers[name] = ProviderHealth{
+				Healthy:  true,
+				Status:   "healthy",
+				Endpoint: endpointName,
+			}
 		}
 	}
-	
-	if len(testDeps) == 0 {
+
+	// Determine overall health based on failure threshold
+	if status.TotalRequired == 0 {
 		// No required providers configured, consider healthy
-		return true
+		status.Healthy = true
+	} else {
+		// Healthy if failure count is within threshold
+		status.Healthy = status.FailureCount <= status.FailureThreshold
 	}
-	
-	// Try a quick fetch with a very short timeout
-	// Only required providers are checked, so any failure means unhealthy
-	_, err := agg.Fetch(ctx, testDeps)
-	return err == nil
+
+	return status
 }
 
 // setRouteLoggerIfAvailable sets the route logger if the generated SetRouteLogger function exists.

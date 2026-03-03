@@ -77,27 +77,28 @@ func ExtractPath(data []byte, path ...string) (jsontext.Value, error) {
 	}
 
 	dec := jsontext.NewDecoder(bytes.NewReader(data))
+	fullPath := strings.Join(path, ".")
 
 	for i, key := range path {
 		// We expect an object at each level of the path.
 		tok, err := dec.ReadToken()
 		if err != nil {
-			return nil, fmt.Errorf("reading object at path[%d] %q: %w", i, key, err)
+			return nil, fmt.Errorf("reading object at path %q (segment %d: %q): %w", fullPath, i, key, err)
 		}
 		if tok.Kind() != '{' {
-			return nil, fmt.Errorf("expected object at path[%d] %q, got %v", i, key, tok.Kind())
+			return nil, fmt.Errorf("expected object at path %q (segment %d: %q), got %v", fullPath, i, key, tok.Kind())
 		}
 
 		found := false
 		for dec.PeekKind() != '}' {
 			nameTok, err := dec.ReadToken()
 			if err != nil {
-				return nil, fmt.Errorf("reading field name at path[%d]: %w", i, err)
+				return nil, fmt.Errorf("reading field name at path %q (segment %d): %w", fullPath, i, err)
 			}
 
 			if nameTok.String() != key {
 				if err := dec.SkipValue(); err != nil {
-					return nil, fmt.Errorf("skipping field at path[%d]: %w", i, err)
+					return nil, fmt.Errorf("skipping field at path %q (segment %d): %w", fullPath, i, err)
 				}
 				continue
 			}
@@ -107,14 +108,14 @@ func ExtractPath(data []byte, path ...string) (jsontext.Value, error) {
 		}
 
 		if !found {
-			return nil, fmt.Errorf("field %q not found at path[%d]", key, i)
+			return nil, fmt.Errorf("field %q not found at path %q (segment %d)", key, fullPath, i)
 		}
 
 		// If this is the last key, read and return the value.
 		if i == len(path)-1 {
 			val, err := dec.ReadValue()
 			if err != nil {
-				return nil, fmt.Errorf("reading value for %q: %w", key, err)
+				return nil, fmt.Errorf("reading value for path %q (final segment %q): %w", fullPath, key, err)
 			}
 			return val, nil
 		}
@@ -179,8 +180,18 @@ func AverageFloat64(values []float64) float64 {
 // These mirror JSONata's built-in string functions. They accept any type and
 // coerce to string using ToString before operating.
 
-// ToString coerces any value to a string. nil → "", string → as-is,
-// everything else → fmt.Sprintf("%v", v).
+// ToString coerces any value to a string.
+//
+// Type coercion rules:
+//   - nil → ""
+//   - string → as-is
+//   - everything else → fmt.Sprintf("%v", v)
+//
+// Example:
+//
+//	ToString(42)        // "42"
+//	ToString("hello")   // "hello"
+//	ToString(nil)       // ""
 func ToString(v any) string {
 	if v == nil {
 		return ""
@@ -280,8 +291,21 @@ func JoinArray(v any, sep ...string) string {
 
 // --- Numeric functions ---
 
-// ToNumber coerces a value to float64. Strings are parsed, booleans map to
-// 0/1, nil → 0.
+// ToNumber coerces a value to float64.
+//
+// Type coercion rules:
+//   - float64, int, int64 → converted to float64
+//   - string → parsed as float64 (returns 0 on parse error)
+//   - bool → 1.0 if true, 0.0 if false
+//   - nil → 0.0
+//   - other types → 0.0
+//
+// Example:
+//
+//	ToNumber("42")      // 42.0
+//	ToNumber(42)        // 42.0
+//	ToNumber(true)      // 1.0
+//	ToNumber(nil)       // 0.0
 func ToNumber(v any) float64 {
 	switch val := v.(type) {
 	case float64:
@@ -356,6 +380,17 @@ func Exists(v any) bool { return v != nil }
 // These operate on Go any values (typically []any from JSON deserialization).
 
 // SortArray sorts a slice lexicographically by value.
+//
+// Input: expects []any (array of any type)
+// Output: returns []any (sorted copy of input)
+//
+// If input is not []any, returns the input unchanged.
+//
+// Example:
+//
+//	SortArray([]any{3, 1, 2})           // []any{1, 2, 3}
+//	SortArray([]any{"c", "a", "b"})     // []any{"a", "b", "c"}
+//	SortArray("not an array")            // "not an array" (unchanged)
 func SortArray(v any) any {
 	arr, ok := v.([]any)
 	if !ok {
@@ -370,6 +405,15 @@ func SortArray(v any) any {
 }
 
 // ReverseArray reverses the order of elements in a slice.
+//
+// Input: expects []any (array of any type)
+// Output: returns []any (reversed copy of input)
+//
+// If input is not []any, returns the input unchanged.
+//
+// Example:
+//
+//	ReverseArray([]any{1, 2, 3})        // []any{3, 2, 1}
 func ReverseArray(v any) any {
 	arr, ok := v.([]any)
 	if !ok {
@@ -383,6 +427,18 @@ func ReverseArray(v any) any {
 }
 
 // AppendArray concatenates two slices.
+//
+// Input: expects []any for both arguments (or converts single values to []any)
+// Output: returns []any (concatenated result)
+//
+// If both inputs are []any, concatenates them.
+// If one input is not []any, converts it to []any and concatenates.
+// If neither is []any, returns []any{v1, v2}.
+//
+// Example:
+//
+//	AppendArray([]any{1, 2}, []any{3, 4})  // []any{1, 2, 3, 4}
+//	AppendArray([]any{1}, 2)               // []any{1, 2}
 func AppendArray(v1, v2 any) any {
 	a1, ok1 := v1.([]any)
 	a2, ok2 := v2.([]any)
@@ -402,6 +458,16 @@ func AppendArray(v1, v2 any) any {
 }
 
 // DistinctArray removes duplicate values from a slice.
+//
+// Input: expects []any (array of any type)
+// Output: returns []any (deduplicated copy of input)
+//
+// If input is not []any, returns the input unchanged.
+// Duplicate detection uses string representation for comparison.
+//
+// Example:
+//
+//	DistinctArray([]any{1, 1, 2, 2, 3})    // []any{1, 2, 3}
 func DistinctArray(v any) any {
 	arr, ok := v.([]any)
 	if !ok {
@@ -422,6 +488,15 @@ func DistinctArray(v any) any {
 // --- Object functions ---
 
 // KeysMap returns the keys of a map[string]any as []any.
+//
+// Input: expects map[string]any (object/map)
+// Output: returns []any (sorted array of keys)
+//
+// If input is not map[string]any, returns nil.
+//
+// Example:
+//
+//	KeysMap(map[string]any{"a": 1, "b": 2})  // []any{"a", "b"}
 func KeysMap(v any) any {
 	m, ok := v.(map[string]any)
 	if !ok {
@@ -438,6 +513,19 @@ func KeysMap(v any) any {
 }
 
 // MergeArray merges an array of objects into a single object.
+//
+// Input: expects []any where each element is map[string]any
+// Output: returns map[string]any (merged object)
+//
+// If input is not []any, returns the input unchanged.
+// Only map[string]any elements are merged; other elements are ignored.
+//
+// Example:
+//
+//	MergeArray([]any{
+//	  map[string]any{"a": 1},
+//	  map[string]any{"b": 2},
+//	})  // map[string]any{"a": 1, "b": 2}
 func MergeArray(v any) any {
 	arr, ok := v.([]any)
 	if !ok {
@@ -455,6 +543,15 @@ func MergeArray(v any) any {
 }
 
 // TypeOf returns the JSONata type name of a value.
+//
+// Returns one of: "null", "boolean", "number", "string", "array", "object", "undefined"
+//
+// Example:
+//
+//	TypeOf(42)              // "number"
+//	TypeOf("hello")         // "string"
+//	TypeOf([]any{1, 2})     // "array"
+//	TypeOf(map[string]any{}) // "object"
 func TypeOf(v any) string {
 	if v == nil {
 		return "null"

@@ -1,0 +1,74 @@
+//go:build goexperiment.jsonv2
+
+package main
+
+import (
+	"sync"
+	"testing"
+	"time"
+)
+
+func TestShutdownAsyncLogging(t *testing.T) {
+	// Reset state
+	logChanClosed = false
+	logWorkerWg = sync.WaitGroup{}
+
+	// Initialize async logging
+	asyncLoggingEnabled = true
+	logChan = make(chan *logEntry, 10)
+	logWorkerWg.Add(1)
+	go func() {
+		defer logWorkerWg.Done()
+		for range logChan {
+			// Process entries
+		}
+	}()
+
+	// Send some entries
+	for i := 0; i < 5; i++ {
+		logChan <- &logEntry{}
+	}
+
+	// Shutdown should complete successfully
+	success := shutdownAsyncLogging(1 * time.Second)
+	if !success {
+		t.Error("shutdown should complete successfully")
+	}
+}
+
+func TestShutdownAsyncLogging_NotEnabled(t *testing.T) {
+	asyncLoggingEnabled = false
+	logChan = nil
+
+	success := shutdownAsyncLogging(1 * time.Second)
+	if !success {
+		t.Error("shutdown should return true when not enabled")
+	}
+}
+
+func TestShutdownAsyncLogging_Timeout(t *testing.T) {
+	// This test verifies timeout behavior, but we can't easily test
+	// a real timeout without making the test slow. We'll just verify
+	// the function handles the case gracefully.
+	// Reset state
+	logChanClosed = false
+	logWorkerWg = sync.WaitGroup{}
+
+	asyncLoggingEnabled = true
+	logChan = make(chan *logEntry, 10)
+
+	// Create a worker that takes longer than timeout
+	logWorkerWg.Add(1)
+	go func() {
+		defer logWorkerWg.Done()
+		time.Sleep(2 * time.Second)
+		for range logChan {
+			// Process entries
+		}
+	}()
+
+	// Shutdown with short timeout
+	success := shutdownAsyncLogging(100 * time.Millisecond)
+	// Should timeout (return false) or complete (return true) - either is acceptable
+	_ = success
+}

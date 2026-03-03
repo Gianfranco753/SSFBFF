@@ -51,6 +51,48 @@ var (
 		[]string{"status"},
 	)
 
+	// Async logging metrics
+	asyncLogsDroppedTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "async_logs_dropped_total",
+			Help: "Total number of async log entries dropped (channel full or during shutdown)",
+		},
+	)
+
+	// Health check metrics
+	healthCheckDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "health_check_duration_seconds",
+			Help:    "Duration of health check in seconds",
+			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5},
+		},
+	)
+
+	// Metrics batcher metrics
+	metricsDroppedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "metrics_dropped_total",
+			Help: "Total number of metrics dropped (batcher channel full or sampling)",
+		},
+		[]string{"reason"},
+	)
+
+	metricsBatcherChannelSize = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "metrics_batcher_channel_size",
+			Help: "Current number of metrics in the batcher channel",
+		},
+	)
+
+	// Shutdown metrics
+	shutdownDuration = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "shutdown_duration_seconds",
+			Help:    "Duration of graceful shutdown in seconds",
+			Buckets: []float64{0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0},
+		},
+	)
+
 	// Resource metrics
 	goRoutines = promauto.NewGauge(
 		prometheus.GaugeOpts{
@@ -245,6 +287,55 @@ func recordAggregatorOperation(status string) {
 
 // resourceMetricsEnabled returns true if resource metrics collection is enabled.
 var resourceMetricsEnabled = getCachedEnableResourceMetrics()
+
+// recordAsyncLogsDropped records dropped async log entries.
+func recordAsyncLogsDropped(count int) {
+	if !metricsEnabled {
+		return
+	}
+	if count <= 0 {
+		return
+	}
+	asyncLogsDroppedTotal.Add(float64(count))
+}
+
+// recordHealthCheckDuration records the duration of a health check.
+func recordHealthCheckDuration(duration time.Duration) {
+	if !metricsEnabled {
+		return
+	}
+	if !shouldSample() {
+		return
+	}
+	healthCheckDuration.Observe(duration.Seconds())
+}
+
+// recordMetricsDropped records when metrics are dropped.
+func recordMetricsDropped(reason string) {
+	if !metricsEnabled {
+		return
+	}
+	metricsDroppedTotal.WithLabelValues(reason).Inc()
+}
+
+// updateMetricsBatcherChannelSize updates the gauge for batcher channel size.
+func updateMetricsBatcherChannelSize(size int) {
+	if !metricsEnabled {
+		return
+	}
+	metricsBatcherChannelSize.Set(float64(size))
+}
+
+// recordShutdownDuration records the duration of graceful shutdown.
+func recordShutdownDuration(duration time.Duration) {
+	if !metricsEnabled {
+		return
+	}
+	if !shouldSample() {
+		return
+	}
+	shutdownDuration.Observe(duration.Seconds())
+}
 
 // updateResourceMetrics updates resource metrics (goroutines, memory).
 // Uses runtime.ReadMemStats which is expensive (stop-the-world), so this should be called infrequently.

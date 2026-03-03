@@ -353,17 +353,23 @@ func main() {
 		serverReadyMu.RUnlock()
 
 		if !ready {
-			return c.Status(503).SendString("not ready")
+			return c.Status(503).JSON(fiber.Map{
+				"healthy": false,
+				"reason":  "server not ready",
+			})
 		}
 
 		// Check upstream service availability
-		if serverAggregator != nil {
-			if !checkUpstreamHealth(serverAggregator) {
-				return c.Status(503).SendString("upstream services unavailable")
-			}
+		startTime := time.Now()
+		healthStatus := checkUpstreamHealth(serverAggregator)
+		duration := time.Since(startTime)
+		recordHealthCheckDuration(duration)
+
+		if !healthStatus.Healthy {
+			return c.Status(503).JSON(healthStatus)
 		}
 
-		return c.SendString("ready")
+		return c.JSON(healthStatus)
 	})
 
 	app.Get("/live", func(c fiber.Ctx) error {
@@ -391,10 +397,40 @@ func main() {
 	sig := <-quit
 	logger.Info().Str("signal", sig.String()).Msg("received signal, shutting down")
 
+	shutdownStart := time.Now()
+	shutdownTimeout := getCachedShutdownTimeout()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer shutdownCancel()
+
+	// Step 1: Stop accepting new requests (Fiber shutdown)
+	logger.Info().Msg("stopping HTTP server")
 	if err := app.ShutdownWithTimeout(10 * time.Second); err != nil {
-		logger.Fatal().Err(err).Msg("shutdown error")
+		logger.Error().Err(err).Msg("HTTP server shutdown error")
 	}
-	logger.Info().Msg("server stopped")
+
+	// Step 2: Wait for in-flight aggregator requests
+	// The aggregator uses context cancellation, so in-flight requests will be cancelled
+	// when shutdownCtx is cancelled. We give them a moment to finish.
+	logger.Info().Msg("waiting for in-flight requests")
+	time.Sleep(1 * time.Second) // Brief pause for in-flight requests to complete
+
+	// Step 3: Drain metrics batcher
+	logger.Info().Msg("draining metrics batcher")
+	shutdownMetricsBatcher()
+
+	// Step 4: Shutdown async logging worker
+	logger.Info().Msg("shutting down async logging worker")
+	asyncLogTimeout := 5 * time.Second
+	if !shutdownAsyncLogging(asyncLogTimeout) {
+		logger.Warn().Msg("async logging worker did not finish in time")
+	}
+
+	// Step 5 & 6: OpenTelemetry and metrics shutdown are handled by defer functions
+	// They will be called when we return from main
+
+	shutdownDuration := time.Since(shutdownStart)
+	recordShutdownDuration(shutdownDuration)
+	logger.Info().Dur("duration", shutdownDuration).Msg("server stopped")
 }
 
 // loadProviders reads all .yaml files from a directory.
@@ -421,6 +457,12 @@ func loadProviders(dir string) (map[string]aggregator.ProviderConfig, error) {
 		if err := yaml.Unmarshal(data, &pc); err != nil {
 			return nil, fmt.Errorf("parsing %s: %w", entry.Name(), err)
 		}
+
+		// Validate provider configuration
+		if err := aggregator.ValidateProviderConfig(name, pc); err != nil {
+			return nil, fmt.Errorf("invalid configuration in %s: %w", entry.Name(), err)
+		}
+
 		providers[name] = pc
 	}
 	return providers, nil

@@ -17,6 +17,7 @@ GOEXPERIMENT=jsonv2 go run ./cmd/server/
 
 # 3. Test
 curl http://localhost:3000/health
+curl http://localhost:3000/ready
 curl http://localhost:3000/dashboard
 curl http://localhost:3000/api/v1/orders
 ```
@@ -184,6 +185,8 @@ endpoints:
 
 **Connection Pool Configuration**: Each provider gets its own isolated HTTP client with a dedicated connection pool. This prevents one slow provider from exhausting connections needed by others. Pool sizes can be configured per-provider in YAML or globally via environment variables.
 
+**Configuration Validation**: Provider configurations are validated at startup. Invalid configurations (malformed URLs, negative timeouts, empty endpoints, etc.) cause the server to fail with descriptive error messages. This ensures configuration errors are caught early rather than at runtime.
+
 ## Adding a New Endpoint
 
 ### 1. Write the JSONata expression
@@ -319,6 +322,9 @@ go run ./cmd/apigen --spec=<openapi.yaml> --jsonata-dir=<dir> [--proxies=<proxie
 | `FIBER_READ_TIMEOUT` | Read timeout (e.g., `5s`) | `5s` |
 | `FIBER_WRITE_TIMEOUT` | Write timeout (e.g., `10s`) | `10s` |
 | `FIBER_IDLE_TIMEOUT` | Idle timeout (e.g., `120s`) | `120s` |
+| `SHUTDOWN_TIMEOUT` | Graceful shutdown timeout (e.g., `30s`) | `30s` |
+| `HEALTH_CHECK_TIMEOUT` | Health check timeout per provider (e.g., `500ms`) | `500ms` |
+| `HEALTH_CHECK_FAILURE_THRESHOLD` | Maximum allowed provider failures for health check (0 = all must be healthy) | `0` |
 
 ### Proxy
 
@@ -369,6 +375,38 @@ The server includes several performance optimizations for high-throughput scenar
 | `METRICS_LABEL_CACHE_ENABLED` | Enable label value caching to avoid WithLabelValues() lookups | `true` |
 | `ASYNC_LOGGING` | Use async logging channel to avoid blocking request path | `false` |
 | `ASYNC_LOGGING_BUFFER_SIZE` | Size of async logging buffer | `1000` |
+
+### Available Metrics
+
+The server exposes the following Prometheus metrics:
+
+**HTTP Metrics:**
+- `http_errors_total` — Counter of HTTP errors by endpoint, method, and status code
+
+**Upstream Metrics:**
+- `upstream_call_duration_seconds` — Histogram of upstream HTTP call durations by provider, endpoint, and status
+- `upstream_errors_total` — Counter of upstream errors by provider, endpoint, and error type
+
+**Aggregator Metrics:**
+- `aggregator_operations_total` — Counter of aggregator operations by status (success/failure)
+
+**Health Check Metrics:**
+- `health_check_duration_seconds` — Histogram of health check durations
+
+**Shutdown Metrics:**
+- `shutdown_duration_seconds` — Histogram of graceful shutdown durations
+
+**Metrics Batcher Metrics:**
+- `metrics_dropped_total` — Counter of dropped metrics by reason (batcher_full, sampling)
+- `metrics_batcher_channel_size` — Gauge of current metrics in the batcher channel
+
+**Async Logging Metrics:**
+- `async_logs_dropped_total` — Counter of async log entries dropped (channel full or during shutdown)
+
+**Resource Metrics (if enabled):**
+- `go_goroutines` — Number of goroutines
+- `go_memstats_alloc_bytes` — Bytes allocated and still in use
+- `go_memstats_sys_bytes` — Bytes obtained from system
 
 **High-Throughput Configuration Example**:
 
@@ -424,6 +462,103 @@ FIBER_CONCURRENCY=512 \
 MAX_IDLE_CONNS_PER_HOST=5000 \
 MAX_CONNS_PER_HOST=10000 \
 GOEXPERIMENT=jsonv2 go run ./cmd/server/
+```
+
+## Health Checks
+
+The server provides three health check endpoints:
+
+- `/health` — Basic liveness check (always returns "ok" if server is running)
+- `/live` — Liveness check (always returns "ok" if server is running)
+- `/ready` — Readiness check with detailed upstream provider status
+
+### `/ready` Endpoint
+
+The `/ready` endpoint performs health checks on all required (non-optional) upstream providers and returns detailed status information.
+
+**When healthy** (HTTP 200):
+```json
+{
+  "healthy": true,
+  "failure_threshold": 0,
+  "failure_count": 0,
+  "total_required": 2,
+  "providers": {
+    "user_service": {
+      "healthy": true,
+      "status": "healthy",
+      "endpoint": "profile"
+    },
+    "bank_service": {
+      "healthy": true,
+      "status": "healthy",
+      "endpoint": "accounts"
+    }
+  }
+}
+```
+
+**When unhealthy** (HTTP 503):
+```json
+{
+  "healthy": false,
+  "failure_threshold": 0,
+  "failure_count": 1,
+  "total_required": 2,
+  "providers": {
+    "user_service": {
+      "healthy": true,
+      "status": "healthy",
+      "endpoint": "profile"
+    },
+    "bank_service": {
+      "healthy": false,
+      "status": "unhealthy",
+      "error": "GET request to http://bank-svc:8080/api/accounts failed: context deadline exceeded",
+      "endpoint": "accounts"
+    }
+  }
+}
+```
+
+**Health Check Behavior:**
+- Only required (non-optional) providers are checked
+- Optional providers are marked as "unchecked" and don't affect health status
+- Providers with no endpoints are marked as "unchecked" (logs a warning)
+- Each provider is checked individually with a short timeout (configurable via `HEALTH_CHECK_TIMEOUT`)
+- Overall health is determined by comparing failure count against `HEALTH_CHECK_FAILURE_THRESHOLD`
+- Health check duration is recorded in the `health_check_duration_seconds` metric
+
+## Graceful Shutdown
+
+The server implements comprehensive graceful shutdown to ensure in-flight requests complete and resources are properly cleaned up.
+
+**Shutdown Sequence:**
+1. Stop accepting new HTTP requests (Fiber shutdown)
+2. Wait for in-flight aggregator requests to complete (context cancellation)
+3. Drain metrics batcher (flush remaining metric updates)
+4. Shutdown async logging worker (close channel, wait for remaining entries)
+5. Shutdown OpenTelemetry (flush traces)
+6. Shutdown metrics (cleanup)
+
+The entire shutdown process is bounded by `SHUTDOWN_TIMEOUT` (default 30s). Shutdown duration is recorded in the `shutdown_duration_seconds` metric.
+
+**Configuration:**
+- `SHUTDOWN_TIMEOUT` — Maximum time allowed for graceful shutdown (default: 30s)
+
+## Error Handling
+
+The server provides enhanced error messages with additional context to aid debugging:
+
+- **Provider endpoint errors** — When an endpoint is not found, the error message lists all available endpoints for that provider
+- **HTTP request errors** — Include the HTTP method and full URL in error messages
+- **JSON path extraction errors** — Include the full path attempted when extraction fails
+
+Example error messages:
+```
+provider "user_service" has no endpoint "invalid" (available: [profile, settings])
+GET request to http://user-svc:8080/api/profile failed: context deadline exceeded
+field "name" not found at path "user.profile.name" (segment 2)
 ```
 
 ## Tracing & Observability

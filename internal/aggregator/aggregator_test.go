@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -195,5 +196,101 @@ func TestFetchDefaultTimeout(t *testing.T) {
 	}
 	if timeout != 10*time.Second {
 		t.Errorf("default timeout = %v, want 10s", timeout)
+	}
+}
+
+func TestValidateProviderConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     ProviderConfig
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name: "valid config",
+			cfg: ProviderConfig{
+				BaseURL:   "http://example.com",
+				Timeout:   5 * time.Second,
+				Endpoints: makeEndpoints(map[string]string{"ep": "/api/ep"}),
+			},
+			wantErr: false,
+		},
+		{
+			name: "empty base_url",
+			cfg: ProviderConfig{
+				BaseURL:   "",
+				Endpoints: makeEndpoints(map[string]string{"ep": "/api/ep"}),
+			},
+			wantErr: true,
+			errMsg:  "base_url is required",
+		},
+		{
+			name: "invalid base_url",
+			cfg: ProviderConfig{
+				BaseURL:   "not-a-url",
+				Endpoints: makeEndpoints(map[string]string{"ep": "/api/ep"}),
+			},
+			wantErr: true,
+			errMsg:  "invalid base_url",
+		},
+		{
+			name: "negative timeout",
+			cfg: ProviderConfig{
+				BaseURL:   "http://example.com",
+				Timeout:   -1 * time.Second,
+				Endpoints: makeEndpoints(map[string]string{"ep": "/api/ep"}),
+			},
+			wantErr: true,
+			errMsg:  "timeout cannot be negative",
+		},
+		{
+			name: "no endpoints",
+			cfg: ProviderConfig{
+				BaseURL:   "http://example.com",
+				Endpoints: makeEndpoints(map[string]string{}),
+			},
+			wantErr: true,
+			errMsg:  "at least one endpoint is required",
+		},
+		{
+			name: "empty endpoint path",
+			cfg: ProviderConfig{
+				BaseURL: "http://example.com",
+				Endpoints: map[string]EndpointConfig{
+					"ep": {Path: ""},
+				},
+			},
+			wantErr: true,
+			errMsg:  "empty path",
+		},
+		{
+			name: "negative endpoint timeout",
+			cfg: ProviderConfig{
+				BaseURL: "http://example.com",
+				Endpoints: map[string]EndpointConfig{
+					"ep": {Path: "/api/ep", Timeout: -1 * time.Second},
+				},
+			},
+			wantErr: true,
+			errMsg:  "timeout cannot be negative",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateProviderConfig("test_provider", tt.cfg)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				if tt.errMsg != "" && !strings.Contains(err.Error(), tt.errMsg) {
+					t.Errorf("error message %q does not contain %q", err.Error(), tt.errMsg)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+			}
+		})
 	}
 }

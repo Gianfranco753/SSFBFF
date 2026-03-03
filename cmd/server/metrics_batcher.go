@@ -90,6 +90,8 @@ func (mb *metricsBatcher) worker() {
 			}
 		}
 		batch = batch[:0]
+		// Update channel size gauge after flush
+		updateMetricsBatcherChannelSize(len(mb.updates))
 	}
 
 	for {
@@ -99,6 +101,11 @@ func (mb *metricsBatcher) worker() {
 			return
 		case update := <-mb.updates:
 			batch = append(batch, update)
+			// Only update channel size gauge periodically to avoid hot path overhead
+			// Update every 10 items or on flush
+			if len(batch)%10 == 0 {
+				updateMetricsBatcherChannelSize(len(mb.updates))
+			}
 			if len(batch) >= mb.batchSize {
 				flush()
 			}
@@ -116,7 +123,10 @@ func (mb *metricsBatcher) recordCounterInc(counter prometheus.Counter) {
 
 	select {
 	case mb.updates <- metricUpdate{typ: updateTypeCounterInc, counter: counter}:
+		// Don't update channel size here - let worker update periodically
 	default:
+		// Channel full, fallback to synchronous recording
+		recordMetricsDropped("batcher_full")
 		counter.Inc()
 	}
 }
@@ -129,7 +139,10 @@ func (mb *metricsBatcher) recordHistogramObserve(hist prometheus.Observer, value
 
 	select {
 	case mb.updates <- metricUpdate{typ: updateTypeHistogramObserve, hist: hist, value: value}:
+		// Don't update channel size here - let worker update periodically
 	default:
+		// Channel full, fallback to synchronous recording
+		recordMetricsDropped("batcher_full")
 		hist.Observe(value)
 	}
 }
@@ -146,9 +159,15 @@ func shouldSample() bool {
 		return true
 	}
 	if metricsSampleRate <= 0.0 {
+		// Record that metrics were dropped due to sampling
+		recordMetricsDropped("sampling")
 		return false
 	}
 	// Use nanosecond timestamp modulo for pseudo-random sampling
 	// This provides consistent sampling without requiring a random number generator
-	return time.Now().UnixNano()%10000 < int64(metricsSampleRate*10000)
+	sampled := time.Now().UnixNano()%10000 < int64(metricsSampleRate*10000)
+	if !sampled {
+		recordMetricsDropped("sampling")
+	}
+	return sampled
 }

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -74,6 +75,42 @@ type Aggregator struct {
 	hasRecordAggregatorOp bool
 }
 
+// ValidateProviderConfig validates a provider configuration and returns an error if invalid.
+// It checks that base_url is a valid URL, timeouts are non-negative, and at least one
+// endpoint is defined with a non-empty path.
+func ValidateProviderConfig(name string, cfg ProviderConfig) error {
+	if cfg.BaseURL == "" {
+		return fmt.Errorf("provider %q: base_url is required", name)
+	}
+
+	parsedURL, err := url.Parse(cfg.BaseURL)
+	if err != nil {
+		return fmt.Errorf("provider %q: invalid base_url %q: %w", name, cfg.BaseURL, err)
+	}
+	if parsedURL.Scheme == "" || parsedURL.Host == "" {
+		return fmt.Errorf("provider %q: base_url %q must include scheme and host", name, cfg.BaseURL)
+	}
+
+	if cfg.Timeout < 0 {
+		return fmt.Errorf("provider %q: timeout cannot be negative (got %v)", name, cfg.Timeout)
+	}
+
+	if len(cfg.Endpoints) == 0 {
+		return fmt.Errorf("provider %q: at least one endpoint is required", name)
+	}
+
+	for endpointName, endpointCfg := range cfg.Endpoints {
+		if endpointCfg.Path == "" {
+			return fmt.Errorf("provider %q: endpoint %q has empty path", name, endpointName)
+		}
+		if endpointCfg.Timeout < 0 {
+			return fmt.Errorf("provider %q: endpoint %q timeout cannot be negative (got %v)", name, endpointName, endpointCfg.Timeout)
+		}
+	}
+
+	return nil
+}
+
 // New creates an Aggregator from a provider config map and a client factory function.
 // The factory function is called for each provider to create a dedicated HTTP client
 // with its own connection pool.
@@ -82,11 +119,19 @@ func New(providers map[string]ProviderConfig, createClient func(ProviderConfig) 
 }
 
 // NewWithObservability creates an Aggregator with optional observability configuration.
+// It validates all provider configurations before creating clients.
 func NewWithObservability(providers map[string]ProviderConfig, createClient func(ProviderConfig) *http.Client, obsConfig *ObservabilityConfig) *Aggregator {
 	resolved := make(map[string]ProviderConfig, len(providers))
 	clients := make(map[string]*http.Client, len(providers))
 
 	for name, prov := range providers {
+		// Validate configuration before processing
+		if err := ValidateProviderConfig(name, prov); err != nil {
+			// This should not happen if validation was done in loadProviders,
+			// but we validate again here as a safety check.
+			panic(fmt.Sprintf("invalid provider config for %q: %v", name, err))
+		}
+
 		// Normalize: strip trailing slash so endpoint paths join cleanly.
 		prov.BaseURL = strings.TrimRight(prov.BaseURL, "/")
 		// Apply default timeout once.
@@ -244,7 +289,12 @@ func (a *Aggregator) resolveURL(dep runtime.ProviderDep) (url string, timeout ti
 
 	endpointCfg, ok := prov.Endpoints[dep.Endpoint]
 	if !ok {
-		return "", 0, prov.Optional, fmt.Errorf("provider %q has no endpoint %q", dep.Provider, dep.Endpoint)
+		// List available endpoints for better error context
+		available := make([]string, 0, len(prov.Endpoints))
+		for k := range prov.Endpoints {
+			available = append(available, k)
+		}
+		return "", 0, prov.Optional, fmt.Errorf("provider %q has no endpoint %q (available: %v)", dep.Provider, dep.Endpoint, available)
 	}
 
 	// Timeout precedence: endpoint-specific > provider-level > global default (10s)
@@ -280,7 +330,7 @@ func (a *Aggregator) doRequest(ctx context.Context, dep runtime.ProviderDep, url
 
 	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
 	if err != nil {
-		return nil, 0, fmt.Errorf("building request: %w", err)
+		return nil, 0, fmt.Errorf("building %s request to %s: %w", method, url, err)
 	}
 
 	for k, v := range dep.Headers {
@@ -289,17 +339,17 @@ func (a *Aggregator) doRequest(ctx context.Context, dep runtime.ProviderDep, url
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, 0, fmt.Errorf("request to %s: %w", url, err)
+		return nil, 0, fmt.Errorf("%s request to %s failed: %w", method, url, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return nil, resp.StatusCode, fmt.Errorf("%s returned %d", url, resp.StatusCode)
+		return nil, resp.StatusCode, fmt.Errorf("%s request to %s returned status %d", method, url, resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, resp.StatusCode, fmt.Errorf("reading response body: %w", err)
+		return nil, resp.StatusCode, fmt.Errorf("reading response body from %s %s: %w", method, url, err)
 	}
 	
 	return body, resp.StatusCode, nil
