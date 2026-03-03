@@ -165,7 +165,7 @@ type configRoute struct {
 	Path     string
 	FuncName string      // e.g. "TransformOrders"
 	ReqKeys  requestKeys // which request fields are actually referenced
-	ProxyEnv string      // if set, this route is a proxy (e.g. "DOWNSTREAM" -> UPSTREAM_DOWNSTREAM_URL)
+	ProxyURL string      // if set, this route is a proxy with the target URL
 }
 
 // requestKeys tracks which specific request fields a JSONata expression uses.
@@ -243,14 +243,9 @@ func parseConfig(path, jsonataDir string) ([]configRoute, error) {
 	var routes []configRoute
 	for _, r := range cfg.Routes {
 		if r.Proxy != "" {
-			// Proxy route: skip JSONata processing
-			proxyEnv := strings.ToUpper(r.Proxy)
-			routes = append(routes, configRoute{
-				Method:   capitalizeFirst(r.Method),
-				Path:     r.Path,
-				ProxyEnv: proxyEnv,
-			})
-			continue
+			// Legacy proxy route: still supports proxy field for backward compatibility
+			// but this should be migrated to proxies.yaml with url field
+			return nil, fmt.Errorf("route %s %s: proxy field is deprecated, use proxies.yaml with url field instead", r.Method, r.Path)
 		}
 
 		// Regular JSONata route
@@ -292,7 +287,7 @@ func parseProxies(path string) ([]configRoute, error) {
 		Routes []struct {
 			Path   string `yaml:"path"`
 			Method string `yaml:"method"`
-			Proxy  string `yaml:"proxy"`
+			URL    string `yaml:"url"`
 		} `yaml:"routes"`
 	}
 
@@ -302,14 +297,13 @@ func parseProxies(path string) ([]configRoute, error) {
 
 	var routes []configRoute
 	for _, r := range cfg.Routes {
-		if r.Proxy == "" {
-			return nil, fmt.Errorf("route %s %s: missing proxy field", r.Method, r.Path)
+		if r.URL == "" {
+			return nil, fmt.Errorf("route %s %s: missing url field", r.Method, r.Path)
 		}
-		proxyEnv := strings.ToUpper(r.Proxy)
 		routes = append(routes, configRoute{
 			Method:   capitalizeFirst(r.Method),
 			Path:     r.Path,
-			ProxyEnv: proxyEnv,
+			ProxyURL: r.URL,
 		})
 	}
 	return routes, nil
@@ -321,7 +315,7 @@ func generateConfigRoutes(routes []configRoute, pkg, genPkg string) ([]byte, err
 
 	hasProxy := false
 	for _, r := range routes {
-		if r.ProxyEnv != "" {
+		if r.ProxyURL != "" {
 			hasProxy = true
 			break
 		}
@@ -335,7 +329,6 @@ func generateConfigRoutes(routes []configRoute, pkg, genPkg string) ([]byte, err
 		w("\t\"bytes\"\n")
 		w("\t\"io\"\n")
 		w("\t\"net/http\"\n")
-		w("\t\"os\"\n")
 		w("\t\"strings\"\n")
 	}
 	w("\t\"github.com/gofiber/fiber/v3\"\n")
@@ -356,14 +349,10 @@ func generateConfigRoutes(routes []configRoute, pkg, genPkg string) ([]byte, err
 	}
 
 	for _, r := range routes {
-		if r.ProxyEnv != "" {
+		if r.ProxyURL != "" {
 			// Proxy route: forward request to downstream server without modification
-			envVar := "UPSTREAM_" + r.ProxyEnv + "_URL"
 			w("\tapp.%s(%q, func(c fiber.Ctx) error {\n", r.Method, r.Path)
-			w("\t\tupstreamURL := os.Getenv(%q)\n", envVar)
-			w("\t\tif upstreamURL == \"\" {\n")
-			w("\t\t\treturn fiber.NewError(fiber.StatusServiceUnavailable, \"%s not configured\")\n", envVar)
-			w("\t\t}\n\n")
+			w("\t\tupstreamURL := %q\n", r.ProxyURL)
 			w("\t\t// Build target URL: append request path to upstream base URL\n")
 			w("\t\t// If route path ends with /*, strip the prefix before the wildcard\n")
 			w("\t\ttargetPath := c.Path()\n")

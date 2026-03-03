@@ -145,10 +145,10 @@ Pass-through proxy routes that forward requests directly to downstream services 
 routes:
   - path: /proxy/*
     method: ALL
-    proxy: downstream
+    url: http://downstream-service:8080
 ```
 
-The `proxy` field value maps to an environment variable: `proxy: downstream` → `UPSTREAM_DOWNSTREAM_URL`.
+Each route specifies the target `url` where requests should be forwarded. The URL can include the full path, and the request path (after the route prefix) will be appended.
 
 ### `data/providers/*.yaml`
 
