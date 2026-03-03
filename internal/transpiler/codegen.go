@@ -592,7 +592,7 @@ func generateFetchFilter(plan *ProviderPlan, packageName, sourceFile, expression
 	// Execute function: fetch via aggregator → filter → marshal to JSON.
 	baseName := strings.TrimPrefix(plan.FuncName, "Transform")
 	depKey := field.Provider + "." + field.Endpoint
-	w("func Execute%s(ctx context.Context, agg *aggregator.Aggregator, req runtime.RequestContext) ([]byte, error) {\n", baseName)
+	w("func Execute%s(ctx context.Context, agg *aggregator.Aggregator, req runtime.RequestContext) (*runtime.Response, error) {\n", baseName)
 	w("\tdeps := []runtime.ProviderDep{{Provider: %q, Endpoint: %q}}\n", field.Provider, field.Endpoint)
 	w("\tresults, err := agg.Fetch(ctx, deps)\n")
 	w("\tif err != nil {\n")
