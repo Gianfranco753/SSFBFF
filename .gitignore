@@ -4,9 +4,9 @@
 *.dll
 *.so
 *.dylib
-apigen
-server
-mockserver
+/apigen
+/server
+/mockserver
 
 # Test binary, built with `go test -c`
 *.test

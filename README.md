@@ -4,7 +4,7 @@ A code-generation pipeline that compiles [JSONata](https://jsonata.org/) express
 
 ## Requirements
 
-- Go 1.26+ with `GOEXPERIMENT=jsonv2`
+- Go 1.25.0+ with `GOEXPERIMENT=jsonv2`
 
 ## Quick Start
 
@@ -237,7 +237,7 @@ SSFBFF/
 │   ├── apigen/main.go              # Route generator (openapi.yaml → Fiber routes)
 │   ├── server/
 │   │   ├── main.go                 # Fiber v3 server entry point
-│   │   ├── fetch.go                # HTTP fetcher with sync.Pool
+│   │   ├── telemetry.go            # OpenTelemetry tracing setup
 │   │   └── routes_gen.go           # Generated (gitignored)
 │   └── transpiler/main.go          # JSONata → Go generator
 ├── data/                           # All BFF configuration

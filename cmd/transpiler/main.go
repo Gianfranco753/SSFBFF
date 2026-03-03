@@ -52,8 +52,9 @@ func main() {
 		fatal("parsing JSONata expression: %v", err)
 	}
 
-	// All expressions use $fetch() or $service() calls — always use the
-	// provider codegen path.
+	// Always use the provider codegen path. This handles both fetch mode
+	// (expressions with $fetch()/$service()/$request()) and fetchFilter mode
+	// ($fetch(p,e)[filter].{projection}).
 	baseName := strings.TrimSuffix(filepath.Base(*input), filepath.Ext(*input))
 	funcName := "Transform" + transpiler.ExportedName(baseName)
 
