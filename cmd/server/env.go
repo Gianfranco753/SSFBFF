@@ -18,68 +18,71 @@ var (
 	envCache struct {
 		mu sync.RWMutex
 
-	// Server configuration
-	port                    string
-	dataDir                 string
-	maxIdleConnsPerHost     int
-	maxConnsPerHost         int
-	idleConnTimeout         time.Duration
-	dialTimeout             time.Duration
-	keepAlive               time.Duration
+		// Server configuration
+		port                string
+		dataDir             string
+		maxIdleConnsPerHost int
+		maxConnsPerHost     int
+		idleConnTimeout     time.Duration
+		dialTimeout         time.Duration
+		keepAlive           time.Duration
 
-	// Fiber configuration
-	fiberPrefork            bool
-	fiberConcurrency        int
-	fiberBodyLimit          int
-	fiberReadTimeout        time.Duration
-	fiberWriteTimeout       time.Duration
-	fiberIdleTimeout        time.Duration
+		// Fiber configuration
+		fiberPrefork      bool
+		fiberConcurrency  int
+		fiberBodyLimit    int
+		fiberReadTimeout  time.Duration
+		fiberWriteTimeout time.Duration
+		fiberIdleTimeout  time.Duration
 
-	// Logging configuration
-	logLevel                string
-	logFormat               string
-	asyncLogging            bool
-	enableErrorLogging      bool
-	asyncLoggingBufferSize  int
+		// Logging configuration
+		logLevel               string
+		logFormat              string
+		asyncLogging           bool
+		enableErrorLogging     bool
+		asyncLoggingBufferSize int
 
-	// OpenTelemetry configuration
-	otelSDKDisabled         bool
-	otelTracesExporter      string
-	otelDisableTracing       bool
-	otelServiceName          string
-	otelPropagateUpstream    bool
-	otelPropagateDownstream  bool
-	otelExporterOTLPEndpoint string
-	otelExporterOTLPTracesEndpoint string
+		// OpenTelemetry configuration
+		otelSDKDisabled                bool
+		otelTracesExporter             string
+		otelDisableTracing             bool
+		otelServiceName                string
+		otelPropagateUpstream          bool
+		otelPropagateDownstream        bool
+		otelExporterOTLPEndpoint       string
+		otelExporterOTLPTracesEndpoint string
 
-	// Metrics configuration
-	enableMetrics            bool
-	metricsLabelCacheEnabled bool
-	metricsCacheTTL          int
-	metricsBatchingEnabled   bool
-	metricsBatchSize         int
-	metricsBatchInterval     time.Duration
-	metricsSampleRate        float64
-	metricsBatcherChannelSize int
+		// Metrics configuration
+		enableMetrics             bool
+		metricsLabelCacheEnabled  bool
+		metricsCacheTTL           int
+		metricsBatchingEnabled    bool
+		metricsBatchSize          int
+		metricsBatchInterval      time.Duration
+		metricsSampleRate         float64
+		metricsBatcherChannelSize int
 
-	// Middleware configuration
-	useTraceIDAsRequestID    bool
+		// Middleware configuration
+		useTraceIDAsRequestID bool
 
-	// Health check configuration
-	healthCheckTimeout        time.Duration
-	healthCheckFailureThreshold int
+		// Health check configuration
+		healthCheckTimeout          time.Duration
+		healthCheckFailureThreshold int
 
-	// Shutdown configuration
-	shutdownTimeout          time.Duration
+		// Shutdown configuration
+		shutdownTimeout time.Duration
 
-	// Documentation configuration
-	enableDocs               bool
+		// Documentation configuration
+		enableDocs bool
 
-	// Proxy configuration (cached to avoid http.ProxyFromEnvironment overhead)
-	httpProxy                *url.URL
-	httpsProxy               *url.URL
-	noProxy                  []string
-	proxyFunc                func(*http.Request) (*url.URL, error)
+		// Response body size limit
+		maxResponseBodySize int
+
+		// Proxy configuration (cached to avoid http.ProxyFromEnvironment overhead)
+		httpProxy  *url.URL
+		httpsProxy *url.URL
+		noProxy    []string
+		proxyFunc  func(*http.Request) (*url.URL, error)
 	}
 	envCacheOnce sync.Once
 )
@@ -151,6 +154,9 @@ func initEnvCache() {
 
 	// Documentation configuration
 	envCache.enableDocs = getEnvBool("ENABLE_DOCS", true)
+
+	// Response body size limit
+	envCache.maxResponseBodySize = getEnvInt("MAX_RESPONSE_BODY_SIZE", 10*1024*1024)
 
 	// Proxy configuration - parse once and cache
 	envCache.httpProxy = parseProxyURL(getEnvString("HTTP_PROXY", ""))
@@ -377,6 +383,11 @@ func getCachedEnableDocs() bool {
 	return envCache.enableDocs
 }
 
+func getCachedMaxResponseBodySize() int {
+	ensureCacheInitialized()
+	return envCache.maxResponseBodySize
+}
+
 func getCachedProxyFunc() func(*http.Request) (*url.URL, error) {
 	ensureCacheInitialized()
 	return envCache.proxyFunc
@@ -547,6 +558,7 @@ func resetEnvCacheForTesting() {
 	envCache.metricsSampleRate = 0
 	envCache.useTraceIDAsRequestID = false
 	envCache.enableDocs = false
+	envCache.maxResponseBodySize = 0
 	envCache.httpProxy = nil
 	envCache.httpsProxy = nil
 	envCache.noProxy = nil

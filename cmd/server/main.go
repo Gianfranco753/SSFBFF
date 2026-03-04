@@ -263,7 +263,8 @@ func main() {
 		RecordUpstreamError: recordUpstreamError,
 		RecordAggregatorOp:  recordAggregatorOperation,
 	}
-	agg := aggregator.NewWithObservability(providers, createProviderClient, obsConfig)
+	maxResponseBodySize := getCachedMaxResponseBodySize()
+	agg := aggregator.NewWithObservability(providers, createProviderClient, obsConfig, maxResponseBodySize)
 	serverAggregator = agg
 
 	// Configure Fiber for high performance

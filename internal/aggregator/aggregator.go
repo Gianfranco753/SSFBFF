@@ -92,6 +92,7 @@ type Aggregator struct {
 	providers map[string]ProviderConfig
 	clients   map[string]*http.Client // Per-provider clients with isolated connection pools
 	obsConfig *ObservabilityConfig   // Optional observability configuration
+	MaxResponseBodySize int // Maximum response body size in bytes
 	
 	// Feature flags set at initialization to avoid nil checks in hot path
 	hasObservability      bool
@@ -141,12 +142,13 @@ func ValidateProviderConfig(name string, cfg ProviderConfig) error {
 // The factory function is called for each provider to create a dedicated HTTP client
 // with its own connection pool.
 func New(providers map[string]ProviderConfig, createClient func(ProviderConfig) *http.Client) *Aggregator {
-	return NewWithObservability(providers, createClient, nil)
+	return NewWithObservability(providers, createClient, nil, 10*1024*1024) // Default 10MB
 }
 
 // NewWithObservability creates an Aggregator with optional observability configuration.
 // It validates all provider configurations before creating clients.
-func NewWithObservability(providers map[string]ProviderConfig, createClient func(ProviderConfig) *http.Client, obsConfig *ObservabilityConfig) *Aggregator {
+// maxResponseBodySize is the maximum size in bytes for response bodies (default 10MB if 0).
+func NewWithObservability(providers map[string]ProviderConfig, createClient func(ProviderConfig) *http.Client, obsConfig *ObservabilityConfig, maxResponseBodySize int) *Aggregator {
 	resolved := make(map[string]ProviderConfig, len(providers))
 	clients := make(map[string]*http.Client, len(providers))
 
@@ -168,10 +170,15 @@ func NewWithObservability(providers map[string]ProviderConfig, createClient func
 		clients[name] = createClient(prov)
 	}
 
+	if maxResponseBodySize == 0 {
+		maxResponseBodySize = 10 * 1024 * 1024 // Default 10MB
+	}
+
 	agg := &Aggregator{
 		providers: resolved,
 		clients:   clients,
 		obsConfig: obsConfig,
+		MaxResponseBodySize: maxResponseBodySize,
 	}
 	
 	// Set feature flags once at initialization to avoid repeated nil checks
@@ -317,11 +324,10 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 								Msg("optional provider failed, using null")
 						}
 					}
-				return nil
-			}
-			// Sanitize error before returning to client
-			sanitizedMsg := runtime.SanitizeError(err)
-			return fmt.Errorf("%s", sanitizedMsg)
+					return nil
+				}
+				// Non-optional provider failed - return error
+				return err
 			}
 
 			a.recordUpstreamCall(dep.Provider, dep.Endpoint, callDuration, "success")
@@ -443,11 +449,20 @@ func (a *Aggregator) doRequest(ctx context.Context, dep runtime.ProviderDep, url
 		return nil, resp.StatusCode, fmt.Errorf("upstream service returned error status %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	limitedReader := io.LimitReader(resp.Body, int64(a.MaxResponseBodySize))
+	body, err := io.ReadAll(limitedReader)
 	if err != nil {
 		// Sanitize error - remove URL and method details
 		sanitizedErr := runtime.SanitizeError(err)
 		return nil, resp.StatusCode, fmt.Errorf("failed to read response: %s", sanitizedErr)
+	}
+
+	// Check for truncation by trying to read one more byte
+	var extraByte [1]byte
+	n, _ := resp.Body.Read(extraByte[:])
+	if n > 0 {
+		// Response was truncated - return error
+		return nil, resp.StatusCode, fmt.Errorf("response body exceeds maximum size of %d bytes", a.MaxResponseBodySize)
 	}
 	
 	return body, resp.StatusCode, nil

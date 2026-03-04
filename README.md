@@ -497,6 +497,7 @@ go run ./cmd/apigen --spec=<openapi.yaml> --jsonata-dir=<dir> [--proxies=<proxie
 | `FIBER_PREFORK` | Enable prefork mode (multi-process, one per CPU core). **Disabled by default for containerized deployments** - scale horizontally (multiple containers) instead. Enable only if you have multiple dedicated CPU cores per container and aren't using an orchestrator | `false` |
 | `FIBER_CONCURRENCY` | Maximum concurrent connections per worker | `256 * CPU count` |
 | `FIBER_BODY_LIMIT` | Maximum request body size in bytes | `10485760` (10MB) |
+| `MAX_RESPONSE_BODY_SIZE` | Maximum response body size in bytes for upstream responses (prevents OOM, truncation detected and returns error) | `10485760` (10MB) |
 | `FIBER_READ_TIMEOUT` | Read timeout (e.g., `5s`) | `5s` |
 | `FIBER_WRITE_TIMEOUT` | Write timeout (e.g., `10s`) | `10s` |
 | `FIBER_IDLE_TIMEOUT` | Idle timeout (e.g., `120s`) | `120s` |
