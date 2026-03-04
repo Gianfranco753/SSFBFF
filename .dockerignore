@@ -7,9 +7,26 @@
 testdata/
 examples/
 
+*_test.go
+*_gen.go
 *.test
 *.out
 *.exe
 
 # Stale build artifacts
 apigen
+transpiler
+server
+
+# Documentation
+README.md
+*.md
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+
+# Development files
+.env
+.env.local
+*.log
