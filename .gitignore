@@ -21,6 +21,8 @@ profile.cov
 # Generated files — recreated by: GOEXPERIMENT=jsonv2 go generate ./internal/generated/
 internal/generated/*_gen.go
 cmd/server/routes_gen.go
+/data
+internal/generated/*
 
 # Dependency directories
 # vendor/

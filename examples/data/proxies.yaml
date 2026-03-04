@@ -1,0 +1,13 @@
+# Proxy route definitions — pass-through routes that forward requests directly
+# to downstream services without JSONata transformation.
+#
+# Each route specifies the target URL where requests should be forwarded.
+
+routes:
+  - path: /proxy/*
+    method: ALL
+    url: http://downstream-service:8080
+
+  - path: /api/legacy/*
+    method: ALL
+    url: http://legacy-service:8080

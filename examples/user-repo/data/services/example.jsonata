@@ -1,0 +1,5 @@
+{
+  "message": "Hello from BFF",
+  "timestamp": $now(),
+  "data": $fetch("example_service", "endpoint")
+}

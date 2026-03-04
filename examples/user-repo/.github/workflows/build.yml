@@ -1,0 +1,130 @@
+name: Build BFF Server
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'data/**'
+  pull_request:
+    branches:
+      - main
+      - master
+    paths:
+      - 'data/**'
+  workflow_dispatch:
+    inputs:
+      exclude_data:
+        description: 'Exclude providers and openapi.yaml from image (mount at runtime)'
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  BUILDER_IMAGE: gcossani/ssfbff-builder:latest
+  REGISTRY: docker.io
+  # Set these in repository secrets:
+  # DOCKER_USERNAME: Your Docker Hub username
+  # DOCKER_PASSWORD: Your Docker Hub password or access token
+  # IMAGE_NAME: Your Docker image name (e.g., myorg/my-bff)
+  # EXCLUDE_DATA_FROM_IMAGE: Set to 'true' to exclude providers and openapi.yaml (default: 'false')
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Determine image tag
+        id: image-tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.ref_name }}"
+          elif [ "${{ github.ref }}" = "refs/heads/main" ] || [ "${{ github.ref }}" = "refs/heads/master" ]; then
+            TAG="latest"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Image tag: $TAG"
+
+      - name: Determine exclude data setting
+        id: exclude-data
+        run: |
+          # Check workflow_dispatch input first, then secret, then default to false
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            EXCLUDE="${{ github.event.inputs.exclude_data }}"
+          else
+            EXCLUDE="${{ secrets.EXCLUDE_DATA_FROM_IMAGE }}"
+          fi
+          
+          # Default to false if empty
+          if [ -z "$EXCLUDE" ]; then
+            EXCLUDE="false"
+          fi
+          
+          echo "exclude=$EXCLUDE" >> $GITHUB_OUTPUT
+          echo "Exclude data from image: $EXCLUDE"
+
+      - name: Build BFF server image
+        run: |
+          IMAGE_NAME="${{ secrets.IMAGE_NAME }}"
+          if [ -z "$IMAGE_NAME" ]; then
+            IMAGE_NAME="${GITHUB_REPOSITORY,,}"
+          fi
+          
+          FULL_IMAGE_TAG="${IMAGE_NAME}:${{ steps.image-tag.outputs.tag }}"
+          
+          echo "Building image: $FULL_IMAGE_TAG"
+          
+          # Build command - conditionally add --push for non-PR events
+          BUILD_CMD="docker run --rm \
+            -v \"${{ github.workspace }}/data:/data:ro\" \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v \"${{ github.workspace }}:/workspace\" \
+            -w /workspace \
+            -e DATA_DIR=/data \
+            ${{ env.BUILDER_IMAGE }} \
+            --output-image \"$FULL_IMAGE_TAG\""
+          
+          # Add --exclude-data flag if enabled
+          if [ "${{ steps.exclude-data.outputs.exclude }}" = "true" ]; then
+            BUILD_CMD="$BUILD_CMD --exclude-data"
+          fi
+          
+          # Only push and login for non-PR events
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            BUILD_CMD="$BUILD_CMD --push \
+              --registry-user \"${{ secrets.DOCKER_USERNAME }}\" \
+              --registry-pass \"${{ secrets.DOCKER_PASSWORD }}\""
+          fi
+          
+          eval $BUILD_CMD
+
+      - name: Output image info
+        if: github.event_name != 'pull_request'
+        run: |
+          IMAGE_NAME="${{ secrets.IMAGE_NAME }}"
+          if [ -z "$IMAGE_NAME" ]; then
+            IMAGE_NAME="${GITHUB_REPOSITORY,,}"
+          fi
+          FULL_IMAGE_TAG="${IMAGE_NAME}:${{ steps.image-tag.outputs.tag }}"
+          EXCLUDE_DATA="${{ steps.exclude-data.outputs.exclude }}"
+          if [ "$EXCLUDE_DATA" = "true" ]; then
+            echo "✅ Built and pushed image: $FULL_IMAGE_TAG (data excluded - mount at runtime)"
+          else
+            echo "✅ Built and pushed image: $FULL_IMAGE_TAG (data included in image)"
+          fi

@@ -223,9 +223,15 @@ echo 'users[active = true].{name: full_name, email: email}' > data/services/user
 echo '{"owner": $fetch("user_service", "profile").name}' > data/services/summary.jsonata
 ```
 
-### 2. Add a `go:generate` directive
+### 2. Regenerate `generate.go` file
 
-In `internal/generated/generate.go`:
+The `internal/generated/generate.go` file contains `go:generate` directives for each JSONata file. After adding a new JSONata file, regenerate it:
+
+```bash
+./scripts/generate-generate-go.sh
+```
+
+This script automatically scans `data/services/` and updates `generate.go` with the correct directives. Alternatively, you can manually add the directive to `internal/generated/generate.go`:
 
 ```go
 //go:generate go run ../../cmd/transpiler --input=../../data/services/users.jsonata --output=users_gen.go --package=generated
@@ -261,9 +267,17 @@ Create `data/providers/user_service.yaml` if it doesn't exist.
 ### 5. Regenerate and run
 
 ```bash
+# Regenerate generate.go if you added a new JSONata file
+./scripts/generate-generate-go.sh
+
+# Generate all code (transforms + routes)
 GOEXPERIMENT=jsonv2 go generate ./internal/generated/
+
+# Start the server
 GOEXPERIMENT=jsonv2 go run ./cmd/server/
 ```
+
+**Note:** The `generate-generate-go.sh` script automatically keeps `internal/generated/generate.go` in sync with your `data/services/` directory. Run it whenever you add, remove, or rename JSONata files.
 
 The generator auto-detects the mode — if the expression contains `$fetch()` or `$service()`, it generates aggregator-aware routes; otherwise, single-upstream filter routes.
 
@@ -536,6 +550,33 @@ Tracing is configured via standard [OTEL environment variables](https://opentele
 | `USE_TRACE_ID_AS_REQUEST_ID` | Use OpenTelemetry trace ID for `X-Request-ID` header instead of generating UUIDs | `true` |
 
 **Per-Request Tracing Override**: When `OTEL_DISABLE_TRACING=true`, you can still enable tracing for specific requests by including the `x-enable-trace: true` or `x-enable-trace: 1` header. This is useful for debugging high-load scenarios without impacting overall performance.
+
+### OpenFeature
+
+OpenFeature integration allows environment variables to be overridden by feature flags at runtime. When OpenFeature is not configured, the system uses the standard environment variable caching (zero overhead).
+
+| Variable | Description | Default |
+|---|---|---|
+| `OPENFEATURE_PROVIDER` | Provider type (e.g., "envvar", "inmemory", "http"). If not set, OpenFeature is disabled | — |
+| `OPENFEATURE_CACHE_TTL` | Cache TTL in seconds for flag values (0 = no cache, enables instant flag changes). Recommended: 60-300 for high performance | `0` |
+
+**How it works:**
+- If `OPENFEATURE_PROVIDER` is not set, the system behaves exactly as before (all values from cached env vars)
+- If OpenFeature is enabled, flag values take precedence over environment variables
+- If a flag is not found in OpenFeature, the system falls back to the cached environment variable value
+- Flag changes are reflected immediately when `OPENFEATURE_CACHE_TTL=0`, or after TTL expires when `OPENFEATURE_CACHE_TTL>0`
+
+**Performance Recommendations for High Throughput:**
+
+1. **Use in-memory or file-based providers** for hot-path variables (avoid HTTP provider for variables accessed in request handling)
+2. **Set `OPENFEATURE_CACHE_TTL=60` or higher** for high-throughput scenarios to minimize flag evaluation overhead
+3. **Only enable OpenFeature for variables that need runtime changes** - keep static configuration in environment variables
+4. **Keep critical path variables (connection pool sizes, timeouts) with TTL > 0** to maintain performance
+
+**Performance Impact:**
+- **OpenFeature disabled**: Zero overhead (same performance as baseline)
+- **OpenFeature enabled, TTL = 0**: ~100-1000ns+ per call (depends on provider)
+- **OpenFeature enabled, TTL > 0**: Cache hits ~5-10ns (similar to baseline), cache misses ~100-1000ns+
 
 ### Performance Tuning
 
@@ -851,6 +892,23 @@ GOEXPERIMENT=jsonv2 go run ./cmd/server/
 GOEXPERIMENT=jsonv2 go test ./... -count=1
 ```
 
+## Cleaning Generated Files
+
+To remove all generated files, binaries, and test artifacts:
+
+```bash
+./scripts/clean.sh
+```
+
+This script removes:
+- The entire `internal/generated/` directory and all its contents
+- `cmd/server/routes_gen.go`
+- Binaries (`apigen`, `transpiler`, `server`, `mockserver`)
+- Test binaries (`*.test`)
+- Coverage files (`coverage.out`, `*.coverprofile`)
+
+**Note:** The `internal/generated/` directory will be recreated by `generate-generate-go.sh` when you regenerate files.
+
 ## Docker
 
 Multi-stage build: generates all code, compiles a static binary, produces a minimal image (~15 MB).
@@ -867,6 +925,294 @@ docker compose -f examples/docker-compose.yaml up --build
 ```
 
 The build copies `data/` into the build stage, runs `go generate` to transpile all JSONata into Go, compiles the binary, then copies only the binary into the runtime image. Routes and service logic are compiled into the binary. The `data/` directory (specifically `data/providers/`) must be mounted as a volume at runtime.
+
+## Distribution
+
+You can use SSFBFF to generate BFF servers from your data directory without needing the generator source code. Two methods are available:
+
+### Method 1: Docker Builder Image
+
+Use the pre-built builder image to generate and build your BFF server from your data directory:
+
+```bash
+# Build your BFF server image
+docker run --rm \
+  -v /path/to/your/data:/data:ro \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  gcossani/ssfbff-builder:latest \
+  --output-image my-bff:latest
+```
+
+**Options:**
+- `--output-image TAG` - Docker image tag for the generated server (required)
+- `--push` - Push the image to registry after building
+- `--registry-user USER` - Registry username for pushing
+- `--registry-pass PASS` - Registry password for pushing
+- `--module-path PATH` - Go module path (default: `github.com/gcossani/ssfbff`)
+- `--data-dir DIR` - Path to data directory (default: `/data`)
+
+**Example with push:**
+```bash
+docker run --rm \
+  -v /path/to/your/data:/data:ro \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  gcossani/ssfbff-builder:latest \
+  --output-image myorg/my-bff:v1.0.0 \
+  --push \
+  --registry-user myuser \
+  --registry-pass mypassword
+```
+
+**Requirements:**
+- Your `data/` directory must contain:
+  - `openapi.yaml` (or `routes.yaml` for legacy mode)
+  - `services/` directory with `.jsonata` files
+  - `providers/` directory with provider YAML files (optional, but required if using `$fetch()`)
+
+**Final Image Contents:**
+By default, the generated Docker image includes:
+- The compiled server binary
+- `data/providers/` directory (required at runtime)
+- `data/openapi.yaml` (if present, for `/docs` endpoint)
+
+The `data/services/` directory is not included since JSONata expressions are compiled into the binary at build time.
+
+**Excluding Data from Image:**
+You can exclude providers and openapi.yaml from the image using the `--exclude-data` flag. This is useful when you want to:
+- Use environment-specific configurations (dev/staging/prod)
+- Keep sensitive provider configs out of the image
+- Mount data at runtime for flexibility
+
+```bash
+docker run --rm \
+  -v /path/to/your/data:/data:ro \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  gcossani/ssfbff-builder:latest \
+  --output-image my-bff:latest \
+  --exclude-data
+```
+
+### Method 2: GitHub Actions
+
+Automatically build and push your BFF server image when you push changes to your data directory.
+
+1. **Copy the workflow template** to your repository:
+   ```bash
+   mkdir -p .github/workflows
+   cp .github/workflows/build.yml your-repo/.github/workflows/
+   ```
+
+2. **Set up repository secrets** in GitHub:
+   - `DOCKER_USERNAME` - Your Docker Hub username
+   - `DOCKER_PASSWORD` - Your Docker Hub password or access token
+   - `IMAGE_NAME` (optional) - Your Docker image name (e.g., `myorg/my-bff`). Defaults to repository name if not set.
+   - `EXCLUDE_DATA_FROM_IMAGE` (optional) - Set to `true` to exclude providers and openapi.yaml from the image. Defaults to `false`.
+
+3. **Push your data directory** to GitHub:
+   ```bash
+   git add data/
+   git commit -m "Add BFF configuration"
+   git push origin main
+   ```
+
+The workflow will automatically:
+- Detect changes in the `data/` directory
+- Build your BFF server using the builder image
+- Push the resulting Docker image to your registry
+
+**Workflow triggers:**
+- Push to `main`/`master` branch (when `data/` changes)
+- Pull requests (for validation, doesn't push)
+- Manual workflow dispatch
+
+**Customization:**
+Edit `.github/workflows/build.yml` to:
+- Change the builder image version
+- Use a different registry (GHCR, ECR, etc.)
+- Add custom build steps
+- Configure version tagging strategy
+
+**Excluding Data from Image:**
+To exclude data from the image in GitHub Actions, either:
+- Set the repository secret `EXCLUDE_DATA_FROM_IMAGE` = `true`
+- Use workflow_dispatch with the `exclude_data` input set to `true`
+
+### Deployment Options
+
+#### Option 1: Data Included in Image (Default)
+
+**Pros:**
+- Self-contained image - no external dependencies
+- Simple deployment - just run the image
+- Immutable - data is versioned with the image
+
+**Usage:**
+```bash
+docker run -p 3000:3000 my-bff:latest
+```
+
+#### Option 2: Mount Data at Runtime
+
+**Pros:**
+- Change providers without rebuilding
+- Environment-specific configs (dev/staging/prod)
+- Keep sensitive data out of images
+- Smaller image size
+
+**Docker:**
+```bash
+# Mount providers directory
+docker run -p 3000:3000 \
+  -v /path/to/providers:/data/providers:ro \
+  -v /path/to/openapi.yaml:/data/openapi.yaml:ro \
+  my-bff:latest
+
+# Or mount entire data directory
+docker run -p 3000:3000 \
+  -v /path/to/data:/data:ro \
+  my-bff:latest
+```
+
+**Kubernetes with ConfigMap:**
+
+1. Create ConfigMap for providers:
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bff-providers
+data:
+  user_service.yaml: |
+    base_url: http://user-svc:8080
+    timeout: 5s
+    endpoints:
+      profile: /api/profile
+  orders_service.yaml: |
+    base_url: http://orders-svc:8080
+    timeout: 5s
+    endpoints:
+      list: /api/orders
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bff-openapi
+data:
+  openapi.yaml: |
+    openapi: 3.0.0
+    info:
+      title: My BFF API
+      version: 1.0.0
+    # ... your OpenAPI spec
+```
+
+2. Create Deployment:
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bff
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: bff
+  template:
+    metadata:
+      labels:
+        app: bff
+    spec:
+      containers:
+      - name: bff
+        image: my-bff:latest
+        ports:
+        - containerPort: 3000
+        env:
+        - name: DATA_DIR
+          value: /data
+        volumeMounts:
+        - name: providers
+          mountPath: /data/providers
+        - name: openapi
+          mountPath: /data/openapi.yaml
+          subPath: openapi.yaml
+      volumes:
+      - name: providers
+        configMap:
+          name: bff-providers
+      - name: openapi
+        configMap:
+          name: bff-openapi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bff
+spec:
+  selector:
+    app: bff
+  ports:
+  - port: 80
+    targetPort: 3000
+```
+
+**Kubernetes with Secrets (for sensitive data):**
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: bff-providers
+type: Opaque
+stringData:
+  user_service.yaml: |
+    base_url: https://secure-api.example.com
+    timeout: 5s
+    endpoints:
+      profile: /api/profile
+---
+# In Deployment, use secret instead of ConfigMap:
+      volumes:
+      - name: providers
+        secret:
+          secretName: bff-providers
+```
+
+**Updating ConfigMaps/Secrets:**
+```bash
+# Update ConfigMap
+kubectl create configmap bff-providers --from-file=providers/ --dry-run=client -o yaml | kubectl apply -f -
+
+# Restart pods to pick up changes (or use a tool like Reloader)
+kubectl rollout restart deployment/bff
+```
+
+**Recommendation:**
+- **Include in image** for simple deployments, single environments, or when data is not sensitive
+- **Mount at runtime** for multi-environment deployments, sensitive configs, or when you need to change providers without rebuilding
+
+### Building the Builder Image
+
+**Automatic Publishing:**
+The builder image is automatically built and published to Docker Hub via GitHub Actions when:
+- Changes are pushed to `main`/`master` branch affecting builder-related files
+- Manual workflow dispatch is triggered
+
+The workflow (`.github/workflows/publish-builder.yml`) publishes:
+- `gcossani/ssfbff-builder:latest` - Latest version from main/master branch
+- `gcossani/ssfbff-builder:<branch>` - Branch-specific tags
+- `gcossani/ssfbff-builder:<sha>` - Commit SHA tags
+- `gcossani/ssfbff-builder:<version>` - Semantic version tags (if using workflow_dispatch with version input)
+
+**Manual Build:**
+To build the builder image yourself (for development or custom versions):
+
+```bash
+docker build -f Dockerfile.builder -t gcossani/ssfbff-builder:latest .
+```
+
+**Requirements for Publishing:**
+- Set `DOCKER_USERNAME` and `DOCKER_PASSWORD` secrets in GitHub repository settings
+- The workflow supports multi-arch builds (amd64, arm64)
 
 ## JSONata Coverage — 86% of spec
 

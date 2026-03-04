@@ -22,6 +22,10 @@ COPY . .
 ENV GOEXPERIMENT=jsonv2
 ENV CGO_ENABLED=0
 
+# Regenerate generate.go from actual JSONata files before running go generate
+# This ensures generate.go is always in sync with data/services/
+RUN ./scripts/generate-generate-go.sh
+
 # Transpile all .jsonata files from data/services/ into *_gen.go
 # and generate route wiring from data/openapi.yaml and data/proxies.yaml.
 RUN go generate ./internal/generated/

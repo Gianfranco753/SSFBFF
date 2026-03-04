@@ -1,0 +1,4 @@
+base_url: http://example-service:8080
+timeout: 5s
+endpoints:
+  endpoint: /api/data
