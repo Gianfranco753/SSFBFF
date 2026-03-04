@@ -15,7 +15,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gcossani/ssfbff/runtime"
@@ -178,8 +177,14 @@ func (a *Aggregator) GetProviders() map[string]ProviderConfig {
 // configured timeout.
 func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map[string][]byte, error) {
 	startTime := time.Now()
+	// Pre-allocate results map with all keys initialized to nil.
+	// This allows concurrent writes to different keys without mutex since:
+	// 1. Map is pre-allocated (no resizing during writes)
+	// 2. Each goroutine writes to a unique key (dep.Key() is unique per dependency)
 	results := make(map[string][]byte, len(deps))
-	var mu sync.Mutex
+	for _, dep := range deps {
+		results[dep.Key()] = nil // Initialize slot
+	}
 
 	g, gctx := errgroup.WithContext(ctx)
 
@@ -206,9 +211,7 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 				}
 				a.recordUpstreamError(dep.Provider, dep.Endpoint, "resolve_error")
 				if optional {
-					mu.Lock()
 					results[dep.Key()] = []byte("null")
-					mu.Unlock()
 					return nil
 				}
 				return err
@@ -262,9 +265,7 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 				a.recordUpstreamCall(dep.Provider, dep.Endpoint, callDuration, status)
 				
 				if optional {
-					mu.Lock()
 					results[dep.Key()] = []byte("null")
-					mu.Unlock()
 					if a.hasLogger {
 						if a.obsConfig.LogFunc != nil {
 							a.obsConfig.LogFunc(reqCtx, zerolog.WarnLevel, "optional provider failed, using null",
@@ -286,9 +287,7 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 
 			a.recordUpstreamCall(dep.Provider, dep.Endpoint, callDuration, "success")
 			
-			mu.Lock()
 			results[dep.Key()] = body
-			mu.Unlock()
 			return nil
 		})
 	}

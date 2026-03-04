@@ -18,6 +18,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
 	"fmt"
 	"io"
@@ -146,6 +147,12 @@ var prometheusRegistry *prometheus.Registry
 // serverAggregator holds the aggregator instance for readiness checks.
 var serverAggregator *aggregator.Aggregator
 
+// cachedOpenAPISpecHTML holds the cached HTML for the /docs endpoint.
+var (
+	cachedOpenAPISpecHTML []byte
+	cachedOpenAPISpecOnce sync.Once
+)
+
 func main() {
 	logger := initLogger()
 	
@@ -203,6 +210,18 @@ func main() {
 	}()
 
 	dataDir := getCachedDataDir()
+
+	// Load and cache OpenAPI spec HTML if docs are enabled
+	if getCachedEnableDocs() {
+		var loadErr error
+		cachedOpenAPISpecOnce.Do(func() {
+			cachedOpenAPISpecHTML, loadErr = loadOpenAPISpecHTML(dataDir, logger)
+			if loadErr != nil {
+				logError(ctx, logger, "failed to load OpenAPI spec for docs",
+					func(e *zerolog.Event) { e.Err(loadErr) })
+			}
+		})
+	}
 
 	providers, err := loadProviders(filepath.Join(dataDir, "providers"))
 	if err != nil {
@@ -291,18 +310,14 @@ func main() {
 			buf.Reset()
 			defer errorResponsePool.Put(buf)
 			
-			// Build JSON response directly
-			buf.WriteString(`{"error":`)
-			jsonBytes, err := jsonv2.Marshal(message)
-			if err != nil {
-				// Fallback to a safe error message if marshaling fails
-				logError(c.Context(), logger, "failed to marshal error message", func(e *zerolog.Event) { e.Err(err) })
-				jsonBytes = []byte(`"Internal Server Error"`)
-			}
-			buf.Write(jsonBytes)
-			buf.WriteString(`,"status":`)
-			buf.WriteString(strconv.Itoa(code))
-			buf.WriteString(`}`)
+			// Build JSON response using jsontext.Encoder for consistent, efficient encoding
+			enc := jsontext.NewEncoder(buf)
+			enc.WriteToken(jsontext.BeginObject)
+			enc.WriteToken(jsontext.String("error"))
+			enc.WriteToken(jsontext.String(message))
+			enc.WriteToken(jsontext.String("status"))
+			enc.WriteToken(jsontext.String(strconv.Itoa(code)))
+			enc.WriteToken(jsontext.EndObject)
 			
 			c.Set("Content-Type", "application/json")
 			return c.Status(code).Send(buf.Bytes())
@@ -387,19 +402,21 @@ func main() {
 		handler.ServeHTTP(&mockResponseWriter{Writer: buf}, req)
 
 		content := buf.Bytes()
-		contentCopy := make([]byte, len(content))
-		copy(contentCopy, content)
 
-		// Update cache if enabled
+		// Update cache if enabled (only copy when caching is needed)
 		if metricsCacheTTL > 0 {
+			contentCopy := make([]byte, len(content))
+			copy(contentCopy, content)
 			metricsCache.mu.Lock()
 			metricsCache.content = contentCopy
 			metricsCache.expires = time.Now().Add(time.Duration(metricsCacheTTL) * time.Second)
 			metricsCache.mu.Unlock()
+			c.Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+			return c.Send(contentCopy)
 		}
 
 		c.Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-		return c.Send(contentCopy)
+		return c.Send(content)
 	})
 
 	app.Get("/ready", func(c fiber.Ctx) error {
@@ -432,61 +449,18 @@ func main() {
 	})
 
 	// Scalar documentation endpoint (enabled via ENABLE_DOCS env var)
+	// Uses cached HTML loaded at startup to avoid file I/O on every request
 	if getCachedEnableDocs() {
 		app.Get("/docs", func(c fiber.Ctx) error {
-			openAPIPath := filepath.Join(dataDir, "openapi.yaml")
-			specData, err := os.ReadFile(openAPIPath)
-			if err != nil {
-				logError(c.Context(), logger, "failed to read OpenAPI spec",
-					func(e *zerolog.Event) { e.Err(err).Str("path", openAPIPath) })
+			if len(cachedOpenAPISpecHTML) == 0 {
+				logError(c.Context(), logger, "OpenAPI spec HTML not loaded",
+					func(e *zerolog.Event) {})
 				return c.Status(500).JSON(fiber.Map{
-					"error": "failed to load OpenAPI specification",
+					"error": "API documentation not available",
 				})
 			}
-
-			// Convert YAML to JSON for Scalar
-			var specObj interface{}
-			if err := yaml.Unmarshal(specData, &specObj); err != nil {
-				logError(c.Context(), logger, "failed to parse OpenAPI spec",
-					func(e *zerolog.Event) { e.Err(err) })
-				return c.Status(500).JSON(fiber.Map{
-					"error": "failed to parse OpenAPI specification",
-				})
-			}
-
-			specJSON, err := jsonv2.Marshal(specObj)
-			if err != nil {
-				logError(c.Context(), logger, "failed to marshal OpenAPI spec to JSON",
-					func(e *zerolog.Event) { e.Err(err) })
-				return c.Status(500).JSON(fiber.Map{
-					"error": "failed to convert OpenAPI specification",
-				})
-			}
-
-			// Escape JSON for embedding in HTML script tag
-			specJSONStr := string(specJSON)
-			specJSONEscaped := strings.ReplaceAll(specJSONStr, "</script>", "<\\/script>")
-
-			html := `<!doctype html>
-<html>
-  <head>
-    <title>API Documentation</title>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <style>
-      body {
-        margin: 0;
-      }
-    </style>
-  </head>
-  <body>
-    <script id="api-reference" type="application/json">` + specJSONEscaped + `</script>
-    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@latest/dist/browser/standalone.js"></script>
-  </body>
-</html>`
-
 			c.Set("Content-Type", "text/html; charset=utf-8")
-			return c.SendString(html)
+			return c.Send(cachedOpenAPISpecHTML)
 		})
 	}
 
@@ -602,6 +576,51 @@ func main() {
 	shutdownDuration := time.Since(shutdownStart)
 	recordShutdownDuration(shutdownDuration)
 	logInfo(shutdownCtx, logger, "server stopped", func(e *zerolog.Event) { e.Dur("duration", shutdownDuration) })
+}
+
+// loadOpenAPISpecHTML loads the OpenAPI spec, converts it to JSON, and builds the HTML template.
+// This is called once at startup and cached for the /docs endpoint.
+func loadOpenAPISpecHTML(dataDir string, logger zerolog.Logger) ([]byte, error) {
+	openAPIPath := filepath.Join(dataDir, "openapi.yaml")
+	specData, err := os.ReadFile(openAPIPath)
+	if err != nil {
+		return nil, fmt.Errorf("reading OpenAPI spec: %w", err)
+	}
+
+	// Convert YAML to JSON for Scalar
+	var specObj interface{}
+	if err := yaml.Unmarshal(specData, &specObj); err != nil {
+		return nil, fmt.Errorf("parsing OpenAPI spec: %w", err)
+	}
+
+	specJSON, err := jsonv2.Marshal(specObj)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling OpenAPI spec to JSON: %w", err)
+	}
+
+	// Escape JSON for embedding in HTML script tag
+	specJSONStr := string(specJSON)
+	specJSONEscaped := strings.ReplaceAll(specJSONStr, "</script>", "<\\/script>")
+
+	html := `<!doctype html>
+<html>
+  <head>
+    <title>API Documentation</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body {
+        margin: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <script id="api-reference" type="application/json">` + specJSONEscaped + `</script>
+    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference@latest/dist/browser/standalone.js"></script>
+  </body>
+</html>`
+
+	return []byte(html), nil
 }
 
 // loadProviders reads all .yaml files from a directory.

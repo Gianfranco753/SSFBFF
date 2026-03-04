@@ -3,6 +3,7 @@
 package main
 
 import (
+	"hash"
 	"hash/fnv"
 	"strconv"
 	"sync"
@@ -98,6 +99,11 @@ var (
 	upstreamErrorCounterCache sync.Map
 	aggregatorOpCounterCache  sync.Map
 	labelCacheEnabled         bool
+
+	// hasherPool reuses hash.Hash64 instances to avoid allocations in hashLabels()
+	hasherPool = sync.Pool{
+		New: func() interface{} { return fnv.New64a() },
+	}
 )
 
 // Pre-format common status codes to avoid fmt.Sprintf
@@ -117,7 +123,9 @@ func getStatusCodeString(code int) string {
 }
 
 func hashLabels(labels []string) uint64 {
-	h := fnv.New64a()
+	h := hasherPool.Get().(hash.Hash64)
+	defer hasherPool.Put(h)
+	h.Reset()
 	for _, label := range labels {
 		h.Write([]byte(label))
 		h.Write([]byte{0})

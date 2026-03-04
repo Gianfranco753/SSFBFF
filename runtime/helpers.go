@@ -61,8 +61,15 @@ type ProviderDep struct {
 }
 
 // Key returns the map key used to store/retrieve fetched data for this dep.
+// Uses strings.Builder with pre-allocated capacity to avoid allocations.
 func (d ProviderDep) Key() string {
-	return d.Provider + "." + d.Endpoint
+	var builder strings.Builder
+	// Pre-allocate capacity: provider + "." + endpoint
+	builder.Grow(len(d.Provider) + 1 + len(d.Endpoint))
+	builder.WriteString(d.Provider)
+	builder.WriteString(".")
+	builder.WriteString(d.Endpoint)
+	return builder.String()
 }
 
 // ExtractPath navigates into a JSON document and returns the raw value at the

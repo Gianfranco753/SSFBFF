@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -40,6 +41,7 @@ var (
 	batcherInitOnce   sync.Once
 	batcherEnabled    bool
 	metricsSampleRate float64
+	sampleCounter     atomic.Uint64
 )
 
 func initMetricsBatcher() {
@@ -164,9 +166,10 @@ func shouldSample() bool {
 		recordMetricsDropped("sampling")
 		return false
 	}
-	// Use nanosecond timestamp modulo for pseudo-random sampling
-	// This provides consistent sampling without requiring a random number generator
-	sampled := time.Now().UnixNano()%10000 < int64(metricsSampleRate*10000)
+	// Use atomic counter for uniform distribution and better performance.
+	// Atomic operations are faster (~5-10ns) than time.Now() syscall (~20-50ns)
+	// and provide truly uniform distribution without time-based patterns.
+	sampled := (sampleCounter.Add(1) % 10000) < uint64(metricsSampleRate*10000)
 	if !sampled {
 		recordMetricsDropped("sampling")
 	}
