@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/gcossani/ssfbff/internal/aggregator"
+	rt "github.com/gcossani/ssfbff/runtime"
 	"github.com/gofiber/fiber/v3"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
@@ -297,12 +298,17 @@ func main() {
 		ErrorHandler: func(c fiber.Ctx, err error) error {
 			code := fiber.StatusInternalServerError
 			message := "Internal Server Error"
+			errorCode := rt.ErrorCodeInternalError
 
 			if e, ok := err.(*fiber.Error); ok {
 				code = e.Code
 				message = e.Message
+				// Try to extract error code from message or classify based on status
+				errorCode = rt.ClassifyError(err)
 			} else {
-				message = err.Error()
+				// Sanitize error message and classify error code
+				message = rt.SanitizeError(err)
+				errorCode = rt.ClassifyError(err)
 			}
 
 			// Use sync.Pool buffer to avoid fiber.Map allocation
@@ -317,6 +323,8 @@ func main() {
 			enc.WriteToken(jsontext.String(message))
 			enc.WriteToken(jsontext.String("status"))
 			enc.WriteToken(jsontext.String(strconv.Itoa(code)))
+			enc.WriteToken(jsontext.String("code"))
+			enc.WriteToken(jsontext.String(errorCode))
 			enc.WriteToken(jsontext.EndObject)
 			
 			c.Set("Content-Type", "application/json")

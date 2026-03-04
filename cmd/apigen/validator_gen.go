@@ -67,7 +67,7 @@ func generateHeaderValidation(params []Parameter) string {
 		}
 
 		// Add constraint validation if needed
-		buf.WriteString(generateParameterConstraints("val", param.Schema, "\t\t"))
+		buf.WriteString(generateParameterConstraints("val", param.Schema, "\t\t", paramName))
 
 		if !param.Required {
 			buf.WriteString("\t\t}\n")
@@ -99,7 +99,7 @@ func generateQueryValidation(params []Parameter) string {
 		}
 
 		// Type conversion and validation
-		buf.WriteString(generateQueryParameterValidation("val", param.Schema, paramName, "\t\t"))
+		buf.WriteString(generateQueryParameterValidation("val", param.Schema, paramName, "\t\t", paramName))
 
 		if !param.Required {
 			buf.WriteString("\t\t}\n")
@@ -126,14 +126,14 @@ func generatePathValidation(params []Parameter) string {
 		buf.WriteString("\t}\n")
 
 		// Type conversion and validation
-		buf.WriteString(generateQueryParameterValidation("val", param.Schema, paramName, "\t"))
+		buf.WriteString(generateQueryParameterValidation("val", param.Schema, paramName, "\t", paramName))
 	}
 
 	return buf.String()
 }
 
 // generateQueryParameterValidation generates validation for query/path parameters with type conversion.
-func generateQueryParameterValidation(varName string, schema SchemaInfo, paramName string, indent string) string {
+func generateQueryParameterValidation(varName string, schema SchemaInfo, paramName string, indent string, fieldName string) string {
 	var buf strings.Builder
 
 	switch schema.Type {
@@ -142,13 +142,13 @@ func generateQueryParameterValidation(varName string, schema SchemaInfo, paramNa
 		buf.WriteString(fmt.Sprintf("%sif err != nil {\n", indent))
 		buf.WriteString(fmt.Sprintf("%s\treturn fmt.Errorf(\"query parameter '%s' must be an integer: %%w\", err)\n", indent, paramName))
 		buf.WriteString(fmt.Sprintf("%s}\n", indent))
-		buf.WriteString(generateParameterConstraints("intVal", schema, indent))
+		buf.WriteString(generateParameterConstraints("intVal", schema, indent, fieldName))
 	case "number":
 		buf.WriteString(fmt.Sprintf("%sfloatVal, err := strconv.ParseFloat(%s, 64)\n", indent, varName))
 		buf.WriteString(fmt.Sprintf("%sif err != nil {\n", indent))
 		buf.WriteString(fmt.Sprintf("%s\treturn fmt.Errorf(\"query parameter '%s' must be a number: %%w\", err)\n", indent, paramName))
 		buf.WriteString(fmt.Sprintf("%s}\n", indent))
-		buf.WriteString(generateParameterConstraints("floatVal", schema, indent))
+		buf.WriteString(generateParameterConstraints("floatVal", schema, indent, fieldName))
 	case "boolean":
 		buf.WriteString(fmt.Sprintf("%sboolVal, err := strconv.ParseBool(%s)\n", indent, varName))
 		buf.WriteString(fmt.Sprintf("%sif err != nil {\n", indent))
@@ -156,32 +156,32 @@ func generateQueryParameterValidation(varName string, schema SchemaInfo, paramNa
 		buf.WriteString(fmt.Sprintf("%s}\n", indent))
 		// Boolean doesn't have constraints typically
 	default: // string
-		buf.WriteString(generateParameterConstraints(varName, schema, indent))
+		buf.WriteString(generateParameterConstraints(varName, schema, indent, fieldName))
 	}
 
 	return buf.String()
 }
 
 // generateParameterConstraints generates constraint validation code.
-func generateParameterConstraints(varName string, schema SchemaInfo, indent string) string {
+func generateParameterConstraints(varName string, schema SchemaInfo, indent string, fieldName string) string {
 	var buf strings.Builder
 	c := schema.Constraints
 
 	if schema.Type == "string" {
 		if c.MinLength != nil {
 			buf.WriteString(fmt.Sprintf("%sif len(%s) < %d {\n", indent, varName, *c.MinLength))
-			buf.WriteString(fmt.Sprintf("%s\treturn fmt.Errorf(\"field must be at least %d characters\")\n", indent, *c.MinLength))
+			buf.WriteString(fmt.Sprintf("%s\treturn fmt.Errorf(\"field '%s' must be at least %d characters\")\n", indent, fieldName, *c.MinLength))
 			buf.WriteString(fmt.Sprintf("%s}\n", indent))
 		}
 		if c.MaxLength != nil {
 			buf.WriteString(fmt.Sprintf("%sif len(%s) > %d {\n", indent, varName, *c.MaxLength))
-			buf.WriteString(fmt.Sprintf("%s\treturn fmt.Errorf(\"field must be at most %d characters\")\n", indent, *c.MaxLength))
+			buf.WriteString(fmt.Sprintf("%s\treturn fmt.Errorf(\"field '%s' must be at most %d characters\")\n", indent, fieldName, *c.MaxLength))
 			buf.WriteString(fmt.Sprintf("%s}\n", indent))
 		}
 		if c.Pattern != "" {
 			buf.WriteString(fmt.Sprintf("%smatched, err := regexp.MatchString(%q, %s)\n", indent, c.Pattern, varName))
 			buf.WriteString(fmt.Sprintf("%sif err != nil || !matched {\n", indent))
-			buf.WriteString(fmt.Sprintf("%s\treturn fmt.Errorf(\"field does not match required pattern\")\n", indent))
+			buf.WriteString(fmt.Sprintf("%s\treturn fmt.Errorf(\"field '%s' does not match required pattern\")\n", indent, fieldName))
 			buf.WriteString(fmt.Sprintf("%s}\n", indent))
 		}
 		if len(c.Enum) > 0 {
@@ -191,7 +191,7 @@ func generateParameterConstraints(varName string, schema SchemaInfo, indent stri
 				buf.WriteString(fmt.Sprintf("%scase %q:\n", indent, enumStr))
 			}
 			buf.WriteString(fmt.Sprintf("%sdefault:\n", indent))
-			buf.WriteString(fmt.Sprintf("%s\treturn fmt.Errorf(\"field must be one of: ", indent))
+			buf.WriteString(fmt.Sprintf("%s\treturn fmt.Errorf(\"field '%s' must be one of: ", indent, fieldName))
 			enumStrs := make([]string, len(c.Enum))
 			for i, e := range c.Enum {
 				enumStrs[i] = fmt.Sprintf("%v", e)
@@ -203,7 +203,7 @@ func generateParameterConstraints(varName string, schema SchemaInfo, indent stri
 		// Format validation
 		if schema.Format == "email" {
 			buf.WriteString(fmt.Sprintf("%sif !strings.Contains(%s, \"@\") {\n", indent, varName))
-			buf.WriteString(fmt.Sprintf("%s\treturn fmt.Errorf(\"field must be a valid email address\")\n", indent))
+			buf.WriteString(fmt.Sprintf("%s\treturn fmt.Errorf(\"field '%s' must be a valid email address\")\n", indent, fieldName))
 			buf.WriteString(fmt.Sprintf("%s}\n", indent))
 		}
 	} else if schema.Type == "integer" || schema.Type == "number" {
@@ -213,7 +213,7 @@ func generateParameterConstraints(varName string, schema SchemaInfo, indent stri
 				comp = varName
 			}
 			buf.WriteString(fmt.Sprintf("%sif %s < %v {\n", indent, comp, *c.Minimum))
-			buf.WriteString(fmt.Sprintf("%s\treturn fmt.Errorf(\"field must be at least %v\")\n", indent, *c.Minimum))
+			buf.WriteString(fmt.Sprintf("%s\treturn fmt.Errorf(\"field '%s' must be at least %v\")\n", indent, fieldName, *c.Minimum))
 			buf.WriteString(fmt.Sprintf("%s}\n", indent))
 		}
 		if c.Maximum != nil {
@@ -222,7 +222,7 @@ func generateParameterConstraints(varName string, schema SchemaInfo, indent stri
 				comp = varName
 			}
 			buf.WriteString(fmt.Sprintf("%sif %s > %v {\n", indent, comp, *c.Maximum))
-			buf.WriteString(fmt.Sprintf("%s\treturn fmt.Errorf(\"field must be at most %v\")\n", indent, *c.Maximum))
+			buf.WriteString(fmt.Sprintf("%s\treturn fmt.Errorf(\"field '%s' must be at most %v\")\n", indent, fieldName, *c.Maximum))
 			buf.WriteString(fmt.Sprintf("%s}\n", indent))
 		}
 	}

@@ -1055,11 +1055,20 @@ func copyRuntimePackage(t *testing.T, dir string) {
 	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// Copy helpers.go
 	runtimeSrc, err := os.ReadFile("../../runtime/helpers.go")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(runtimeDir, "helpers.go"), runtimeSrc, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Copy errors.go
+	errorsSrc, err := os.ReadFile("../../runtime/errors.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runtimeDir, "errors.go"), errorsSrc, 0o644); err != nil {
 		t.Fatal(err)
 	}
 }

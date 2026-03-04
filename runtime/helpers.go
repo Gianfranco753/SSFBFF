@@ -1022,11 +1022,12 @@ type Response struct {
 	Body       []byte
 }
 
-// HTTPError represents an error with an associated HTTP status code.
+// HTTPError represents an error with an associated HTTP status code and error code.
 // This is a convenience wrapper around Response for error cases.
 type HTTPError struct {
 	StatusCode int
 	Message    string
+	Code       string // Error code for programmatic handling
 }
 
 func (e *HTTPError) Error() string {
@@ -1034,10 +1035,30 @@ func (e *HTTPError) Error() string {
 }
 
 // NewHTTPError creates a new HTTPError with the given status code and message.
-func NewHTTPError(statusCode int, message string) *HTTPError {
+// The error code is optional - if not provided, it will be inferred from the status code.
+func NewHTTPError(statusCode int, message string, code ...string) *HTTPError {
+	errorCode := ""
+	if len(code) > 0 && code[0] != "" {
+		errorCode = code[0]
+	} else {
+		// Infer error code from status code if not provided
+		switch {
+		case statusCode >= 500:
+			errorCode = ErrorCodeInternalError
+		case statusCode == 400:
+			errorCode = ErrorCodeInvalidRequest
+		case statusCode == 502:
+			errorCode = ErrorCodeBadGateway
+		case statusCode == 504:
+			errorCode = ErrorCodeUpstreamTimeout
+		default:
+			errorCode = ErrorCodeInternalError
+		}
+	}
 	return &HTTPError{
 		StatusCode: statusCode,
 		Message:    message,
+		Code:       errorCode,
 	}
 }
 
@@ -1047,6 +1068,7 @@ func (e *HTTPError) ToResponse() (*Response, error) {
 	body, err := jsonv2.Marshal(map[string]any{
 		"error":  e.Message,
 		"status": e.StatusCode,
+		"code":   e.Code,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal HTTPError response: %w", err)

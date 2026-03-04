@@ -737,18 +737,75 @@ The entire shutdown process is bounded by `SHUTDOWN_TIMEOUT` (default 30s). Shut
 
 ## Error Handling
 
-The server provides enhanced error messages with additional context to aid debugging:
+The server provides standardized error responses with error codes for programmatic handling. All errors follow a consistent format while protecting internal implementation details.
 
-- **Provider endpoint errors** — When an endpoint is not found, the error message lists all available endpoints for that provider
-- **HTTP request errors** — Include the HTTP method and full URL in error messages
-- **JSON path extraction errors** — Include the full path attempted when extraction fails
+### Error Response Format
 
-Example error messages:
+All error responses use the following JSON structure:
+
+```json
+{
+  "error": "Human-readable error message",
+  "status": 500,
+  "code": "ERROR_CODE"
+}
 ```
-provider "user_service" has no endpoint "invalid" (available: [profile, settings])
-GET request to http://user-svc:8080/api/profile failed: context deadline exceeded
-field "name" not found at path "user.profile.name" (segment 2)
+
+### Error Codes
+
+| Code | HTTP Status | Description |
+|------|-------------|-------------|
+| `VALIDATION_ERROR` | 400 | Request validation failed |
+| `UPSTREAM_TIMEOUT` | 504 | Upstream service timeout |
+| `UPSTREAM_UNAVAILABLE` | 502 | Upstream service unavailable |
+| `UPSTREAM_ERROR` | 502 | Upstream service error (4xx/5xx) |
+| `BAD_GATEWAY` | 502 | Gateway/proxy error |
+| `INTERNAL_ERROR` | 500 | Internal server error |
+| `INVALID_REQUEST` | 400 | Invalid request format |
+
+### Error Sanitization
+
+To protect internal implementation details, all errors are sanitized before being sent to clients:
+
+- **Provider/endpoint names** are removed (e.g., "user_service/profile" → sanitized)
+- **URLs and internal paths** are removed
+- **System-level error details** are replaced with user-friendly messages
+- **Full error details** are logged server-side for debugging
+
+**Example**:
+
+- Internal error: `user_service/profile: connection refused`
+- Client receives: `{"error": "Service temporarily unavailable", "status": 502, "code": "UPSTREAM_UNAVAILABLE"}`
+
+### Validation Errors
+
+Validation errors include the specific field name and validation rule that failed:
+
+```json
+{
+  "error": "required query parameter 'userId' is missing",
+  "status": 400,
+  "code": "VALIDATION_ERROR"
+}
 ```
+
+```json
+{
+  "error": "field 'email' does not match required pattern",
+  "status": 400,
+  "code": "VALIDATION_ERROR"
+}
+```
+
+### Using Error Codes in JSONata
+
+The `$httpError()` function supports error codes as an optional third parameter:
+
+```jsonata
+$httpError(404, "Order not found", "NOT_FOUND")
+```
+
+This returns an error response with the specified status code, message, and error code. If no error code is provided, one will be inferred from the status code.
 
 ## Tracing & Observability
 
@@ -1018,18 +1075,20 @@ The remaining gaps are mainly higher-order functions and regex functions.
 | `$fetch()` with config | `$fetch("svc", "ep", {"method": "POST"}).val` |
 | `$request()` context | `$request().headers.Authorization` |
 | `$service(name)` composition | `$service("get_user").name` |
-| `$httpError(statusCode, message)` | `$httpError(404, "Not found")` |
+| `$httpError(statusCode, message, code?)` | `$httpError(404, "Not found", "NOT_FOUND")` |
 | `$httpResponse(statusCode, body, headers?)` | `$httpResponse(201, $fetch("orders", "create"))` |
 
-#### `$httpError(statusCode, message)`
+#### `$httpError(statusCode, message, code?)`
 
-Returns an HTTP error response with the specified status code and message. Use in conditionals to return errors when conditions aren't met:
+Returns an HTTP error response with the specified status code and message. An optional error code can be provided for programmatic handling. Use in conditionals to return errors when conditions aren't met:
 
 ```jsonata
 $count($fetch("orders_service", "data")[order_id = $request().params.id]) = 0 
-  ? $httpError(404, "Order not found")
+  ? $httpError(404, "Order not found", "NOT_FOUND")
   : $fetch("orders_service", "data")[order_id = $request().params.id][0]
 ```
+
+If no error code is provided, one will be inferred from the status code (e.g., 404 → `INVALID_REQUEST`, 500 → `INTERNAL_ERROR`).
 
 **Note**: This is a BFF extension function. JSONata has a built-in `$error()` function that throws exceptions, so we use `$httpError()` to avoid conflicts.
 

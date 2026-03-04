@@ -794,7 +794,11 @@ func writeProviderTransformFunc(w func(string, ...any), plan *ProviderPlan, hasD
 			// If field is directly an error, return immediately
 			w("\t// Error field - return immediately\n")
 			w("\tenc.WriteToken(jsontext.EndObject)\n")
-			w("\treturn nil, runtime.NewHTTPError(%d, %q)\n", field.StatusCode, field.ErrorMessage)
+			if field.ErrorCode != "" {
+				w("\treturn nil, runtime.NewHTTPError(%d, %q, %q)\n", field.StatusCode, field.ErrorMessage, field.ErrorCode)
+			} else {
+				w("\treturn nil, runtime.NewHTTPError(%d, %q)\n", field.StatusCode, field.ErrorMessage)
+			}
 
 		case "response":
 			// If field is directly a response, evaluate body and headers, then return
@@ -839,7 +843,11 @@ func writeProviderTransformFunc(w func(string, ...any), plan *ProviderPlan, hasD
 			if field.ValueExpr.Kind == "error" {
 				w("\t// Expression evaluates to error - return immediately\n")
 				w("\tenc.WriteToken(jsontext.EndObject)\n")
-				w("\treturn nil, runtime.NewHTTPError(%d, %q)\n", field.ValueExpr.StatusCode, field.ValueExpr.ErrorMessage)
+				if field.ValueExpr.ErrorCode != "" {
+					w("\treturn nil, runtime.NewHTTPError(%d, %q, %q)\n", field.ValueExpr.StatusCode, field.ValueExpr.ErrorMessage, field.ValueExpr.ErrorCode)
+				} else {
+					w("\treturn nil, runtime.NewHTTPError(%d, %q)\n", field.ValueExpr.StatusCode, field.ValueExpr.ErrorMessage)
+				}
 			} else if field.ValueExpr.Kind == "response" {
 				w("\t// Expression evaluates to response - return immediately\n")
 				// Evaluate body
@@ -868,13 +876,21 @@ func writeProviderTransformFunc(w func(string, ...any), plan *ProviderPlan, hasD
 				if field.ValueExpr.Then.Kind == "error" {
 					w("\tif runtime.Truthy(%s) {\n", condVal)
 					w("\t\tenc.WriteToken(jsontext.EndObject)\n")
-					w("\t\treturn nil, runtime.NewHTTPError(%d, %q)\n", field.ValueExpr.Then.StatusCode, field.ValueExpr.Then.ErrorMessage)
+					if field.ValueExpr.Then.ErrorCode != "" {
+						w("\t\treturn nil, runtime.NewHTTPError(%d, %q, %q)\n", field.ValueExpr.Then.StatusCode, field.ValueExpr.Then.ErrorMessage, field.ValueExpr.Then.ErrorCode)
+					} else {
+						w("\t\treturn nil, runtime.NewHTTPError(%d, %q)\n", field.ValueExpr.Then.StatusCode, field.ValueExpr.Then.ErrorMessage)
+					}
 					w("\t}\n")
 					// Evaluate else branch
 					if field.ValueExpr.Else != nil {
 						if field.ValueExpr.Else.Kind == "error" {
 							w("\tenc.WriteToken(jsontext.EndObject)\n")
-							w("\treturn nil, runtime.NewHTTPError(%d, %q)\n", field.ValueExpr.Else.StatusCode, field.ValueExpr.Else.ErrorMessage)
+							if field.ValueExpr.Else.ErrorCode != "" {
+								w("\treturn nil, runtime.NewHTTPError(%d, %q, %q)\n", field.ValueExpr.Else.StatusCode, field.ValueExpr.Else.ErrorMessage, field.ValueExpr.Else.ErrorCode)
+							} else {
+								w("\treturn nil, runtime.NewHTTPError(%d, %q)\n", field.ValueExpr.Else.StatusCode, field.ValueExpr.Else.ErrorMessage)
+							}
 						} else if field.ValueExpr.Else.Kind == "response" {
 							bodyVal := em.emit(field.ValueExpr.Else.ResponseBodyExpr)
 							w("\tbodyBytes, err := jsonv2.Marshal(%s)\n", bodyVal)
@@ -915,7 +931,11 @@ func writeProviderTransformFunc(w func(string, ...any), plan *ProviderPlan, hasD
 					if field.ValueExpr.Else != nil {
 						if field.ValueExpr.Else.Kind == "error" {
 							w("\tenc.WriteToken(jsontext.EndObject)\n")
-							w("\treturn nil, runtime.NewHTTPError(%d, %q)\n", field.ValueExpr.Else.StatusCode, field.ValueExpr.Else.ErrorMessage)
+							if field.ValueExpr.Else.ErrorCode != "" {
+								w("\treturn nil, runtime.NewHTTPError(%d, %q, %q)\n", field.ValueExpr.Else.StatusCode, field.ValueExpr.Else.ErrorMessage, field.ValueExpr.Else.ErrorCode)
+							} else {
+								w("\treturn nil, runtime.NewHTTPError(%d, %q)\n", field.ValueExpr.Else.StatusCode, field.ValueExpr.Else.ErrorMessage)
+							}
 						} else if field.ValueExpr.Else.Kind == "response" {
 							bodyVal := em.emit(field.ValueExpr.Else.ResponseBodyExpr)
 							w("\tbodyBytes, err := jsonv2.Marshal(%s)\n", bodyVal)

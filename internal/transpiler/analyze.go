@@ -97,6 +97,7 @@ type Expr struct {
 	// Kind="error": signals an HTTP error should be returned.
 	StatusCode  int    // HTTP status code
 	ErrorMessage string // Error message
+	ErrorCode   string // Optional error code for programmatic handling
 
 	// Kind="response": signals a full HTTP response should be returned.
 	ResponseStatusCode int                // HTTP status code
@@ -666,8 +667,8 @@ func analyzeExpr(node jparse.Node, fc *fieldCollector) (*Expr, error) {
 
 		// Handle $httpError() function
 		if funcName == "httpError" {
-			if len(n.Args) != 2 {
-				return nil, fmt.Errorf("$httpError() requires exactly 2 arguments (statusCode, message), got %d", len(n.Args))
+			if len(n.Args) < 2 || len(n.Args) > 3 {
+				return nil, fmt.Errorf("$httpError() requires 2 or 3 arguments (statusCode, message, code?), got %d", len(n.Args))
 			}
 			statusCodeNode, ok := n.Args[0].(*jparse.NumberNode)
 			if !ok {
@@ -677,10 +678,19 @@ func analyzeExpr(node jparse.Node, fc *fieldCollector) (*Expr, error) {
 			if !ok {
 				return nil, fmt.Errorf("$httpError() second argument must be a string (message), got %T", n.Args[1])
 			}
+			errorCode := ""
+			if len(n.Args) == 3 {
+				codeNode, ok := n.Args[2].(*jparse.StringNode)
+				if !ok {
+					return nil, fmt.Errorf("$httpError() third argument must be a string (error code), got %T", n.Args[2])
+				}
+				errorCode = codeNode.Value
+			}
 			return &Expr{
 				Kind:         "error",
 				StatusCode:   int(statusCodeNode.Value),
 				ErrorMessage: messageNode.Value,
+				ErrorCode:    errorCode,
 				GoType:       "any",
 			}, nil
 		}
@@ -1113,6 +1123,7 @@ type ProviderField struct {
 	// Kind="error": signals an HTTP error should be returned.
 	StatusCode  int    // HTTP status code
 	ErrorMessage string // Error message
+	ErrorCode   string // Optional error code for programmatic handling
 
 	// Kind="response": signals a full HTTP response should be returned.
 	BodyExpr *Expr                // Expression for response body
@@ -1678,11 +1689,11 @@ func analyzeServiceFn(fnCall *jparse.FunctionCallNode, trailingPath []string) (P
 	}, nil
 }
 
-// analyzeErrorFn parses a $httpError(statusCode, message) call.
-// It takes 2 arguments: status code (number) and message (string).
+// analyzeErrorFn parses a $httpError(statusCode, message, code?) call.
+// It takes 2 or 3 arguments: status code (number), message (string), and optional error code (string).
 func analyzeErrorFn(fnCall *jparse.FunctionCallNode) (ProviderField, error) {
-	if len(fnCall.Args) != 2 {
-		return ProviderField{}, fmt.Errorf("$httpError() requires exactly 2 arguments (statusCode, message), got %d", len(fnCall.Args))
+	if len(fnCall.Args) < 2 || len(fnCall.Args) > 3 {
+		return ProviderField{}, fmt.Errorf("$httpError() requires 2 or 3 arguments (statusCode, message, code?), got %d", len(fnCall.Args))
 	}
 
 	statusCodeNode, ok := fnCall.Args[0].(*jparse.NumberNode)
@@ -1695,10 +1706,20 @@ func analyzeErrorFn(fnCall *jparse.FunctionCallNode) (ProviderField, error) {
 		return ProviderField{}, fmt.Errorf("$httpError() second argument must be a string (message), got %T", fnCall.Args[1])
 	}
 
+	errorCode := ""
+	if len(fnCall.Args) == 3 {
+		codeNode, ok := fnCall.Args[2].(*jparse.StringNode)
+		if !ok {
+			return ProviderField{}, fmt.Errorf("$httpError() third argument must be a string (error code), got %T", fnCall.Args[2])
+		}
+		errorCode = codeNode.Value
+	}
+
 	return ProviderField{
 		Kind:         "error",
 		StatusCode:   int(statusCodeNode.Value),
 		ErrorMessage: messageNode.Value,
+		ErrorCode:    errorCode,
 	}, nil
 }
 

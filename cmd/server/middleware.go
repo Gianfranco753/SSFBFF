@@ -290,7 +290,7 @@ func panicRecoveryMiddleware(logger zerolog.Logger) fiber.Handler {
 				buf.Reset()
 				defer errorResponsePool.Put(buf)
 				
-				buf.WriteString(`{"error":"Internal Server Error","status":500}`)
+				buf.WriteString(`{"error":"Internal Server Error","status":500,"code":"INTERNAL_ERROR"}`)
 				c.Set("Content-Type", "application/json")
 				_ = c.Status(fiber.StatusInternalServerError).Send(buf.Bytes())
 			}

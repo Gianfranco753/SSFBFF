@@ -317,9 +317,11 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 								Msg("optional provider failed, using null")
 						}
 					}
-					return nil
-				}
-				return fmt.Errorf("%s/%s: %w", dep.Provider, dep.Endpoint, err)
+				return nil
+			}
+			// Sanitize error before returning to client
+			sanitizedMsg := runtime.SanitizeError(err)
+			return fmt.Errorf("%s", sanitizedMsg)
 			}
 
 			a.recordUpstreamCall(dep.Provider, dep.Endpoint, callDuration, "success")
@@ -369,17 +371,20 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 func (a *Aggregator) resolveURL(dep runtime.ProviderDep) (url string, timeout time.Duration, endpointCfg EndpointConfig, optional bool, err error) {
 	prov, ok := a.providers[dep.Provider]
 	if !ok {
-		return "", 0, EndpointConfig{}, false, fmt.Errorf("unknown provider %q", dep.Provider)
+		// Sanitize error - don't expose provider name to client
+		return "", 0, EndpointConfig{}, false, fmt.Errorf("unknown provider")
 	}
 
 	endpointCfg, ok = prov.Endpoints[dep.Endpoint]
 	if !ok {
-		// List available endpoints for better error context
+		// List available endpoints for logging (server-side only)
 		available := make([]string, 0, len(prov.Endpoints))
 		for k := range prov.Endpoints {
 			available = append(available, k)
 		}
-		return "", 0, EndpointConfig{}, prov.Optional, fmt.Errorf("provider %q has no endpoint %q (available: %v)", dep.Provider, dep.Endpoint, available)
+		// Sanitize error - don't expose provider/endpoint names to client
+		// Full details are logged server-side above
+		return "", 0, EndpointConfig{}, prov.Optional, fmt.Errorf("endpoint not found")
 	}
 
 	// Timeout precedence: endpoint-specific > provider-level > global default (10s)
@@ -400,7 +405,8 @@ func (a *Aggregator) resolveURL(dep runtime.ProviderDep) (url string, timeout ti
 func (a *Aggregator) doRequest(ctx context.Context, dep runtime.ProviderDep, url string) ([]byte, int, error) {
 	client, ok := a.clients[dep.Provider]
 	if !ok {
-		return nil, 0, fmt.Errorf("no client configured for provider %q", dep.Provider)
+		// Sanitize error - don't expose provider name to client
+		return nil, 0, fmt.Errorf("client not configured")
 	}
 
 	method := dep.Method
@@ -415,7 +421,9 @@ func (a *Aggregator) doRequest(ctx context.Context, dep runtime.ProviderDep, url
 
 	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
 	if err != nil {
-		return nil, 0, fmt.Errorf("building %s request to %s: %w", method, url, err)
+		// Sanitize error - remove URL and method details
+		sanitizedErr := runtime.SanitizeError(err)
+		return nil, 0, fmt.Errorf("failed to create request: %s", sanitizedErr)
 	}
 
 	for k, v := range dep.Headers {
@@ -424,17 +432,22 @@ func (a *Aggregator) doRequest(ctx context.Context, dep runtime.ProviderDep, url
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, 0, fmt.Errorf("%s request to %s failed: %w", method, url, err)
+		// Sanitize error - remove URL and method details
+		sanitizedErr := runtime.SanitizeError(err)
+		return nil, 0, fmt.Errorf("%s", sanitizedErr)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		return nil, resp.StatusCode, fmt.Errorf("%s request to %s returned status %d", method, url, resp.StatusCode)
+		// Sanitize error - remove URL and method details
+		return nil, resp.StatusCode, fmt.Errorf("upstream service returned error status %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, resp.StatusCode, fmt.Errorf("reading response body from %s %s: %w", method, url, err)
+		// Sanitize error - remove URL and method details
+		sanitizedErr := runtime.SanitizeError(err)
+		return nil, resp.StatusCode, fmt.Errorf("failed to read response: %s", sanitizedErr)
 	}
 	
 	return body, resp.StatusCode, nil
