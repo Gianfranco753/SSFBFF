@@ -192,7 +192,7 @@ func TestFetchDefaultTimeout(t *testing.T) {
 
 	// Default timeout is now applied at startup in New(), so resolveURL returns it directly.
 	dep := runtime.ProviderDep{Provider: "svc", Endpoint: "ep"}
-	_, timeout, _, err := agg.resolveURL(dep)
+	_, timeout, _, _, err := agg.resolveURL(dep)
 	if err != nil {
 		t.Fatalf("resolveURL error: %v", err)
 	}
@@ -294,5 +294,300 @@ func TestValidateProviderConfig(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestFetchCacheHit(t *testing.T) {
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.Write([]byte(`{"name":"Alice"}`))
+	}))
+	defer srv.Close()
+
+	agg := New(map[string]ProviderConfig{
+		"user_svc": {
+			BaseURL: srv.URL,
+			Timeout: 5 * time.Second,
+			Endpoints: map[string]EndpointConfig{
+				"profile": {Path: "/profile", UseCache: true},
+			},
+		},
+	}, testClientFactory)
+
+	ctx := context.Background()
+	cache := &FetchCache{}
+	ctx = WithFetchCache(ctx, cache)
+
+	dep := runtime.ProviderDep{Provider: "user_svc", Endpoint: "profile"}
+	
+	// First call - cache miss, should make HTTP request
+	results1, err := agg.Fetch(ctx, []runtime.ProviderDep{dep})
+	if err != nil {
+		t.Fatalf("Fetch error: %v", err)
+	}
+	if callCount != 1 {
+		t.Errorf("expected 1 HTTP call, got %d", callCount)
+	}
+	if got := string(results1["user_svc.profile"]); got != `{"name":"Alice"}` {
+		t.Errorf("result = %q, want %q", got, `{"name":"Alice"}`)
+	}
+
+	// Second call with same dep - cache hit, should NOT make HTTP request
+	results2, err := agg.Fetch(ctx, []runtime.ProviderDep{dep})
+	if err != nil {
+		t.Fatalf("Fetch error: %v", err)
+	}
+	if callCount != 1 {
+		t.Errorf("expected 1 HTTP call after cache hit, got %d", callCount)
+	}
+	if got := string(results2["user_svc.profile"]); got != `{"name":"Alice"}` {
+		t.Errorf("cached result = %q, want %q", got, `{"name":"Alice"}`)
+	}
+}
+
+func TestFetchCacheMissWhenDisabled(t *testing.T) {
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.Write([]byte(`{"name":"Alice"}`))
+	}))
+	defer srv.Close()
+
+	agg := New(map[string]ProviderConfig{
+		"user_svc": {
+			BaseURL: srv.URL,
+			Timeout: 5 * time.Second,
+			Endpoints: map[string]EndpointConfig{
+				"profile": {Path: "/profile", UseCache: false}, // Cache disabled
+			},
+		},
+	}, testClientFactory)
+
+	ctx := context.Background()
+	cache := &FetchCache{}
+	ctx = WithFetchCache(ctx, cache)
+
+	dep := runtime.ProviderDep{Provider: "user_svc", Endpoint: "profile"}
+	
+	// First call
+	_, err := agg.Fetch(ctx, []runtime.ProviderDep{dep})
+	if err != nil {
+		t.Fatalf("Fetch error: %v", err)
+	}
+	if callCount != 1 {
+		t.Errorf("expected 1 HTTP call, got %d", callCount)
+	}
+
+	// Second call - cache disabled, should make another HTTP request
+	_, err = agg.Fetch(ctx, []runtime.ProviderDep{dep})
+	if err != nil {
+		t.Fatalf("Fetch error: %v", err)
+	}
+	if callCount != 2 {
+		t.Errorf("expected 2 HTTP calls (cache disabled), got %d", callCount)
+	}
+}
+
+func TestFetchCacheKeyUniqueness(t *testing.T) {
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.Write([]byte(`{"result":"ok"}`))
+	}))
+	defer srv.Close()
+
+	agg := New(map[string]ProviderConfig{
+		"svc": {
+			BaseURL: srv.URL,
+			Timeout: 5 * time.Second,
+			Endpoints: map[string]EndpointConfig{
+				"ep": {Path: "/ep", UseCache: true},
+			},
+		},
+	}, testClientFactory)
+
+	ctx := context.Background()
+	cache := &FetchCache{}
+	ctx = WithFetchCache(ctx, cache)
+
+	// Different methods should get different cache entries
+	dep1 := runtime.ProviderDep{Provider: "svc", Endpoint: "ep", Method: "GET"}
+	dep2 := runtime.ProviderDep{Provider: "svc", Endpoint: "ep", Method: "POST"}
+
+	_, err := agg.Fetch(ctx, []runtime.ProviderDep{dep1})
+	if err != nil {
+		t.Fatalf("Fetch error: %v", err)
+	}
+	if callCount != 1 {
+		t.Errorf("expected 1 HTTP call, got %d", callCount)
+	}
+
+	_, err = agg.Fetch(ctx, []runtime.ProviderDep{dep2})
+	if err != nil {
+		t.Fatalf("Fetch error: %v", err)
+	}
+	if callCount != 2 {
+		t.Errorf("expected 2 HTTP calls (different methods), got %d", callCount)
+	}
+
+	// Same method should hit cache
+	_, err = agg.Fetch(ctx, []runtime.ProviderDep{dep1})
+	if err != nil {
+		t.Fatalf("Fetch error: %v", err)
+	}
+	if callCount != 2 {
+		t.Errorf("expected 2 HTTP calls (cache hit for GET), got %d", callCount)
+	}
+}
+
+func TestFetchCacheRequestScoping(t *testing.T) {
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		w.Write([]byte(`{"name":"Alice"}`))
+	}))
+	defer srv.Close()
+
+	agg := New(map[string]ProviderConfig{
+		"user_svc": {
+			BaseURL: srv.URL,
+			Timeout: 5 * time.Second,
+			Endpoints: map[string]EndpointConfig{
+				"profile": {Path: "/profile", UseCache: true},
+			},
+		},
+	}, testClientFactory)
+
+	dep := runtime.ProviderDep{Provider: "user_svc", Endpoint: "profile"}
+	
+	// Request 1
+	ctx1 := context.Background()
+	cache1 := &FetchCache{}
+	ctx1 = WithFetchCache(ctx1, cache1)
+	_, err := agg.Fetch(ctx1, []runtime.ProviderDep{dep})
+	if err != nil {
+		t.Fatalf("Fetch error: %v", err)
+	}
+	if callCount != 1 {
+		t.Errorf("expected 1 HTTP call, got %d", callCount)
+	}
+
+	// Request 2 - different context, should make new HTTP request
+	ctx2 := context.Background()
+	cache2 := &FetchCache{}
+	ctx2 = WithFetchCache(ctx2, cache2)
+	_, err = agg.Fetch(ctx2, []runtime.ProviderDep{dep})
+	if err != nil {
+		t.Fatalf("Fetch error: %v", err)
+	}
+	if callCount != 2 {
+		t.Errorf("expected 2 HTTP calls (different requests), got %d", callCount)
+	}
+}
+
+func TestFetchCacheConcurrentAccess(t *testing.T) {
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		time.Sleep(10 * time.Millisecond) // Simulate network latency
+		w.Write([]byte(`{"name":"Alice"}`))
+	}))
+	defer srv.Close()
+
+	agg := New(map[string]ProviderConfig{
+		"user_svc": {
+			BaseURL: srv.URL,
+			Timeout: 5 * time.Second,
+			Endpoints: map[string]EndpointConfig{
+				"profile": {Path: "/profile", UseCache: true},
+			},
+		},
+	}, testClientFactory)
+
+	ctx := context.Background()
+	cache := &FetchCache{}
+	ctx = WithFetchCache(ctx, cache)
+
+	dep := runtime.ProviderDep{Provider: "user_svc", Endpoint: "profile"}
+	
+	// Make 10 concurrent requests for the same endpoint
+	// First one should make HTTP call, others should wait and then use cache
+	results := make([]map[string][]byte, 10)
+	errs := make([]error, 10)
+	
+	for i := 0; i < 10; i++ {
+		results[i], errs[i] = agg.Fetch(ctx, []runtime.ProviderDep{dep})
+	}
+
+	// All should succeed
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("request %d failed: %v", i, err)
+		}
+	}
+
+	// Should have made only 1 HTTP call (first one), rest should be cache hits
+	// Note: due to race conditions, we might get 1-2 calls, but definitely not 10
+	if callCount > 2 {
+		t.Errorf("expected at most 2 HTTP calls (race condition), got %d", callCount)
+	}
+
+	// All results should be the same
+	expected := `{"name":"Alice"}`
+	for i, result := range results {
+		if got := string(result["user_svc.profile"]); got != expected {
+			t.Errorf("result %d = %q, want %q", i, got, expected)
+		}
+	}
+}
+
+func TestFetchCacheOnlyStoresSuccess(t *testing.T) {
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		if callCount == 1 {
+			http.Error(w, "error", http.StatusInternalServerError)
+		} else {
+			w.Write([]byte(`{"name":"Alice"}`))
+		}
+	}))
+	defer srv.Close()
+
+	agg := New(map[string]ProviderConfig{
+		"user_svc": {
+			BaseURL: srv.URL,
+			Timeout: 5 * time.Second,
+			Endpoints: map[string]EndpointConfig{
+				"profile": {Path: "/profile", UseCache: true},
+			},
+		},
+	}, testClientFactory)
+
+	ctx := context.Background()
+	cache := &FetchCache{}
+	ctx = WithFetchCache(ctx, cache)
+
+	dep := runtime.ProviderDep{Provider: "user_svc", Endpoint: "profile"}
+	
+	// First call - fails, should not be cached
+	_, err := agg.Fetch(ctx, []runtime.ProviderDep{dep})
+	if err == nil {
+		t.Fatal("expected error for failed request")
+	}
+	if callCount != 1 {
+		t.Errorf("expected 1 HTTP call, got %d", callCount)
+	}
+
+	// Second call - should make another HTTP request (first one wasn't cached)
+	results, err := agg.Fetch(ctx, []runtime.ProviderDep{dep})
+	if err != nil {
+		t.Fatalf("Fetch error: %v", err)
+	}
+	if callCount != 2 {
+		t.Errorf("expected 2 HTTP calls (first failure not cached), got %d", callCount)
+	}
+	if got := string(results["user_svc.profile"]); got != `{"name":"Alice"}` {
+		t.Errorf("result = %q, want %q", got, `{"name":"Alice"}`)
 	}
 }

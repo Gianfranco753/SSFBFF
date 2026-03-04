@@ -526,7 +526,11 @@ func generateConfigRoutes(routes []configRoute, pkg, genPkg string) ([]byte, err
 				w("\t\t}\n\n")
 			}
 
-			w("\t\tresp, err := generated.Execute%s(c.Context(), agg, reqCtx)\n", execName)
+			// Initialize request-scoped cache for $fetch() calls
+			w("\t\tfetchCache := &aggregator.FetchCache{}\n")
+			w("\t\tctx := aggregator.WithFetchCache(c.Context(), fetchCache)\n\n")
+
+			w("\t\tresp, err := generated.Execute%s(ctx, agg, reqCtx)\n", execName)
 			w("\t\tif err != nil {\n")
 			w("\t\t\t// Check if it's an HTTPError\n")
 			w("\t\t\tif httpErr, ok := err.(*runtime.HTTPError); ok {\n")

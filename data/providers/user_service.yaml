@@ -1,4 +1,10 @@
 base_url: http://user-svc:8080
 timeout: 5s
 endpoints:
+  # Simple string format (backward compatible)
   profile: /api/profile
+  
+  # Object format with caching enabled (useful when profile is called multiple times)
+  profile_cached:
+    path: /api/profile
+    use_cache: true

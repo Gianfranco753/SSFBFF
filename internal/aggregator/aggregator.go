@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gcossani/ssfbff/runtime"
@@ -22,10 +23,31 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// fetchCacheKey is a private type for context key to avoid collisions.
+type fetchCacheKey struct{}
+
+// FetchCache provides request-scoped caching for $fetch() responses.
+// Uses sync.Map for lock-free concurrent access optimized for high throughput.
+type FetchCache struct {
+	m sync.Map // map[string][]byte - cache key -> response body
+}
+
+// WithFetchCache attaches a FetchCache to the context for request-scoped caching.
+func WithFetchCache(ctx context.Context, cache *FetchCache) context.Context {
+	return context.WithValue(ctx, fetchCacheKey{}, cache)
+}
+
+// FetchCacheFromContext extracts the FetchCache from context if present.
+func FetchCacheFromContext(ctx context.Context) (*FetchCache, bool) {
+	cache, ok := ctx.Value(fetchCacheKey{}).(*FetchCache)
+	return cache, ok
+}
+
 // EndpointConfig describes a single endpoint configuration with optional timeout override.
 type EndpointConfig struct {
-	Path    string        `yaml:"path"`
-	Timeout time.Duration `yaml:"timeout"` // Optional, falls back to provider timeout
+	Path     string        `yaml:"path"`
+	Timeout  time.Duration `yaml:"timeout"` // Optional, falls back to provider timeout
+	UseCache bool          `yaml:"use_cache"` // Optional, enables request-scoped caching (default false)
 }
 
 // UnmarshalYAML implements custom YAML unmarshaling to support both string and object formats.
@@ -39,14 +61,16 @@ func (e *EndpointConfig) UnmarshalYAML(unmarshal func(interface{}) error) error 
 	}
 
 	var obj struct {
-		Path    string        `yaml:"path"`
-		Timeout time.Duration `yaml:"timeout"`
+		Path     string        `yaml:"path"`
+		Timeout  time.Duration `yaml:"timeout"`
+		UseCache bool          `yaml:"use_cache"`
 	}
 	if err := unmarshal(&obj); err != nil {
 		return err
 	}
 	e.Path = obj.Path
 	e.Timeout = obj.Timeout
+	e.UseCache = obj.UseCache
 	return nil
 }
 
@@ -191,7 +215,7 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 		for _, dep := range deps {
 		dep := dep // capture loop variable
 		g.Go(func() error {
-			url, timeout, optional, err := a.resolveURL(dep)
+			url, timeout, endpointCfg, optional, err := a.resolveURL(dep)
 			if err != nil {
 				if a.hasLogger {
 					if a.obsConfig.LogFunc != nil {
@@ -215,6 +239,19 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 					return nil
 				}
 				return err
+			}
+
+			// Check cache if enabled (early return for zero overhead when disabled)
+			if endpointCfg.UseCache {
+				if cache, ok := FetchCacheFromContext(gctx); ok {
+					cacheKey := dep.CacheKey()
+					if cached, hit := cache.m.Load(cacheKey); hit {
+						// Cache hit - use cached response
+						results[dep.Key()] = cached.([]byte)
+						a.recordUpstreamCall(dep.Provider, dep.Endpoint, 0, "cache_hit")
+						return nil
+					}
+				}
 			}
 
 			reqCtx, cancel := context.WithTimeout(gctx, timeout)
@@ -287,6 +324,13 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 
 			a.recordUpstreamCall(dep.Provider, dep.Endpoint, callDuration, "success")
 			
+			// Store in cache only on success and if enabled
+			if err == nil && statusCode < 400 && endpointCfg.UseCache {
+				if cache, ok := FetchCacheFromContext(gctx); ok {
+					cache.m.Store(dep.CacheKey(), body)
+				}
+			}
+			
 			results[dep.Key()] = body
 			return nil
 		})
@@ -319,23 +363,23 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 	return results, nil
 }
 
-// resolveURL builds the full URL for a dep and returns the endpoint-specific timeout
-// and whether the provider is optional. Timeout precedence: endpoint > provider > global default.
+// resolveURL builds the full URL for a dep and returns the endpoint-specific timeout,
+// endpoint config, and whether the provider is optional. Timeout precedence: endpoint > provider > global default.
 // Default timeouts were already applied at startup in New().
-func (a *Aggregator) resolveURL(dep runtime.ProviderDep) (url string, timeout time.Duration, optional bool, err error) {
+func (a *Aggregator) resolveURL(dep runtime.ProviderDep) (url string, timeout time.Duration, endpointCfg EndpointConfig, optional bool, err error) {
 	prov, ok := a.providers[dep.Provider]
 	if !ok {
-		return "", 0, false, fmt.Errorf("unknown provider %q", dep.Provider)
+		return "", 0, EndpointConfig{}, false, fmt.Errorf("unknown provider %q", dep.Provider)
 	}
 
-	endpointCfg, ok := prov.Endpoints[dep.Endpoint]
+	endpointCfg, ok = prov.Endpoints[dep.Endpoint]
 	if !ok {
 		// List available endpoints for better error context
 		available := make([]string, 0, len(prov.Endpoints))
 		for k := range prov.Endpoints {
 			available = append(available, k)
 		}
-		return "", 0, prov.Optional, fmt.Errorf("provider %q has no endpoint %q (available: %v)", dep.Provider, dep.Endpoint, available)
+		return "", 0, EndpointConfig{}, prov.Optional, fmt.Errorf("provider %q has no endpoint %q (available: %v)", dep.Provider, dep.Endpoint, available)
 	}
 
 	// Timeout precedence: endpoint-specific > provider-level > global default (10s)
@@ -347,7 +391,7 @@ func (a *Aggregator) resolveURL(dep runtime.ProviderDep) (url string, timeout ti
 		timeout = 10 * time.Second
 	}
 
-	return prov.BaseURL + endpointCfg.Path, timeout, prov.Optional, nil
+	return prov.BaseURL + endpointCfg.Path, timeout, endpointCfg, prov.Optional, nil
 }
 
 // doRequest makes an HTTP request respecting dep.Method, dep.Headers, and

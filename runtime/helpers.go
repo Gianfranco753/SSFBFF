@@ -13,6 +13,7 @@ import (
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
 	"fmt"
+	"hash/fnv"
 	"math"
 	"math/rand"
 	"sort"
@@ -69,6 +70,66 @@ func (d ProviderDep) Key() string {
 	builder.WriteString(d.Provider)
 	builder.WriteString(".")
 	builder.WriteString(d.Endpoint)
+	return builder.String()
+}
+
+// CacheKey returns a unique cache key for this dependency including provider, endpoint,
+// method, headers, and body. Used for request-scoped caching of $fetch() responses.
+// The key format is: "provider.endpoint:method:headers_hash:body_hash"
+func (d ProviderDep) CacheKey() string {
+	method := d.Method
+	if method == "" {
+		method = "GET"
+	}
+
+	// Estimate capacity: provider + endpoint + method + headers + body hash
+	// Rough estimate: 50 for base parts + 100 for headers + 20 for hashes
+	estimatedCap := len(d.Provider) + len(d.Endpoint) + len(method) + 200
+	var builder strings.Builder
+	builder.Grow(estimatedCap)
+
+	// Base: provider.endpoint:method
+	builder.WriteString(d.Provider)
+	builder.WriteString(".")
+	builder.WriteString(d.Endpoint)
+	builder.WriteString(":")
+	builder.WriteString(method)
+	builder.WriteString(":")
+
+	// Headers: sort keys and build "k1:v1|k2:v2" format
+	if len(d.Headers) > 0 {
+		keys := make([]string, 0, len(d.Headers))
+		for k := range d.Headers {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for i, k := range keys {
+			if i > 0 {
+				builder.WriteString("|")
+			}
+			builder.WriteString(k)
+			builder.WriteString(":")
+			builder.WriteString(d.Headers[k])
+		}
+	}
+	builder.WriteString(":")
+
+	// Body hash: use fast FNV hash for performance
+	if len(d.Body) > 0 {
+		h := fnv.New64a()
+		// For small bodies, hash the full content. For larger bodies, hash first 512 bytes + length
+		if len(d.Body) <= 512 {
+			h.Write(d.Body)
+		} else {
+			h.Write(d.Body[:512])
+			// Include length in hash to differentiate bodies with same prefix
+			h.Write([]byte(strconv.Itoa(len(d.Body))))
+		}
+		builder.WriteString(strconv.FormatUint(h.Sum64(), 16))
+	} else {
+		builder.WriteString("0")
+	}
+
 	return builder.String()
 }
 

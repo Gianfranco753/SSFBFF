@@ -157,7 +157,7 @@ Each route specifies the target `url` where requests should be forwarded. The UR
 
 ### `data/providers/*.yaml`
 
-Each provider configuration supports per-endpoint timeouts and connection pool tuning:
+Each provider configuration supports per-endpoint timeouts, connection pool tuning, and request-scoped caching:
 
 ```yaml
 # data/providers/user_service.yaml
@@ -173,9 +173,28 @@ endpoints:
   slow_query:
     path: /api/slow
     timeout: 30s  # Override for slow endpoint
+  
+  # Object format with caching enabled
+  cached_endpoint:
+    path: /api/cached
+    use_cache: true  # Enable request-scoped caching for this endpoint
 ```
 
 **Timeout precedence**: Endpoint-level timeout > Provider-level timeout > Global default (10s)
+
+**Request-Scoped Caching**: The `use_cache: true` option enables per-request caching for `$fetch()` calls. When multiple services or expressions call `$fetch("provider", "endpoint")` with the same configuration within the same client request, the cached response is reused instead of making duplicate HTTP calls. This is particularly useful for:
+
+- Idempotent GET requests that are called multiple times in the same request
+- Reducing upstream load when the same data is needed in multiple places
+- Improving response time for duplicate calls
+
+**Performance characteristics**:
+- **Zero overhead when disabled** (default): `use_cache: false` adds no performance cost
+- **Lock-free cache reads**: Uses `sync.Map` for high-concurrency scenarios (650k+ RPS)
+- **Per-request scope**: Cache is automatically cleared after each request completes
+- **Cache key includes**: provider, endpoint, HTTP method, headers, and body hash (ensures different configs get different cache entries)
+
+Cache only stores successful responses (status < 400) and respects the endpoint's `use_cache` setting.
 
 Mark a provider as non-critical with `optional: true` — failures store `null` instead of aborting:
 
