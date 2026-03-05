@@ -6,6 +6,7 @@ require (
 	github.com/blues/jsonata-go v1.5.4
 	github.com/gofiber/contrib/v3/otel v1.1.0
 	github.com/gofiber/fiber/v3 v3.1.0
+	github.com/open-feature/go-sdk v1.17.1
 	github.com/prometheus/client_golang v1.20.5
 	github.com/rs/zerolog v1.33.0
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.66.0
@@ -47,6 +48,7 @@ require (
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.41.0 // indirect
 	go.opentelemetry.io/otel/metric v1.41.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.9.0 // indirect
+	go.uber.org/mock v0.6.0 // indirect
 	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/net v0.51.0 // indirect
 	golang.org/x/sys v0.41.0 // indirect

@@ -557,14 +557,75 @@ OpenFeature integration allows environment variables to be overridden by feature
 
 | Variable | Description | Default |
 |---|---|---|
-| `OPENFEATURE_PROVIDER` | Provider type (e.g., "envvar", "inmemory", "http"). If not set, OpenFeature is disabled | — |
+| `OPENFEATURE_PROVIDER` | Provider type: `"envvar"`, `"inmemory"`, or `"http"`. If not set, OpenFeature is disabled | — |
 | `OPENFEATURE_CACHE_TTL` | Cache TTL in seconds for flag values (0 = no cache, enables instant flag changes). Recommended: 60-300 for high performance | `0` |
 
 **How it works:**
 - If `OPENFEATURE_PROVIDER` is not set, the system behaves exactly as before (all values from cached env vars)
 - If OpenFeature is enabled, flag values take precedence over environment variables
 - If a flag is not found in OpenFeature, the system falls back to the cached environment variable value
-- Flag changes are reflected immediately when `OPENFEATURE_CACHE_TTL=0`, or after TTL expires when `OPENFEATURE_CACHE_TTL>0`
+- **Push/Streaming Priority**: When providers support eventing (implement `EventHandler`), flag changes are pushed via events and cache is invalidated immediately for real-time updates
+- **TTL Fallback**: When `OPENFEATURE_CACHE_TTL=0`, flags are evaluated on every access. When `OPENFEATURE_CACHE_TTL>0`, TTL caching is used as a fallback for providers without push/streaming support
+- Flag keys use the same names as environment variables (e.g., `PORT`, `LOG_LEVEL`, `MAX_IDLE_CONNS_PER_HOST`)
+
+**Evaluation Model (Push/Streaming Priority):**
+- **In-process**: All flag evaluation happens synchronously within the same process (no external calls during evaluation for built-in providers)
+- **Push/Streaming Priority**: The implementation prioritizes push/streaming updates via OpenFeature's eventing system. When providers emit `ProviderConfigChange` events, cache entries are invalidated immediately, ensuring real-time flag updates
+- **TTL Fallback**: When `OPENFEATURE_CACHE_TTL>0`, TTL caching is used as a fallback mechanism for providers that don't support push/streaming events. Cache entries are invalidated by events when available, or expire after TTL when events are not supported
+- **Event-driven cache invalidation**: Providers that implement the `EventHandler` interface can emit events when flags change. The system listens to these events and invalidates the cache for changed flags immediately, ensuring instant updates without waiting for TTL expiration
+- **Provider support**: External providers (e.g., LaunchDarkly, Split.io) that support push/streaming will automatically benefit from real-time updates. Built-in providers (`envvar`, `inmemory`) can be extended to support eventing
+
+**Provider Types:**
+
+1. **`envvar`** - Reads flags from environment variables
+   - Useful for testing or when you want flags to come from env vars
+   - Example: `OPENFEATURE_PROVIDER=envvar`
+   - Flags are read from environment variables with the same name (e.g., `PORT` flag reads from `PORT` env var)
+
+2. **`inmemory`** - Simple in-memory provider (currently empty, can be extended)
+   - Best for testing or simple use cases
+   - Example: `OPENFEATURE_PROVIDER=inmemory`
+   - Note: This provider currently has no flags configured by default. You would need to extend the implementation to populate flags.
+
+3. **`http`** - HTTP-based provider (placeholder, requires implementation)
+   - For integration with external feature flag services
+   - Example: `OPENFEATURE_PROVIDER=http`
+   - Note: This is a placeholder and requires additional implementation to connect to an actual HTTP-based feature flag service.
+
+**Configuration Examples:**
+
+**Basic setup with envvar provider:**
+```bash
+export OPENFEATURE_PROVIDER=envvar
+export OPENFEATURE_CACHE_TTL=60
+# Now flags can override env vars
+export PORT=8080  # This will be used as the flag value
+```
+
+**High-performance setup with caching:**
+```bash
+export OPENFEATURE_PROVIDER=inmemory
+export OPENFEATURE_CACHE_TTL=300  # Cache for 5 minutes
+```
+
+**Instant flag changes (no cache):**
+```bash
+export OPENFEATURE_PROVIDER=envvar
+export OPENFEATURE_CACHE_TTL=0  # No caching, changes take effect immediately
+```
+
+**Using with Docker:**
+```bash
+docker run -e OPENFEATURE_PROVIDER=envvar \
+           -e OPENFEATURE_CACHE_TTL=60 \
+           -e PORT=3000 \
+           your-image
+```
+
+**Flag Naming Convention:**
+- Flags use the same names as environment variables
+- Example: To override `LOG_LEVEL`, create a flag named `LOG_LEVEL` in your provider
+- Example: To override `MAX_IDLE_CONNS_PER_HOST`, create a flag named `MAX_IDLE_CONNS_PER_HOST`
 
 **Performance Recommendations for High Throughput:**
 
@@ -577,6 +638,15 @@ OpenFeature integration allows environment variables to be overridden by feature
 - **OpenFeature disabled**: Zero overhead (same performance as baseline)
 - **OpenFeature enabled, TTL = 0**: ~100-1000ns+ per call (depends on provider)
 - **OpenFeature enabled, TTL > 0**: Cache hits ~5-10ns (similar to baseline), cache misses ~100-1000ns+
+
+**Advanced: Using External Providers**
+
+To use external feature flag services (e.g., LaunchDarkly, Split.io, etc.), you'll need to:
+1. Install the provider package: `go get github.com/open-feature/go-sdk-contrib/providers/<provider-name>`
+2. Modify `cmd/server/openfeature.go` to import and initialize the external provider
+3. Set `OPENFEATURE_PROVIDER` to your provider type and configure provider-specific environment variables
+
+See the [OpenFeature providers documentation](https://openfeature.dev/docs/reference/concepts/provider) for available providers.
 
 ### Performance Tuning
 

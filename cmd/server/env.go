@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"net/url"
 	"os"
@@ -83,15 +84,36 @@ var (
 		httpsProxy *url.URL
 		noProxy    []string
 		proxyFunc  func(*http.Request) (*url.URL, error)
+
+		// OpenFeature configuration
+		openFeatureEnabled bool
+		openFeatureCacheTTL time.Duration
+		openFeatureCache struct {
+			mu      sync.RWMutex
+			entries map[string]cacheEntry
+		}
 	}
 	envCacheOnce sync.Once
 )
+
+// cacheEntry holds a cached flag value with expiration time
+type cacheEntry struct {
+	value   interface{}
+	expires time.Time
+}
 
 // initEnvCache loads all environment variables into the cache at startup.
 // This is called via init() to ensure it runs before any package-level variable initializations.
 func initEnvCache() {
 	envCache.mu.Lock()
 	defer envCache.mu.Unlock()
+
+	// Initialize OpenFeature if configured
+	envCache.openFeatureEnabled = initOpenFeature()
+	if envCache.openFeatureEnabled {
+		envCache.openFeatureCacheTTL = openFeatureCfg.cacheTTL
+		envCache.openFeatureCache.entries = make(map[string]cacheEntry)
+	}
 
 	// Server configuration
 	envCache.port = getEnvString("PORT", "3000")
@@ -185,207 +207,404 @@ func ensureCacheInitialized() {
 	envCacheOnce.Do(initEnvCache)
 }
 
+// Helper functions for OpenFeature flag evaluation with push/streaming priority
+
+// getCachedFlagString gets a string value from OpenFeature (push/streaming updates via events, TTL as fallback) or falls back to env var
+func getCachedFlagString(flagKey string, envVarValue string) string {
+	if !envCache.openFeatureEnabled {
+		return envVarValue
+	}
+
+	ctx := context.Background()
+
+	// Check cache first (entries are invalidated by push/streaming events, TTL is fallback)
+	if envCache.openFeatureCacheTTL > 0 {
+		envCache.openFeatureCache.mu.RLock()
+		if entry, ok := envCache.openFeatureCache.entries[flagKey]; ok {
+			// If TTL is set, check expiration (fallback mechanism)
+			// If entry exists and not expired, use cached value
+			// Events will have already invalidated stale entries
+			if time.Now().Before(entry.expires) {
+				value := entry.value.(string)
+				envCache.openFeatureCache.mu.RUnlock()
+				return value
+			}
+		}
+		envCache.openFeatureCache.mu.RUnlock()
+	}
+
+	// Evaluate flag (cache miss or expired)
+	if flagValue, found := evaluateFlagString(ctx, flagKey); found {
+		// Cache the value (TTL used as fallback when events not available)
+		if envCache.openFeatureCacheTTL > 0 {
+			envCache.openFeatureCache.mu.Lock()
+			envCache.openFeatureCache.entries[flagKey] = cacheEntry{
+				value:   flagValue,
+				expires: time.Now().Add(envCache.openFeatureCacheTTL),
+			}
+			envCache.openFeatureCache.mu.Unlock()
+		}
+		return flagValue
+	}
+
+	return envVarValue
+}
+
+// getCachedFlagInt gets an int value from OpenFeature (push/streaming updates via events, TTL as fallback) or falls back to env var
+func getCachedFlagInt(flagKey string, envVarValue int) int {
+	if !envCache.openFeatureEnabled {
+		return envVarValue
+	}
+
+	ctx := context.Background()
+
+	// Check cache first (entries are invalidated by push/streaming events, TTL is fallback)
+	if envCache.openFeatureCacheTTL > 0 {
+		envCache.openFeatureCache.mu.RLock()
+		if entry, ok := envCache.openFeatureCache.entries[flagKey]; ok {
+			if time.Now().Before(entry.expires) {
+				value := entry.value.(int)
+				envCache.openFeatureCache.mu.RUnlock()
+				return value
+			}
+		}
+		envCache.openFeatureCache.mu.RUnlock()
+	}
+
+	// Evaluate flag (cache miss or expired)
+	if flagValue, found := evaluateFlagInt(ctx, flagKey); found {
+		// Cache the value (TTL used as fallback when events not available)
+		if envCache.openFeatureCacheTTL > 0 {
+			envCache.openFeatureCache.mu.Lock()
+			envCache.openFeatureCache.entries[flagKey] = cacheEntry{
+				value:   flagValue,
+				expires: time.Now().Add(envCache.openFeatureCacheTTL),
+			}
+			envCache.openFeatureCache.mu.Unlock()
+		}
+		return flagValue
+	}
+
+	return envVarValue
+}
+
+// getCachedFlagBool gets a bool value from OpenFeature (push/streaming updates via events, TTL as fallback) or falls back to env var
+func getCachedFlagBool(flagKey string, envVarValue bool) bool {
+	if !envCache.openFeatureEnabled {
+		return envVarValue
+	}
+
+	ctx := context.Background()
+
+	// Check cache first (entries are invalidated by push/streaming events, TTL is fallback)
+	if envCache.openFeatureCacheTTL > 0 {
+		envCache.openFeatureCache.mu.RLock()
+		if entry, ok := envCache.openFeatureCache.entries[flagKey]; ok {
+			if time.Now().Before(entry.expires) {
+				value := entry.value.(bool)
+				envCache.openFeatureCache.mu.RUnlock()
+				return value
+			}
+		}
+		envCache.openFeatureCache.mu.RUnlock()
+	}
+
+	// Evaluate flag (cache miss or expired)
+	if flagValue, found := evaluateFlagBool(ctx, flagKey); found {
+		// Cache the value (TTL used as fallback when events not available)
+		if envCache.openFeatureCacheTTL > 0 {
+			envCache.openFeatureCache.mu.Lock()
+			envCache.openFeatureCache.entries[flagKey] = cacheEntry{
+				value:   flagValue,
+				expires: time.Now().Add(envCache.openFeatureCacheTTL),
+			}
+			envCache.openFeatureCache.mu.Unlock()
+		}
+		return flagValue
+	}
+
+	return envVarValue
+}
+
+// getCachedFlagDuration gets a duration value from OpenFeature (push/streaming updates via events, TTL as fallback) or falls back to env var
+func getCachedFlagDuration(flagKey string, envVarValue time.Duration) time.Duration {
+	if !envCache.openFeatureEnabled {
+		return envVarValue
+	}
+
+	ctx := context.Background()
+
+	// Check cache first (entries are invalidated by push/streaming events, TTL is fallback)
+	if envCache.openFeatureCacheTTL > 0 {
+		envCache.openFeatureCache.mu.RLock()
+		if entry, ok := envCache.openFeatureCache.entries[flagKey]; ok {
+			if time.Now().Before(entry.expires) {
+				value := entry.value.(time.Duration)
+				envCache.openFeatureCache.mu.RUnlock()
+				return value
+			}
+		}
+		envCache.openFeatureCache.mu.RUnlock()
+	}
+
+	// Evaluate flag as string and parse to duration (cache miss or expired)
+	if flagValue, found := evaluateFlagString(ctx, flagKey); found {
+		if parsed, err := time.ParseDuration(flagValue); err == nil && parsed > 0 {
+			// Cache the value (TTL used as fallback when events not available)
+			if envCache.openFeatureCacheTTL > 0 {
+				envCache.openFeatureCache.mu.Lock()
+				envCache.openFeatureCache.entries[flagKey] = cacheEntry{
+					value:   parsed,
+					expires: time.Now().Add(envCache.openFeatureCacheTTL),
+				}
+				envCache.openFeatureCache.mu.Unlock()
+			}
+			return parsed
+		}
+	}
+
+	return envVarValue
+}
+
+// getCachedFlagFloat gets a float value from OpenFeature (push/streaming updates via events, TTL as fallback) or falls back to env var
+func getCachedFlagFloat(flagKey string, envVarValue float64) float64 {
+	if !envCache.openFeatureEnabled {
+		return envVarValue
+	}
+
+	ctx := context.Background()
+
+	// Check cache first (entries are invalidated by push/streaming events, TTL is fallback)
+	if envCache.openFeatureCacheTTL > 0 {
+		envCache.openFeatureCache.mu.RLock()
+		if entry, ok := envCache.openFeatureCache.entries[flagKey]; ok {
+			if time.Now().Before(entry.expires) {
+				value := entry.value.(float64)
+				envCache.openFeatureCache.mu.RUnlock()
+				return value
+			}
+		}
+		envCache.openFeatureCache.mu.RUnlock()
+	}
+
+	// Evaluate flag (cache miss or expired)
+	if flagValue, found := evaluateFlagFloat(ctx, flagKey); found {
+		// Cache the value (TTL used as fallback when events not available)
+		if envCache.openFeatureCacheTTL > 0 {
+			envCache.openFeatureCache.mu.Lock()
+			envCache.openFeatureCache.entries[flagKey] = cacheEntry{
+				value:   flagValue,
+				expires: time.Now().Add(envCache.openFeatureCacheTTL),
+			}
+			envCache.openFeatureCache.mu.Unlock()
+		}
+		return flagValue
+	}
+
+	return envVarValue
+}
+
 // Helper functions to get cached values.
-// Cache is read-only after init(), so no locks needed for reads.
+// These functions now check OpenFeature first (with TTL caching), then fall back to env vars.
 
 func getCachedPort() string {
 	ensureCacheInitialized()
-	return envCache.port
+	return getCachedFlagString("PORT", envCache.port)
 }
 
 func getCachedDataDir() string {
 	ensureCacheInitialized()
-	return envCache.dataDir
+	return getCachedFlagString("DATA_DIR", envCache.dataDir)
 }
 
 func getCachedMaxIdleConnsPerHost() int {
 	ensureCacheInitialized()
-	return envCache.maxIdleConnsPerHost
+	return getCachedFlagInt("MAX_IDLE_CONNS_PER_HOST", envCache.maxIdleConnsPerHost)
 }
 
 func getCachedMaxConnsPerHost() int {
 	ensureCacheInitialized()
-	return envCache.maxConnsPerHost
+	return getCachedFlagInt("MAX_CONNS_PER_HOST", envCache.maxConnsPerHost)
 }
 
 func getCachedIdleConnTimeout() time.Duration {
 	ensureCacheInitialized()
-	return envCache.idleConnTimeout
+	return getCachedFlagDuration("IDLE_CONN_TIMEOUT", envCache.idleConnTimeout)
 }
 
 func getCachedDialTimeout() time.Duration {
 	ensureCacheInitialized()
-	return envCache.dialTimeout
+	return getCachedFlagDuration("DIAL_TIMEOUT", envCache.dialTimeout)
 }
 
 func getCachedKeepAlive() time.Duration {
 	ensureCacheInitialized()
-	return envCache.keepAlive
+	return getCachedFlagDuration("KEEP_ALIVE", envCache.keepAlive)
 }
 
 func getCachedFiberPrefork() bool {
 	ensureCacheInitialized()
-	return envCache.fiberPrefork
+	return getCachedFlagBool("FIBER_PREFORK", envCache.fiberPrefork)
 }
 
 func getCachedFiberConcurrency() int {
 	ensureCacheInitialized()
-	return envCache.fiberConcurrency
+	return getCachedFlagInt("FIBER_CONCURRENCY", envCache.fiberConcurrency)
 }
 
 func getCachedFiberBodyLimit() int {
 	ensureCacheInitialized()
-	return envCache.fiberBodyLimit
+	return getCachedFlagInt("FIBER_BODY_LIMIT", envCache.fiberBodyLimit)
 }
 
 func getCachedFiberReadTimeout() time.Duration {
 	ensureCacheInitialized()
-	return envCache.fiberReadTimeout
+	return getCachedFlagDuration("FIBER_READ_TIMEOUT", envCache.fiberReadTimeout)
 }
 
 func getCachedFiberWriteTimeout() time.Duration {
 	ensureCacheInitialized()
-	return envCache.fiberWriteTimeout
+	return getCachedFlagDuration("FIBER_WRITE_TIMEOUT", envCache.fiberWriteTimeout)
 }
 
 func getCachedFiberIdleTimeout() time.Duration {
 	ensureCacheInitialized()
-	return envCache.fiberIdleTimeout
+	return getCachedFlagDuration("FIBER_IDLE_TIMEOUT", envCache.fiberIdleTimeout)
 }
 
 func getCachedLogLevel() string {
 	ensureCacheInitialized()
-	return envCache.logLevel
+	return getCachedFlagString("LOG_LEVEL", envCache.logLevel)
 }
 
 func getCachedLogFormat() string {
 	ensureCacheInitialized()
-	return envCache.logFormat
+	return getCachedFlagString("LOG_FORMAT", envCache.logFormat)
 }
 
 func getCachedAsyncLogging() bool {
 	ensureCacheInitialized()
-	return envCache.asyncLogging
+	return getCachedFlagBool("ASYNC_LOGGING", envCache.asyncLogging)
 }
 
 func getCachedEnableErrorLogging() bool {
 	ensureCacheInitialized()
-	return envCache.enableErrorLogging
+	return getCachedFlagBool("ENABLE_ERROR_LOGGING", envCache.enableErrorLogging)
 }
 
 func getCachedAsyncLoggingBufferSize() int {
 	ensureCacheInitialized()
-	return envCache.asyncLoggingBufferSize
+	return getCachedFlagInt("ASYNC_LOGGING_BUFFER_SIZE", envCache.asyncLoggingBufferSize)
 }
 
 func getCachedOtelSDKDisabled() bool {
 	ensureCacheInitialized()
-	return envCache.otelSDKDisabled
+	return getCachedFlagBool("OTEL_SDK_DISABLED", envCache.otelSDKDisabled)
 }
 
 func getCachedOtelTracesExporter() string {
 	ensureCacheInitialized()
-	return envCache.otelTracesExporter
+	return getCachedFlagString("OTEL_TRACES_EXPORTER", envCache.otelTracesExporter)
 }
 
 func getCachedOtelDisableTracing() bool {
 	ensureCacheInitialized()
-	return envCache.otelDisableTracing
+	return getCachedFlagBool("OTEL_DISABLE_TRACING", envCache.otelDisableTracing)
 }
 
 func getCachedOtelServiceName() string {
 	ensureCacheInitialized()
-	return envCache.otelServiceName
+	return getCachedFlagString("OTEL_SERVICE_NAME", envCache.otelServiceName)
 }
 
 func getCachedOtelPropagateUpstream() bool {
 	ensureCacheInitialized()
-	return envCache.otelPropagateUpstream
+	return getCachedFlagBool("OTEL_PROPAGATE_UPSTREAM", envCache.otelPropagateUpstream)
 }
 
 func getCachedOtelPropagateDownstream() bool {
 	ensureCacheInitialized()
-	return envCache.otelPropagateDownstream
+	return getCachedFlagBool("OTEL_PROPAGATE_DOWNSTREAM", envCache.otelPropagateDownstream)
 }
 
 func getCachedOtelExporterOTLPEndpoint() string {
 	ensureCacheInitialized()
-	return envCache.otelExporterOTLPEndpoint
+	return getCachedFlagString("OTEL_EXPORTER_OTLP_ENDPOINT", envCache.otelExporterOTLPEndpoint)
 }
 
 func getCachedOtelExporterOTLPTracesEndpoint() string {
 	ensureCacheInitialized()
-	return envCache.otelExporterOTLPTracesEndpoint
+	return getCachedFlagString("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", envCache.otelExporterOTLPTracesEndpoint)
 }
 
 func getCachedEnableMetrics() bool {
 	ensureCacheInitialized()
-	return envCache.enableMetrics
+	return getCachedFlagBool("ENABLE_METRICS", envCache.enableMetrics)
 }
 
 func getCachedMetricsLabelCacheEnabled() bool {
 	ensureCacheInitialized()
-	return envCache.metricsLabelCacheEnabled
+	return getCachedFlagBool("METRICS_LABEL_CACHE_ENABLED", envCache.metricsLabelCacheEnabled)
 }
 
 func getCachedMetricsCacheTTL() int {
 	ensureCacheInitialized()
-	return envCache.metricsCacheTTL
+	return getCachedFlagInt("METRICS_CACHE_TTL", envCache.metricsCacheTTL)
 }
 
 func getCachedMetricsBatchingEnabled() bool {
 	ensureCacheInitialized()
-	return envCache.metricsBatchingEnabled
+	return getCachedFlagBool("METRICS_BATCHING_ENABLED", envCache.metricsBatchingEnabled)
 }
 
 func getCachedMetricsBatchSize() int {
 	ensureCacheInitialized()
-	return envCache.metricsBatchSize
+	return getCachedFlagInt("METRICS_BATCH_SIZE", envCache.metricsBatchSize)
 }
 
 func getCachedMetricsBatchInterval() time.Duration {
 	ensureCacheInitialized()
-	return envCache.metricsBatchInterval
+	return getCachedFlagDuration("METRICS_BATCH_INTERVAL", envCache.metricsBatchInterval)
 }
 
 func getCachedMetricsSampleRate() float64 {
 	ensureCacheInitialized()
-	return envCache.metricsSampleRate
+	return getCachedFlagFloat("METRICS_SAMPLE_RATE", envCache.metricsSampleRate)
 }
 
 func getCachedMetricsBatcherChannelSize() int {
 	ensureCacheInitialized()
-	return envCache.metricsBatcherChannelSize
+	return getCachedFlagInt("METRICS_BATCHER_CHANNEL_SIZE", envCache.metricsBatcherChannelSize)
 }
 
 func getCachedUseTraceIDAsRequestID() bool {
 	ensureCacheInitialized()
-	return envCache.useTraceIDAsRequestID
+	return getCachedFlagBool("USE_TRACE_ID_AS_REQUEST_ID", envCache.useTraceIDAsRequestID)
 }
 
 func getCachedHealthCheckTimeout() time.Duration {
 	ensureCacheInitialized()
-	return envCache.healthCheckTimeout
+	return getCachedFlagDuration("HEALTH_CHECK_TIMEOUT", envCache.healthCheckTimeout)
 }
 
 func getCachedHealthCheckFailureThreshold() int {
 	ensureCacheInitialized()
-	return envCache.healthCheckFailureThreshold
+	return getCachedFlagInt("HEALTH_CHECK_FAILURE_THRESHOLD", envCache.healthCheckFailureThreshold)
 }
 
 func getCachedShutdownTimeout() time.Duration {
 	ensureCacheInitialized()
-	return envCache.shutdownTimeout
+	return getCachedFlagDuration("SHUTDOWN_TIMEOUT", envCache.shutdownTimeout)
 }
 
 func getCachedEnableDocs() bool {
 	ensureCacheInitialized()
-	return envCache.enableDocs
+	return getCachedFlagBool("ENABLE_DOCS", envCache.enableDocs)
 }
 
 func getCachedMaxResponseBodySize() int {
 	ensureCacheInitialized()
-	return envCache.maxResponseBodySize
+	return getCachedFlagInt("MAX_RESPONSE_BODY_SIZE", envCache.maxResponseBodySize)
 }
 
 func getCachedProxyFunc() func(*http.Request) (*url.URL, error) {
@@ -564,6 +783,16 @@ func resetEnvCacheForTesting() {
 	envCache.noProxy = nil
 	envCache.proxyFunc = nil
 	envCache.metricsBatcherChannelSize = 0
+	// Reset OpenFeature state
+	envCache.openFeatureEnabled = false
+	envCache.openFeatureCacheTTL = 0
+	envCache.openFeatureCache.mu.Lock()
+	envCache.openFeatureCache.entries = make(map[string]cacheEntry)
+	envCache.openFeatureCache.mu.Unlock()
+	// Reset global OpenFeature config
+	openFeatureCfg.enabled = false
+	openFeatureCfg.client = nil
+	openFeatureCfg.cacheTTL = 0
 	envCache.mu.Unlock()
 	initEnvCache()
 }
