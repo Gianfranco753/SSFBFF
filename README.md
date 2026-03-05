@@ -913,6 +913,23 @@ This script removes:
 
 Multi-stage build: generates all code, compiles a static binary, produces a minimal image (~15 MB).
 
+### Building Locally
+
+To create the image locally (using podman or docker):
+
+```bash
+./scripts/generate-generate-go.sh && GOEXPERIMENT=jsonv2 go generate ./internal/generated/ && GOEXPERIMENT=jsonv2 go test ./... && podman build -t bff-app . && ./scripts/clean.sh
+```
+
+This command:
+1. Regenerates `generate.go` from your JSONata files
+2. Generates all transform and route code
+3. Runs tests
+4. Builds the Docker image
+5. Cleans up generated files
+
+### Running the Image
+
 ```bash
 # Build
 docker build -t bff-app .
