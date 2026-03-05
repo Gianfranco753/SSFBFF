@@ -15,7 +15,16 @@ import (
 
 // testClientFactory creates a simple default http.Client factory for tests.
 func testClientFactory(cfg ProviderConfig) *http.Client {
-	return &http.Client{Timeout: 10 * time.Second}
+	transport := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 50,
+		MaxConnsPerHost:     100,
+		IdleConnTimeout:     90 * time.Second,
+	}
+	return &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: transport,
+	}
 }
 
 // makeEndpoints is a helper to create endpoint maps from string paths (backward compatible format).
@@ -320,7 +329,7 @@ func TestFetchCacheHit(t *testing.T) {
 	ctx = WithFetchCache(ctx, cache)
 
 	dep := runtime.ProviderDep{Provider: "user_svc", Endpoint: "profile"}
-	
+
 	// First call - cache miss, should make HTTP request
 	results1, err := agg.Fetch(ctx, []runtime.ProviderDep{dep})
 	if err != nil {
@@ -369,7 +378,7 @@ func TestFetchCacheMissWhenDisabled(t *testing.T) {
 	ctx = WithFetchCache(ctx, cache)
 
 	dep := runtime.ProviderDep{Provider: "user_svc", Endpoint: "profile"}
-	
+
 	// First call
 	_, err := agg.Fetch(ctx, []runtime.ProviderDep{dep})
 	if err != nil {
@@ -460,7 +469,7 @@ func TestFetchCacheRequestScoping(t *testing.T) {
 	}, testClientFactory)
 
 	dep := runtime.ProviderDep{Provider: "user_svc", Endpoint: "profile"}
-	
+
 	// Request 1
 	ctx1 := context.Background()
 	cache1 := &FetchCache{}
@@ -510,12 +519,12 @@ func TestFetchCacheConcurrentAccess(t *testing.T) {
 	ctx = WithFetchCache(ctx, cache)
 
 	dep := runtime.ProviderDep{Provider: "user_svc", Endpoint: "profile"}
-	
+
 	// Make 10 concurrent requests for the same endpoint
 	// First one should make HTTP call, others should wait and then use cache
 	results := make([]map[string][]byte, 10)
 	errs := make([]error, 10)
-	
+
 	for i := 0; i < 10; i++ {
 		results[i], errs[i] = agg.Fetch(ctx, []runtime.ProviderDep{dep})
 	}
@@ -569,7 +578,7 @@ func TestFetchCacheOnlyStoresSuccess(t *testing.T) {
 	ctx = WithFetchCache(ctx, cache)
 
 	dep := runtime.ProviderDep{Provider: "user_svc", Endpoint: "profile"}
-	
+
 	// First call - fails, should not be cached
 	_, err := agg.Fetch(ctx, []runtime.ProviderDep{dep})
 	if err == nil {

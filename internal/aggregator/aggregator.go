@@ -209,10 +209,10 @@ func (a *Aggregator) GetProviders() map[string]ProviderConfig {
 func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map[string][]byte, error) {
 	startTime := time.Now()
 	// Pre-allocate results map with all keys initialized to nil.
-	// This allows concurrent writes to different keys without mutex since:
-	// 1. Map is pre-allocated (no resizing during writes)
-	// 2. Each goroutine writes to a unique key (dep.Key() is unique per dependency)
+	// Each goroutine writes to a unique key (dep.Key() is unique per dependency),
+	// but Go maps require synchronization for concurrent writes.
 	results := make(map[string][]byte, len(deps))
+	var resultsMu sync.Mutex
 	for _, dep := range deps {
 		results[dep.Key()] = nil // Initialize slot
 	}
@@ -232,7 +232,9 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 					})
 				a.recordUpstreamError(dep.Provider, dep.Endpoint, "resolve_error")
 				if optional {
+					resultsMu.Lock()
 					results[dep.Key()] = []byte("null")
+					resultsMu.Unlock()
 					return nil
 				}
 				return err
@@ -244,7 +246,9 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 					cacheKey := dep.CacheKey()
 					if cached, hit := cache.m.Load(cacheKey); hit {
 						// Cache hit - use cached response
+						resultsMu.Lock()
 						results[dep.Key()] = cached.([]byte)
+						resultsMu.Unlock()
 						a.recordUpstreamCall(dep.Provider, dep.Endpoint, 0, "cache_hit")
 						return nil
 					}
@@ -289,7 +293,9 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 				a.recordUpstreamCall(dep.Provider, dep.Endpoint, callDuration, status)
 				
 				if optional {
+					resultsMu.Lock()
 					results[dep.Key()] = []byte("null")
+					resultsMu.Unlock()
 					a.logWithContext(reqCtx, zerolog.WarnLevel, "optional provider failed, using null",
 						func(e *zerolog.Event) {
 							e.Str("provider", dep.Provider).
@@ -310,7 +316,9 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 				}
 			}
 			
+			resultsMu.Lock()
 			results[dep.Key()] = body
+			resultsMu.Unlock()
 			return nil
 		})
 	}
