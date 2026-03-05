@@ -59,6 +59,14 @@ You can filter and project fetched data using the pattern `$fetch("provider", "e
 $fetch("orders_service", "data")[price > 100].{id: order_id, total: $sum(items.price)}
 ```
 
+**Important**: Generator expressions that only fetch data without any transformation are not allowed and will result in a build-time error. Field access (e.g., `$fetch(...).field`) is considered transformation and is allowed. If you need to pass data through completely unchanged, use a proxy route in `proxies.yaml` instead. For example:
+
+- ❌ **Invalid**: `$fetch("provider", "endpoint")` (completely bare fetch without any transformation)
+- ✅ **Valid**: `$fetch("provider", "endpoint").field` (field access is transformation)
+- ✅ **Valid**: `$fetch("provider", "endpoint")[filter].{projection}` (has filter/projection)
+- ✅ **Valid**: `{"data": $fetch("provider", "endpoint").field}` (inside object literal, mapping data)
+- ✅ **Use proxy**: For complete pass-through without any transformation, define a route in `data/proxies.yaml`
+
 ## JSONata Extensions
 
 ### `$fetch(provider, endpoint [, config])`

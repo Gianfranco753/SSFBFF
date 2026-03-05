@@ -1301,6 +1301,13 @@ func AnalyzeFetchCalls(root jparse.Node, funcName string) (*ProviderPlan, error)
 		return plan, nil
 	}
 
+	// Detect completely bare $fetch() generator expressions without any transformation.
+	// Field access (e.g., $fetch(...).field) is considered transformation and is allowed.
+	// Only completely bare $fetch(...) calls should use a proxy instead.
+	if isBareFetchCall(root) {
+		return nil, fmt.Errorf("generator expression with only $fetch() and no transformation (field access, filter, or projection) is not allowed; use a proxy route in proxies.yaml instead")
+	}
+
 	// Handle top-level conditional expressions (e.g., condition ? $httpError(...) : ...)
 	if _, ok := root.(*jparse.ConditionalNode); ok {
 		fc := &fieldCollector{numeric: map[string]bool{}, varTypes: map[string]string{}}
@@ -1397,6 +1404,25 @@ func HasFetchCalls(root jparse.Node) bool {
 			}
 		}
 	}
+	return false
+}
+
+// isBareFetchCall detects if the root is a completely bare $fetch() generator expression
+// without any transformation (no field access, filter, or projection). Such expressions
+// should use a proxy route instead.
+//
+// Field access (e.g., $fetch(...).field) is considered transformation, so it's allowed.
+// Only completely bare $fetch(...) calls are blocked.
+func isBareFetchCall(root jparse.Node) bool {
+	// Check if root is a completely bare $fetch() function call with no path navigation
+	if fnCall, ok := root.(*jparse.FunctionCallNode); ok {
+		if v, ok := fnCall.Func.(*jparse.VariableNode); ok && v.Name == "fetch" {
+			return true
+		}
+	}
+
+	// If it's a PathNode, it means there's some navigation (field access, filter, etc.)
+	// which counts as transformation, so it's not bare.
 	return false
 }
 
