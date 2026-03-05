@@ -70,6 +70,9 @@ var (
 		healthCheckTimeout          time.Duration
 		healthCheckFailureThreshold int
 
+		// Slow request configuration
+		slowRequestThreshold time.Duration
+
 		// Shutdown configuration
 		shutdownTimeout time.Duration
 
@@ -170,6 +173,9 @@ func initEnvCache() {
 	// Health check configuration
 	envCache.healthCheckTimeout = getEnvDuration("HEALTH_CHECK_TIMEOUT", 500*time.Millisecond)
 	envCache.healthCheckFailureThreshold = getEnvInt("HEALTH_CHECK_FAILURE_THRESHOLD", 0)
+
+	// Slow request configuration
+	envCache.slowRequestThreshold = getEnvDuration("SLOW_REQUEST_THRESHOLD", 1*time.Second)
 
 	// Shutdown configuration
 	envCache.shutdownTimeout = getEnvDuration("SHUTDOWN_TIMEOUT", 30*time.Second)
@@ -592,6 +598,11 @@ func getCachedHealthCheckFailureThreshold() int {
 	return getCachedFlagInt("HEALTH_CHECK_FAILURE_THRESHOLD", envCache.healthCheckFailureThreshold)
 }
 
+func getCachedSlowRequestThreshold() time.Duration {
+	ensureCacheInitialized()
+	return getCachedFlagDuration("SLOW_REQUEST_THRESHOLD", envCache.slowRequestThreshold)
+}
+
 func getCachedShutdownTimeout() time.Duration {
 	ensureCacheInitialized()
 	return getCachedFlagDuration("SHUTDOWN_TIMEOUT", envCache.shutdownTimeout)
@@ -776,6 +787,9 @@ func resetEnvCacheForTesting() {
 	envCache.metricsBatchInterval = 0
 	envCache.metricsSampleRate = 0
 	envCache.useTraceIDAsRequestID = false
+	envCache.healthCheckTimeout = 0
+	envCache.healthCheckFailureThreshold = 0
+	envCache.slowRequestThreshold = 0
 	envCache.enableDocs = false
 	envCache.maxResponseBodySize = 0
 	envCache.httpProxy = nil

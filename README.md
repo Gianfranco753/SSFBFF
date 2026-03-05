@@ -142,6 +142,19 @@ The `x-service-name` value maps to `data/services/{service-name}.jsonata`.
 
 **Request Validation**: The server automatically generates validation functions from OpenAPI request schemas (parameters and requestBody). Validation happens at runtime before the JSONata transform executes, ensuring invalid requests are rejected early with HTTP 400 errors. See the [Request Validation](#request-validation) section for details.
 
+**Slow Request Threshold Override**: You can override the global slow request threshold per route using the `x-slow-request-threshold` extension. This allows fine-grained control over which requests are considered slow:
+
+```yaml
+paths:
+  /api/v1/orders:
+    get:
+      x-service-name: orders
+      x-slow-request-threshold: 500ms  # Override default threshold for this route
+      summary: Get orders
+```
+
+The threshold accepts duration format (e.g., `500ms`, `2s`, `1.5s`). If not specified, the route uses the global `SLOW_REQUEST_THRESHOLD` environment variable (default: `1s`). Requests exceeding the threshold are recorded in the `slow_requests_total` metric.
+
 ### `data/proxies.yaml`
 
 Pass-through proxy routes that forward requests directly to downstream services without JSONata transformation:
@@ -518,6 +531,7 @@ go run ./cmd/apigen --spec=<openapi.yaml> --jsonata-dir=<dir> [--proxies=<proxie
 | `SHUTDOWN_TIMEOUT` | Graceful shutdown timeout (e.g., `30s`) | `30s` |
 | `HEALTH_CHECK_TIMEOUT` | Health check timeout per provider (e.g., `500ms`) | `500ms` |
 | `HEALTH_CHECK_FAILURE_THRESHOLD` | Maximum allowed provider failures for health check (0 = all must be healthy) | `0` |
+| `SLOW_REQUEST_THRESHOLD` | Duration threshold for slow request detection (e.g., `1s`, `500ms`). Requests exceeding this duration are recorded in `slow_requests_total` metric | `1s` |
 | `ENABLE_DOCS` | Enable the `/docs` endpoint with interactive API documentation (Scalar) | `true` |
 
 ### Proxy
@@ -673,6 +687,9 @@ The server exposes the following Prometheus metrics:
 
 **HTTP Metrics:**
 - `http_errors_total` — Counter of HTTP errors by endpoint, method, and status code
+- `http_request_duration_seconds` — Histogram of HTTP request durations by endpoint, method, and status code
+- `http_response_size_bytes` — Histogram of HTTP response body sizes by endpoint, method, and status code
+- `slow_requests_total` — Counter of slow requests that exceeded the threshold by endpoint and method
 
 **Upstream Metrics:**
 - `upstream_call_duration_seconds` — Histogram of upstream HTTP call durations by provider, endpoint, and status
@@ -937,6 +954,8 @@ The server is fully OpenTelemetry compatible out of the box:
 - **High-load optimization** — set `OTEL_DISABLE_TRACING=true` to disable tracing globally for maximum performance. Spans are still created (minimal overhead) but not exported. Use the `x-enable-trace` header on specific requests to enable tracing for debugging.
 
 - **Per-provider connection pools** — each provider gets its own isolated HTTP client with a dedicated connection pool, preventing one slow provider from exhausting connections needed by others. Pool sizes are configurable per-provider in YAML or globally via environment variables.
+
+- **Enhanced upstream error logging** — when upstream requests fail, logs include request method, sanitized headers (sensitive headers like Authorization are redacted), and request body size for improved debugging without exposing sensitive data.
 
 - **Proxy support** — `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` are respected by all upstream calls, making the BFF compatible with corporate proxies and cloud egress gateways.
 

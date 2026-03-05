@@ -33,6 +33,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 	"unicode"
 
 	"gopkg.in/yaml.v3"
@@ -167,12 +168,21 @@ func parseSpec(path, jsonataDir string) ([]configRoute, error) {
 			// Parse request schema from OpenAPI operation
 			requestSchema := parseRequestSchema(op, components)
 
+			// Parse x-slow-request-threshold extension (duration format: "500ms", "2s", etc.)
+			var slowRequestThreshold time.Duration
+			if thresholdStr, ok := op["x-slow-request-threshold"].(string); ok && thresholdStr != "" {
+				if parsed, err := time.ParseDuration(thresholdStr); err == nil && parsed > 0 {
+					slowRequestThreshold = parsed
+				}
+			}
+
 			routes = append(routes, configRoute{
-				Method:        capitalizeFirst(method),
-				Path:          urlPath,
-				FuncName:      funcName,
-				ReqKeys:       rk,
-				RequestSchema: requestSchema,
+				Method:               capitalizeFirst(method),
+				Path:                 urlPath,
+				FuncName:             funcName,
+				ReqKeys:              rk,
+				RequestSchema:        requestSchema,
+				SlowRequestThreshold: slowRequestThreshold,
 			})
 		}
 	}
@@ -182,12 +192,13 @@ func parseSpec(path, jsonataDir string) ([]configRoute, error) {
 // --- Config mode ---
 
 type configRoute struct {
-	Method        string
-	Path          string
-	FuncName      string         // e.g. "TransformOrders"
-	ReqKeys       requestKeys    // which request fields are actually referenced
-	ProxyURL      string         // if set, this route is a proxy with the target URL
-	RequestSchema *RequestSchema // parsed schema for request validation (nil if no schema)
+	Method               string
+	Path                 string
+	FuncName             string         // e.g. "TransformOrders"
+	ReqKeys              requestKeys    // which request fields are actually referenced
+	ProxyURL             string         // if set, this route is a proxy with the target URL
+	RequestSchema        *RequestSchema // parsed schema for request validation (nil if no schema)
+	SlowRequestThreshold time.Duration  // per-route slow request threshold (0 means use default)
 }
 
 // requestKeys tracks which specific request fields a JSONata expression uses.
@@ -361,6 +372,7 @@ func generateConfigRoutes(routes []configRoute, pkg, genPkg string) ([]byte, err
 		w("\t\"net/http\"\n")
 		w("\t\"net/url\"\n")
 		w("\t\"strings\"\n")
+		w("\t\"time\"\n")
 	}
 	if hasValidation {
 		if !hasProxy {
@@ -373,6 +385,9 @@ func generateConfigRoutes(routes []configRoute, pkg, genPkg string) ([]byte, err
 		if !hasProxy {
 			w("\t\"strings\"\n")
 		}
+	}
+	if !hasProxy && !hasValidation {
+		w("\t\"time\"\n")
 	}
 	w("\t\"github.com/gofiber/fiber/v3\"\n")
 	w("\t\"github.com/gcossani/ssfbff/internal/aggregator\"\n")
@@ -412,6 +427,9 @@ func generateConfigRoutes(routes []configRoute, pkg, genPkg string) ([]byte, err
 		if r.ProxyURL != "" {
 			// Proxy route: forward request to downstream server without modification
 			w("\tapp.%s(%q, func(c fiber.Ctx) error {\n", r.Method, r.Path)
+			w("\t\tstartTime := time.Now()\n")
+			w("\t\tendpoint := %q\n", r.Path)
+			w("\t\tmethod := c.Method()\n")
 			w("\t\tupstreamURL := %q\n", r.ProxyURL)
 			w("\t\t// Build target URL: append request path to upstream base URL\n")
 			w("\t\t// If route path ends with /*, strip the prefix before the wildcard\n")
@@ -432,15 +450,15 @@ func generateConfigRoutes(routes []configRoute, pkg, genPkg string) ([]byte, err
 			w("\t\tif strings.HasSuffix(upstreamURL, \"/\") && strings.HasPrefix(targetPath, \"/\") {\n")
 			w("\t\t\ttargetPath = targetPath[1:]\n")
 			w("\t\t}\n")
-		w("\t\ttargetURL := upstreamURL + targetPath\n")
-		w("\t\tqueries := c.Queries()\n")
-		w("\t\tif len(queries) > 0 {\n")
-		w("\t\t\tvals := make(url.Values, len(queries))\n")
-		w("\t\t\tfor k, v := range queries {\n")
-		w("\t\t\t\tvals[k] = []string{v}\n")
-		w("\t\t\t}\n")
-		w("\t\t\ttargetURL += \"?\" + vals.Encode()\n")
-		w("\t\t}\n\n")
+			w("\t\ttargetURL := upstreamURL + targetPath\n")
+			w("\t\tqueries := c.Queries()\n")
+			w("\t\tif len(queries) > 0 {\n")
+			w("\t\t\tvals := make(url.Values, len(queries))\n")
+			w("\t\t\tfor k, v := range queries {\n")
+			w("\t\t\t\tvals[k] = []string{v}\n")
+			w("\t\t\t}\n")
+			w("\t\t\ttargetURL += \"?\" + vals.Encode()\n")
+			w("\t\t}\n\n")
 			w("\t\t// Create HTTP request with same method, headers, and body\n")
 			w("\t\tvar bodyReader io.Reader\n")
 			w("\t\tif len(c.Body()) > 0 {\n")
@@ -448,6 +466,9 @@ func generateConfigRoutes(routes []configRoute, pkg, genPkg string) ([]byte, err
 			w("\t\t}\n")
 			w("\t\treq, err := http.NewRequestWithContext(c.Context(), c.Method(), targetURL, bodyReader)\n")
 			w("\t\tif err != nil {\n")
+			w("\t\t\tduration := time.Since(startTime)\n")
+			w("\t\t\trecordHTTPRequestDuration(endpoint, method, fiber.StatusInternalServerError, duration)\n")
+			w("\t\t\trecordHTTPResponseSize(endpoint, method, fiber.StatusInternalServerError, 0)\n")
 			w("\t\t\trouteLogger.Error().\n")
 			w("\t\t\t\tStr(\"endpoint\", %q).\n", r.Path)
 			w("\t\t\t\tStr(\"method\", c.Method()).\n")
@@ -464,6 +485,9 @@ func generateConfigRoutes(routes []configRoute, pkg, genPkg string) ([]byte, err
 			w("\t\t// Make request using shared HTTP client (with OTel instrumentation)\n")
 			w("\t\tresp, err := proxyClient.Do(req)\n")
 			w("\t\tif err != nil {\n")
+			w("\t\t\tduration := time.Since(startTime)\n")
+			w("\t\t\trecordHTTPRequestDuration(endpoint, method, fiber.StatusBadGateway, duration)\n")
+			w("\t\t\trecordHTTPResponseSize(endpoint, method, fiber.StatusBadGateway, 0)\n")
 			w("\t\t\trouteLogger.Error().\n")
 			w("\t\t\t\tStr(\"endpoint\", %q).\n", r.Path)
 			w("\t\t\t\tStr(\"method\", c.Method()).\n")
@@ -494,6 +518,9 @@ func generateConfigRoutes(routes []configRoute, pkg, genPkg string) ([]byte, err
 			w("\t\tlimitedReader := io.LimitReader(resp.Body, int64(maxSize))\n")
 			w("\t\tbody, err := io.ReadAll(limitedReader)\n")
 			w("\t\tif err != nil {\n")
+			w("\t\t\tduration := time.Since(startTime)\n")
+			w("\t\t\trecordHTTPRequestDuration(endpoint, method, fiber.StatusBadGateway, duration)\n")
+			w("\t\t\trecordHTTPResponseSize(endpoint, method, fiber.StatusBadGateway, 0)\n")
 			w("\t\t\trouteLogger.Error().\n")
 			w("\t\t\t\tStr(\"endpoint\", %q).\n", r.Path)
 			w("\t\t\t\tStr(\"method\", c.Method()).\n")
@@ -508,6 +535,9 @@ func generateConfigRoutes(routes []configRoute, pkg, genPkg string) ([]byte, err
 			w("\t\tn, _ := resp.Body.Read(extraByte[:])\n")
 			w("\t\tif n > 0 {\n")
 			w("\t\t\t// Response was truncated - log error and return error\n")
+			w("\t\t\tduration := time.Since(startTime)\n")
+			w("\t\t\trecordHTTPRequestDuration(endpoint, method, fiber.StatusBadGateway, duration)\n")
+			w("\t\t\trecordHTTPResponseSize(endpoint, method, fiber.StatusBadGateway, 0)\n")
 			w("\t\t\trouteLogger.Error().\n")
 			w("\t\t\t\tStr(\"endpoint\", %q).\n", r.Path)
 			w("\t\t\t\tStr(\"method\", c.Method()).\n")
@@ -516,12 +546,30 @@ func generateConfigRoutes(routes []configRoute, pkg, genPkg string) ([]byte, err
 			w("\t\t\trecordHTTPError(%q, c.Method(), fiber.StatusBadGateway)\n", r.Path)
 			w("\t\t\treturn fiber.NewError(fiber.StatusBadGateway, fmt.Sprintf(\"response body exceeds maximum size of %%d bytes\", maxSize))\n")
 			w("\t\t}\n")
+			w("\t\tduration := time.Since(startTime)\n")
+			w("\t\tstatusCode := resp.StatusCode\n")
+			w("\t\trecordHTTPRequestDuration(endpoint, method, statusCode, duration)\n")
+			w("\t\trecordHTTPResponseSize(endpoint, method, statusCode, len(body))\n")
+			w("\t\t// Check for slow request\n")
+			w("\t\tthreshold := getCachedSlowRequestThreshold()\n")
+			if r.SlowRequestThreshold > 0 {
+				w("\t\tif duration > %d*time.Nanosecond {\n", r.SlowRequestThreshold.Nanoseconds())
+				w("\t\t\trecordSlowRequest(endpoint, method)\n")
+				w("\t\t}\n")
+			} else {
+				w("\t\tif duration > threshold {\n")
+				w("\t\t\trecordSlowRequest(endpoint, method)\n")
+				w("\t\t}\n")
+			}
 			w("\t\treturn c.Send(body)\n")
 			w("\t})\n\n")
 		} else {
 			// Regular JSONata route
 			execName := strings.TrimPrefix(r.FuncName, "Transform")
 			w("\tapp.%s(%q, func(c fiber.Ctx) error {\n", r.Method, r.Path)
+			w("\t\tstartTime := time.Now()\n")
+			w("\t\tendpoint := %q\n", r.Path)
+			w("\t\tmethod := c.Method()\n")
 			writeRequestContextBuilder(w, "\t\t", r.ReqKeys)
 
 			// Add validation call if schema exists
@@ -548,10 +596,13 @@ func generateConfigRoutes(routes []configRoute, pkg, genPkg string) ([]byte, err
 
 			w("\t\tresp, err := generated.Execute%s(ctx, agg, reqCtx)\n", execName)
 			w("\t\tif err != nil {\n")
+			w("\t\t\tduration := time.Since(startTime)\n")
 			w("\t\t\t// Check if it's an HTTPError\n")
 			w("\t\t\tif httpErr, ok := err.(*runtime.HTTPError); ok {\n")
 			w("\t\t\t\tresp, respErr := httpErr.ToResponse()\n")
 			w("\t\t\t\tif respErr != nil {\n")
+			w("\t\t\t\t\trecordHTTPRequestDuration(endpoint, method, fiber.StatusInternalServerError, duration)\n")
+			w("\t\t\t\t\trecordHTTPResponseSize(endpoint, method, fiber.StatusInternalServerError, 0)\n")
 			w("\t\t\t\t\trouteLogger.Error().\n")
 			w("\t\t\t\t\t\tStr(\"endpoint\", %q).\n", r.Path)
 			w("\t\t\t\t\t\tStr(\"method\", c.Method()).\n")
@@ -560,12 +611,29 @@ func generateConfigRoutes(routes []configRoute, pkg, genPkg string) ([]byte, err
 			w("\t\t\t\t\trecordHTTPError(%q, c.Method(), fiber.StatusInternalServerError)\n", r.Path)
 			w("\t\t\t\t\treturn fiber.NewError(fiber.StatusInternalServerError, \"internal error\")\n")
 			w("\t\t\t\t}\n")
+			w("\t\t\t\tstatusCode := resp.StatusCode\n")
+			w("\t\t\t\tresponseSize := len(resp.Body)\n")
+			w("\t\t\t\trecordHTTPRequestDuration(endpoint, method, statusCode, duration)\n")
+			w("\t\t\t\trecordHTTPResponseSize(endpoint, method, statusCode, responseSize)\n")
+			w("\t\t\t\t// Check for slow request\n")
+			w("\t\t\t\tthreshold := getCachedSlowRequestThreshold()\n")
+			if r.SlowRequestThreshold > 0 {
+				w("\t\t\t\tif duration > %d*time.Nanosecond {\n", r.SlowRequestThreshold.Nanoseconds())
+				w("\t\t\t\t\trecordSlowRequest(endpoint, method)\n")
+				w("\t\t\t\t}\n")
+			} else {
+				w("\t\t\t\tif duration > threshold {\n")
+				w("\t\t\t\t\trecordSlowRequest(endpoint, method)\n")
+				w("\t\t\t\t}\n")
+			}
 			w("\t\t\t\tfor k, v := range resp.Headers {\n")
 			w("\t\t\t\t\tc.Set(k, v)\n")
 			w("\t\t\t\t}\n")
 			w("\t\t\t\treturn c.Status(resp.StatusCode).Send(resp.Body)\n")
 			w("\t\t\t}\n")
 			w("\t\t\t// Regular error handling\n")
+			w("\t\t\trecordHTTPRequestDuration(endpoint, method, fiber.StatusBadGateway, duration)\n")
+			w("\t\t\trecordHTTPResponseSize(endpoint, method, fiber.StatusBadGateway, 0)\n")
 			w("\t\t\trouteLogger.Error().\n")
 			w("\t\t\t\tStr(\"endpoint\", %q).\n", r.Path)
 			w("\t\t\t\tStr(\"method\", c.Method()).\n")
@@ -576,25 +644,58 @@ func generateConfigRoutes(routes []configRoute, pkg, genPkg string) ([]byte, err
 			w("\t\t\treturn fiber.NewError(fiber.StatusBadGateway, sanitizedMsg)\n")
 			w("\t\t}\n\n")
 			w("\t\tif resp == nil {\n")
+			w("\t\t\tduration := time.Since(startTime)\n")
+			w("\t\t\trecordHTTPRequestDuration(endpoint, method, fiber.StatusInternalServerError, duration)\n")
+			w("\t\t\trecordHTTPResponseSize(endpoint, method, fiber.StatusInternalServerError, 0)\n")
 			w("\t\t\treturn fiber.NewError(500, \"empty response\")\n")
 			w("\t\t}\n\n")
 			w("\t\t// Set headers\n")
 			w("\t\tfor k, v := range resp.Headers {\n")
 			w("\t\t\tc.Set(k, v)\n")
 			w("\t\t}\n\n")
-		w("\t\t// Handle redirects\n")
-		w("\t\tif resp.StatusCode >= 300 && resp.StatusCode < 400 {\n")
-		w("\t\t\tif location := resp.Headers[\"Location\"]; location != \"\" {\n")
-		w("\t\t\t\tc.Set(\"Location\", location)\n")
-		w("\t\t\t\tc.Status(resp.StatusCode)\n")
-		w("\t\t\t\tc.Redirect()\n")
-		w("\t\t\t\treturn nil\n")
-		w("\t\t\t}\n")
-		w("\t\t}\n\n")
+			w("\t\t// Handle redirects\n")
+			w("\t\tif resp.StatusCode >= 300 && resp.StatusCode < 400 {\n")
+			w("\t\t\tif location := resp.Headers[\"Location\"]; location != \"\" {\n")
+			w("\t\t\t\tc.Set(\"Location\", location)\n")
+			w("\t\t\t\tc.Status(resp.StatusCode)\n")
+			w("\t\t\t\tc.Redirect()\n")
+			w("\t\t\t\treturn nil\n")
+			w("\t\t\t}\n")
+			w("\t\t}\n\n")
 			w("\t\t// Handle 204 No Content\n")
 			w("\t\tif resp.StatusCode == 204 {\n")
+			w("\t\t\tduration := time.Since(startTime)\n")
+			w("\t\t\trecordHTTPRequestDuration(endpoint, method, 204, duration)\n")
+			w("\t\t\trecordHTTPResponseSize(endpoint, method, 204, 0)\n")
+			w("\t\t\t// Check for slow request\n")
+			w("\t\t\tthreshold := getCachedSlowRequestThreshold()\n")
+			if r.SlowRequestThreshold > 0 {
+				w("\t\t\tif duration > %d*time.Nanosecond {\n", r.SlowRequestThreshold.Nanoseconds())
+				w("\t\t\t\trecordSlowRequest(endpoint, method)\n")
+				w("\t\t\t}\n")
+			} else {
+				w("\t\t\tif duration > threshold {\n")
+				w("\t\t\t\trecordSlowRequest(endpoint, method)\n")
+				w("\t\t\t}\n")
+			}
 			w("\t\t\treturn c.Status(204).Send(nil)\n")
 			w("\t\t}\n\n")
+			w("\t\tduration := time.Since(startTime)\n")
+			w("\t\tstatusCode := resp.StatusCode\n")
+			w("\t\tresponseSize := len(resp.Body)\n")
+			w("\t\trecordHTTPRequestDuration(endpoint, method, statusCode, duration)\n")
+			w("\t\trecordHTTPResponseSize(endpoint, method, statusCode, responseSize)\n")
+			w("\t\t// Check for slow request\n")
+			w("\t\tthreshold := getCachedSlowRequestThreshold()\n")
+			if r.SlowRequestThreshold > 0 {
+				w("\t\tif duration > %d*time.Nanosecond {\n", r.SlowRequestThreshold.Nanoseconds())
+				w("\t\t\trecordSlowRequest(endpoint, method)\n")
+				w("\t\t}\n")
+			} else {
+				w("\t\tif duration > threshold {\n")
+				w("\t\t\trecordSlowRequest(endpoint, method)\n")
+				w("\t\t}\n")
+			}
 			w("\t\treturn c.Status(resp.StatusCode).Send(resp.Body)\n")
 			w("\t})\n\n")
 		}

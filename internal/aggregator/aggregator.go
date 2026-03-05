@@ -280,16 +280,28 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 				}
 				
 				if a.hasLogger {
+					requestMethod := dep.Method
+					if requestMethod == "" {
+						requestMethod = http.MethodGet
+					}
+					requestBodySize := len(dep.Body)
+					sanitizedHeaders := sanitizeHeaders(dep.Headers)
+					
 					if a.obsConfig.LogFunc != nil {
 						a.obsConfig.LogFunc(reqCtx, zerolog.ErrorLevel, "upstream request failed",
 							func(e *zerolog.Event) {
 								e.Str("provider", dep.Provider).
 									Str("endpoint", dep.Endpoint).
 									Str("url", url).
+									Str("method", requestMethod).
+									Int("request_body_size", requestBodySize).
 									Dur("duration_ms", callDuration).
 									Err(err)
 								if statusCode > 0 {
 									e.Int("status_code", statusCode)
+								}
+								if len(sanitizedHeaders) > 0 {
+									e.Interface("headers", sanitizedHeaders)
 								}
 							})
 					} else {
@@ -297,10 +309,15 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 							Str("provider", dep.Provider).
 							Str("endpoint", dep.Endpoint).
 							Str("url", url).
+							Str("method", requestMethod).
+							Int("request_body_size", requestBodySize).
 							Dur("duration_ms", callDuration).
 							Err(err)
 						if statusCode > 0 {
 							logEvent = logEvent.Int("status_code", statusCode)
+						}
+						if len(sanitizedHeaders) > 0 {
+							logEvent = logEvent.Interface("headers", sanitizedHeaders)
 						}
 						logEvent.Msg("upstream request failed")
 					}
@@ -403,6 +420,31 @@ func (a *Aggregator) resolveURL(dep runtime.ProviderDep) (url string, timeout ti
 	}
 
 	return prov.BaseURL + endpointCfg.Path, timeout, endpointCfg, prov.Optional, nil
+}
+
+// sanitizeHeaders removes sensitive headers from a map for safe logging.
+// Headers like Authorization, X-Api-Key, etc. are replaced with "[redacted]".
+func sanitizeHeaders(headers map[string]string) map[string]string {
+	if len(headers) == 0 {
+		return nil
+	}
+	sanitized := make(map[string]string, len(headers))
+	sensitiveHeaders := map[string]bool{
+		"authorization": true,
+		"x-api-key":     true,
+		"x-auth-token":  true,
+		"cookie":        true,
+		"set-cookie":    true,
+	}
+	for k, v := range headers {
+		keyLower := strings.ToLower(k)
+		if sensitiveHeaders[keyLower] {
+			sanitized[k] = "[redacted]"
+		} else {
+			sanitized[k] = v
+		}
+	}
+	return sanitized
 }
 
 // doRequest makes an HTTP request respecting dep.Method, dep.Headers, and

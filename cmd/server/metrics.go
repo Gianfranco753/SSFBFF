@@ -93,11 +93,43 @@ var (
 		},
 	)
 
+	// HTTP request duration histogram by endpoint, method, and status code
+	httpRequestDuration = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "http_request_duration_seconds",
+			Help:    "Duration of HTTP requests in seconds",
+			Buckets: []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0},
+		},
+		[]string{"endpoint", "method", "status_code"},
+	)
+
+	// HTTP response size histogram by endpoint, method, and status code
+	httpResponseSizeBytes = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "http_response_size_bytes",
+			Help:    "Size of HTTP response bodies in bytes",
+			Buckets: []float64{100, 500, 1000, 5000, 10000, 50000, 100000, 500000, 1000000, 5000000},
+		},
+		[]string{"endpoint", "method", "status_code"},
+	)
+
+	// Slow requests counter by endpoint and method
+	slowRequestsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "slow_requests_total",
+			Help: "Total number of slow requests that exceeded the threshold",
+		},
+		[]string{"endpoint", "method"},
+	)
+
 	// Label caches for common label combinations
 	httpErrorCounterCache     sync.Map
 	upstreamCallHistCache     sync.Map
 	upstreamErrorCounterCache sync.Map
 	aggregatorOpCounterCache  sync.Map
+	httpRequestDurationCache  sync.Map
+	httpResponseSizeCache     sync.Map
+	slowRequestCounterCache   sync.Map
 	labelCacheEnabled         bool
 
 	// hasherPool reuses hash.Hash64 instances to avoid allocations in hashLabels()
@@ -317,4 +349,102 @@ func recordShutdownDuration(duration time.Duration) {
 		return
 	}
 	shutdownDuration.Observe(duration.Seconds())
+}
+
+func getHTTPRequestDurationHistogram(endpoint, method string, statusCode int) prometheus.Observer {
+	if !labelCacheEnabled {
+		return httpRequestDuration.WithLabelValues(endpoint, method, getStatusCodeString(statusCode))
+	}
+
+	key := hashLabels([]string{endpoint, method, getStatusCodeString(statusCode)})
+	if cached, ok := httpRequestDurationCache.Load(key); ok {
+		return cached.(prometheus.Observer)
+	}
+
+	hist := httpRequestDuration.WithLabelValues(endpoint, method, getStatusCodeString(statusCode))
+	httpRequestDurationCache.Store(key, hist)
+	return hist
+}
+
+// recordHTTPRequestDuration records the duration of an HTTP request.
+func recordHTTPRequestDuration(endpoint, method string, statusCode int, duration time.Duration) {
+	if !metricsEnabled {
+		return
+	}
+	if !shouldSample() {
+		return
+	}
+
+	hist := getHTTPRequestDurationHistogram(endpoint, method, statusCode)
+	value := duration.Seconds()
+	if globalBatcher != nil && globalBatcher.enabled {
+		globalBatcher.recordHistogramObserve(hist, value)
+	} else {
+		hist.Observe(value)
+	}
+}
+
+func getHTTPResponseSizeHistogram(endpoint, method string, statusCode int) prometheus.Observer {
+	if !labelCacheEnabled {
+		return httpResponseSizeBytes.WithLabelValues(endpoint, method, getStatusCodeString(statusCode))
+	}
+
+	key := hashLabels([]string{endpoint, method, getStatusCodeString(statusCode)})
+	if cached, ok := httpResponseSizeCache.Load(key); ok {
+		return cached.(prometheus.Observer)
+	}
+
+	hist := httpResponseSizeBytes.WithLabelValues(endpoint, method, getStatusCodeString(statusCode))
+	httpResponseSizeCache.Store(key, hist)
+	return hist
+}
+
+// recordHTTPResponseSize records the size of an HTTP response body.
+func recordHTTPResponseSize(endpoint, method string, statusCode int, sizeBytes int) {
+	if !metricsEnabled {
+		return
+	}
+	if !shouldSample() {
+		return
+	}
+
+	hist := getHTTPResponseSizeHistogram(endpoint, method, statusCode)
+	value := float64(sizeBytes)
+	if globalBatcher != nil && globalBatcher.enabled {
+		globalBatcher.recordHistogramObserve(hist, value)
+	} else {
+		hist.Observe(value)
+	}
+}
+
+func getSlowRequestCounter(endpoint, method string) prometheus.Counter {
+	if !labelCacheEnabled {
+		return slowRequestsTotal.WithLabelValues(endpoint, method)
+	}
+
+	key := hashLabels([]string{endpoint, method})
+	if cached, ok := slowRequestCounterCache.Load(key); ok {
+		return cached.(prometheus.Counter)
+	}
+
+	counter := slowRequestsTotal.WithLabelValues(endpoint, method)
+	slowRequestCounterCache.Store(key, counter)
+	return counter
+}
+
+// recordSlowRequest records a slow request that exceeded the threshold.
+func recordSlowRequest(endpoint, method string) {
+	if !metricsEnabled {
+		return
+	}
+	if !shouldSample() {
+		return
+	}
+
+	counter := getSlowRequestCounter(endpoint, method)
+	if globalBatcher != nil && globalBatcher.enabled {
+		globalBatcher.recordCounterInc(counter)
+	} else {
+		counter.Inc()
+	}
 }
