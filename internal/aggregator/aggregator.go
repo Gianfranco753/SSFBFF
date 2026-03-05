@@ -224,22 +224,12 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 		g.Go(func() error {
 			url, timeout, endpointCfg, optional, err := a.resolveURL(dep)
 			if err != nil {
-				if a.hasLogger {
-					if a.obsConfig.LogFunc != nil {
-						a.obsConfig.LogFunc(gctx, zerolog.ErrorLevel, "failed to resolve upstream URL",
-							func(e *zerolog.Event) {
-								e.Str("provider", dep.Provider).
-									Str("endpoint", dep.Endpoint).
-									Err(err)
-							})
-					} else {
-						a.obsConfig.Logger.Error().
-							Str("provider", dep.Provider).
+				a.logWithContext(gctx, zerolog.ErrorLevel, "failed to resolve upstream URL",
+					func(e *zerolog.Event) {
+						e.Str("provider", dep.Provider).
 							Str("endpoint", dep.Endpoint).
-							Err(err).
-							Msg("failed to resolve upstream URL")
-					}
-				}
+							Err(err)
+					})
 				a.recordUpstreamError(dep.Provider, dep.Endpoint, "resolve_error")
 				if optional {
 					results[dep.Key()] = []byte("null")
@@ -270,43 +260,18 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 			
 			if err != nil {
 				status := "error"
-				errorType := "request_error"
-				if statusCode >= 500 {
-					errorType = "server_error"
-				} else if statusCode == 408 || statusCode == 504 {
-					errorType = "timeout"
-				} else if statusCode >= 400 {
-					errorType = "client_error"
-				}
+				errorType := classifyUpstreamError(statusCode)
 				
-				if a.hasLogger {
-					requestMethod := dep.Method
-					if requestMethod == "" {
-						requestMethod = http.MethodGet
-					}
-					requestBodySize := len(dep.Body)
-					sanitizedHeaders := sanitizeHeaders(dep.Headers)
-					
-					if a.obsConfig.LogFunc != nil {
-						a.obsConfig.LogFunc(reqCtx, zerolog.ErrorLevel, "upstream request failed",
-							func(e *zerolog.Event) {
-								e.Str("provider", dep.Provider).
-									Str("endpoint", dep.Endpoint).
-									Str("url", url).
-									Str("method", requestMethod).
-									Int("request_body_size", requestBodySize).
-									Dur("duration_ms", callDuration).
-									Err(err)
-								if statusCode > 0 {
-									e.Int("status_code", statusCode)
-								}
-								if len(sanitizedHeaders) > 0 {
-									e.Interface("headers", sanitizedHeaders)
-								}
-							})
-					} else {
-						logEvent := a.obsConfig.Logger.Error().
-							Str("provider", dep.Provider).
+				requestMethod := dep.Method
+				if requestMethod == "" {
+					requestMethod = http.MethodGet
+				}
+				requestBodySize := len(dep.Body)
+				sanitizedHeaders := sanitizeHeaders(dep.Headers)
+				
+				a.logWithContext(reqCtx, zerolog.ErrorLevel, "upstream request failed",
+					func(e *zerolog.Event) {
+						e.Str("provider", dep.Provider).
 							Str("endpoint", dep.Endpoint).
 							Str("url", url).
 							Str("method", requestMethod).
@@ -314,33 +279,22 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 							Dur("duration_ms", callDuration).
 							Err(err)
 						if statusCode > 0 {
-							logEvent = logEvent.Int("status_code", statusCode)
+							e.Int("status_code", statusCode)
 						}
 						if len(sanitizedHeaders) > 0 {
-							logEvent = logEvent.Interface("headers", sanitizedHeaders)
+							e.Interface("headers", sanitizedHeaders)
 						}
-						logEvent.Msg("upstream request failed")
-					}
-				}
+					})
 				a.recordUpstreamError(dep.Provider, dep.Endpoint, errorType)
 				a.recordUpstreamCall(dep.Provider, dep.Endpoint, callDuration, status)
 				
 				if optional {
 					results[dep.Key()] = []byte("null")
-					if a.hasLogger {
-						if a.obsConfig.LogFunc != nil {
-							a.obsConfig.LogFunc(reqCtx, zerolog.WarnLevel, "optional provider failed, using null",
-								func(e *zerolog.Event) {
-									e.Str("provider", dep.Provider).
-										Str("endpoint", dep.Endpoint)
-								})
-						} else {
-							a.obsConfig.Logger.Warn().
-								Str("provider", dep.Provider).
-								Str("endpoint", dep.Endpoint).
-								Msg("optional provider failed, using null")
-						}
-					}
+					a.logWithContext(reqCtx, zerolog.WarnLevel, "optional provider failed, using null",
+						func(e *zerolog.Event) {
+							e.Str("provider", dep.Provider).
+								Str("endpoint", dep.Endpoint)
+						})
 					return nil
 				}
 				// Non-optional provider failed - return error
@@ -370,19 +324,12 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 	}
 	
 	a.recordAggregatorOperation("success")
-	if a.hasLogger && totalDuration > 1*time.Second {
-		if a.obsConfig.LogFunc != nil {
-			a.obsConfig.LogFunc(ctx, zerolog.WarnLevel, "slow aggregation detected",
-				func(e *zerolog.Event) {
-					e.Dur("total_duration_ms", totalDuration).
-						Int("dependencies", len(deps))
-				})
-		} else {
-			a.obsConfig.Logger.Warn().
-				Dur("total_duration_ms", totalDuration).
-				Int("dependencies", len(deps)).
-				Msg("slow aggregation detected")
-		}
+	if totalDuration > 1*time.Second {
+		a.logWithContext(ctx, zerolog.WarnLevel, "slow aggregation detected",
+			func(e *zerolog.Event) {
+				e.Dur("total_duration_ms", totalDuration).
+					Int("dependencies", len(deps))
+			})
 	}
 	
 	return results, nil
@@ -412,14 +359,61 @@ func (a *Aggregator) resolveURL(dep runtime.ProviderDep) (url string, timeout ti
 
 	// Timeout precedence: endpoint-specific > provider-level > global default (10s)
 	timeout = endpointCfg.Timeout
-	if timeout == 0 {
+	hasEndpointTimeout := timeout > 0
+	if !hasEndpointTimeout {
 		timeout = prov.Timeout
 	}
-	if timeout == 0 {
+	hasProviderTimeout := timeout > 0
+	if !hasProviderTimeout {
 		timeout = 10 * time.Second
 	}
 
 	return prov.BaseURL + endpointCfg.Path, timeout, endpointCfg, prov.Optional, nil
+}
+
+// classifyUpstreamError determines the error type based on status code.
+func classifyUpstreamError(statusCode int) string {
+	if statusCode >= 500 {
+		return "server_error"
+	}
+	if statusCode == 408 || statusCode == 504 {
+		return "timeout"
+	}
+	if statusCode >= 400 {
+		return "client_error"
+	}
+	return "request_error"
+}
+
+// logWithContext logs a message using either LogFunc (if available) or Logger.
+// This consolidates the duplicate logging pattern throughout the aggregator.
+func (a *Aggregator) logWithContext(ctx context.Context, level zerolog.Level, msg string, fields func(*zerolog.Event)) {
+	if !a.hasLogger {
+		return
+	}
+	if a.obsConfig.LogFunc != nil {
+		a.obsConfig.LogFunc(ctx, level, msg, fields)
+	} else {
+		var event *zerolog.Event
+		switch level {
+		case zerolog.DebugLevel:
+			event = a.obsConfig.Logger.Debug()
+		case zerolog.InfoLevel:
+			event = a.obsConfig.Logger.Info()
+		case zerolog.WarnLevel:
+			event = a.obsConfig.Logger.Warn()
+		case zerolog.ErrorLevel:
+			event = a.obsConfig.Logger.Error()
+		case zerolog.FatalLevel:
+			event = a.obsConfig.Logger.Fatal()
+		case zerolog.PanicLevel:
+			event = a.obsConfig.Logger.Panic()
+		default:
+			event = a.obsConfig.Logger.Info()
+		}
+		fields(event)
+		event.Msg(msg)
+	}
 }
 
 // sanitizeHeaders removes sensitive headers from a map for safe logging.

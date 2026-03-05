@@ -7,7 +7,6 @@ import (
 
 	"github.com/gcossani/ssfbff/internal/aggregator"
 	"github.com/gcossani/ssfbff/runtime"
-	"github.com/rs/zerolog"
 )
 
 // ProviderHealth represents the health status of a single provider.
@@ -110,14 +109,4 @@ func checkUpstreamHealth(agg *aggregator.Aggregator) HealthStatus {
 	}
 
 	return status
-}
-
-// setRouteLoggerIfAvailable sets the route logger if the generated SetRouteLogger function exists.
-// This is a no-op if routes haven't been generated yet.
-// The generated routes_gen.go will have a SetRouteLogger function that we can call.
-func setRouteLoggerIfAvailable(logger zerolog.Logger) {
-	// SetRouteLogger will be available in generated routes_gen.go after running go generate
-	// We can't call it here directly because it's generated, but the generated code
-	// will use the routeLogger variable that we set via this mechanism.
-	// For now, this is a placeholder - the actual setting happens in generated code.
 }

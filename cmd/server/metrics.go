@@ -165,6 +165,40 @@ func hashLabels(labels []string) uint64 {
 	return h.Sum64()
 }
 
+// getCachedCounter returns a cached Counter or creates and caches a new one.
+// cache is the sync.Map cache, metricVec is the CounterVec, labels are the label values.
+func getCachedCounter(cache *sync.Map, metricVec *prometheus.CounterVec, labels []string) prometheus.Counter {
+	if !labelCacheEnabled {
+		return metricVec.WithLabelValues(labels...)
+	}
+
+	key := hashLabels(labels)
+	if cached, ok := cache.Load(key); ok {
+		return cached.(prometheus.Counter)
+	}
+
+	counter := metricVec.WithLabelValues(labels...)
+	cache.Store(key, counter)
+	return counter
+}
+
+// getCachedObserver returns a cached Observer or creates and caches a new one.
+// cache is the sync.Map cache, metricVec is the HistogramVec, labels are the label values.
+func getCachedObserver(cache *sync.Map, metricVec *prometheus.HistogramVec, labels []string) prometheus.Observer {
+	if !labelCacheEnabled {
+		return metricVec.WithLabelValues(labels...)
+	}
+
+	key := hashLabels(labels)
+	if cached, ok := cache.Load(key); ok {
+		return cached.(prometheus.Observer)
+	}
+
+	observer := metricVec.WithLabelValues(labels...)
+	cache.Store(key, observer)
+	return observer
+}
+
 // metricsEnabled returns true if metrics recording is enabled.
 var metricsEnabled = getCachedEnableMetrics()
 
@@ -174,18 +208,7 @@ func init() {
 }
 
 func getHTTPErrorCounter(endpoint, method string, statusCode int) prometheus.Counter {
-	if !labelCacheEnabled {
-		return httpErrorsTotal.WithLabelValues(endpoint, method, getStatusCodeString(statusCode))
-	}
-
-	key := hashLabels([]string{endpoint, method, getStatusCodeString(statusCode)})
-	if cached, ok := httpErrorCounterCache.Load(key); ok {
-		return cached.(prometheus.Counter)
-	}
-
-	counter := httpErrorsTotal.WithLabelValues(endpoint, method, getStatusCodeString(statusCode))
-	httpErrorCounterCache.Store(key, counter)
-	return counter
+	return getCachedCounter(&httpErrorCounterCache, httpErrorsTotal, []string{endpoint, method, getStatusCodeString(statusCode)})
 }
 
 // recordHTTPError records an HTTP error with endpoint, method, and status code.
@@ -206,18 +229,7 @@ func recordHTTPError(endpoint, method string, statusCode int) {
 }
 
 func getUpstreamCallHistogram(provider, endpoint, status string) prometheus.Observer {
-	if !labelCacheEnabled {
-		return upstreamCallDuration.WithLabelValues(provider, endpoint, status)
-	}
-
-	key := hashLabels([]string{provider, endpoint, status})
-	if cached, ok := upstreamCallHistCache.Load(key); ok {
-		return cached.(prometheus.Observer)
-	}
-
-	hist := upstreamCallDuration.WithLabelValues(provider, endpoint, status)
-	upstreamCallHistCache.Store(key, hist)
-	return hist
+	return getCachedObserver(&upstreamCallHistCache, upstreamCallDuration, []string{provider, endpoint, status})
 }
 
 // recordUpstreamCall records upstream call metrics.
@@ -239,18 +251,7 @@ func recordUpstreamCall(provider, endpoint string, duration time.Duration, statu
 }
 
 func getUpstreamErrorCounter(provider, endpoint, errorType string) prometheus.Counter {
-	if !labelCacheEnabled {
-		return upstreamErrorsTotal.WithLabelValues(provider, endpoint, errorType)
-	}
-
-	key := hashLabels([]string{provider, endpoint, errorType})
-	if cached, ok := upstreamErrorCounterCache.Load(key); ok {
-		return cached.(prometheus.Counter)
-	}
-
-	counter := upstreamErrorsTotal.WithLabelValues(provider, endpoint, errorType)
-	upstreamErrorCounterCache.Store(key, counter)
-	return counter
+	return getCachedCounter(&upstreamErrorCounterCache, upstreamErrorsTotal, []string{provider, endpoint, errorType})
 }
 
 // recordUpstreamError records an upstream error.
@@ -271,18 +272,7 @@ func recordUpstreamError(provider, endpoint, errorType string) {
 }
 
 func getAggregatorOpCounter(status string) prometheus.Counter {
-	if !labelCacheEnabled {
-		return aggregatorOperationsTotal.WithLabelValues(status)
-	}
-
-	key := hashLabels([]string{status})
-	if cached, ok := aggregatorOpCounterCache.Load(key); ok {
-		return cached.(prometheus.Counter)
-	}
-
-	counter := aggregatorOperationsTotal.WithLabelValues(status)
-	aggregatorOpCounterCache.Store(key, counter)
-	return counter
+	return getCachedCounter(&aggregatorOpCounterCache, aggregatorOperationsTotal, []string{status})
 }
 
 // recordAggregatorOperation records aggregator operation status.
@@ -352,18 +342,7 @@ func recordShutdownDuration(duration time.Duration) {
 }
 
 func getHTTPRequestDurationHistogram(endpoint, method string, statusCode int) prometheus.Observer {
-	if !labelCacheEnabled {
-		return httpRequestDuration.WithLabelValues(endpoint, method, getStatusCodeString(statusCode))
-	}
-
-	key := hashLabels([]string{endpoint, method, getStatusCodeString(statusCode)})
-	if cached, ok := httpRequestDurationCache.Load(key); ok {
-		return cached.(prometheus.Observer)
-	}
-
-	hist := httpRequestDuration.WithLabelValues(endpoint, method, getStatusCodeString(statusCode))
-	httpRequestDurationCache.Store(key, hist)
-	return hist
+	return getCachedObserver(&httpRequestDurationCache, httpRequestDuration, []string{endpoint, method, getStatusCodeString(statusCode)})
 }
 
 // recordHTTPRequestDuration records the duration of an HTTP request.
@@ -385,18 +364,7 @@ func recordHTTPRequestDuration(endpoint, method string, statusCode int, duration
 }
 
 func getHTTPResponseSizeHistogram(endpoint, method string, statusCode int) prometheus.Observer {
-	if !labelCacheEnabled {
-		return httpResponseSizeBytes.WithLabelValues(endpoint, method, getStatusCodeString(statusCode))
-	}
-
-	key := hashLabels([]string{endpoint, method, getStatusCodeString(statusCode)})
-	if cached, ok := httpResponseSizeCache.Load(key); ok {
-		return cached.(prometheus.Observer)
-	}
-
-	hist := httpResponseSizeBytes.WithLabelValues(endpoint, method, getStatusCodeString(statusCode))
-	httpResponseSizeCache.Store(key, hist)
-	return hist
+	return getCachedObserver(&httpResponseSizeCache, httpResponseSizeBytes, []string{endpoint, method, getStatusCodeString(statusCode)})
 }
 
 // recordHTTPResponseSize records the size of an HTTP response body.
@@ -418,18 +386,7 @@ func recordHTTPResponseSize(endpoint, method string, statusCode int, sizeBytes i
 }
 
 func getSlowRequestCounter(endpoint, method string) prometheus.Counter {
-	if !labelCacheEnabled {
-		return slowRequestsTotal.WithLabelValues(endpoint, method)
-	}
-
-	key := hashLabels([]string{endpoint, method})
-	if cached, ok := slowRequestCounterCache.Load(key); ok {
-		return cached.(prometheus.Counter)
-	}
-
-	counter := slowRequestsTotal.WithLabelValues(endpoint, method)
-	slowRequestCounterCache.Store(key, counter)
-	return counter
+	return getCachedCounter(&slowRequestCounterCache, slowRequestsTotal, []string{endpoint, method})
 }
 
 // recordSlowRequest records a slow request that exceeded the threshold.

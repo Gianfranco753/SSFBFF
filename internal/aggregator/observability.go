@@ -21,12 +21,6 @@ type ObservabilityConfig struct {
 	RecordAggregatorOp  func(status string)
 }
 
-// observabilityEnabled returns true if observability is configured.
-// Uses feature flag to avoid nil check overhead.
-func (a *Aggregator) observabilityEnabled() bool {
-	return a.hasObservability
-}
-
 // recordUpstreamCall records metrics for an upstream call.
 // Uses feature flag to avoid nil check overhead.
 func (a *Aggregator) recordUpstreamCall(provider, endpoint string, duration time.Duration, status string) {

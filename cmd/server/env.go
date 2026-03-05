@@ -215,8 +215,11 @@ func ensureCacheInitialized() {
 
 // Helper functions for OpenFeature flag evaluation with push/streaming priority
 
-// getCachedFlagString gets a string value from OpenFeature (push/streaming updates via events, TTL as fallback) or falls back to env var
-func getCachedFlagString(flagKey string, envVarValue string) string {
+// getCachedFlag is a generic helper that gets a cached flag value from OpenFeature
+// or falls back to the environment variable value.
+// T is the type of the flag value (string, int, bool, float64).
+// evaluateFn is a function that evaluates the flag and returns (value, found).
+func getCachedFlag[T comparable](flagKey string, envVarValue T, evaluateFn func(context.Context, string) (T, bool)) T {
 	if !envCache.openFeatureEnabled {
 		return envVarValue
 	}
@@ -227,11 +230,8 @@ func getCachedFlagString(flagKey string, envVarValue string) string {
 	if envCache.openFeatureCacheTTL > 0 {
 		envCache.openFeatureCache.mu.RLock()
 		if entry, ok := envCache.openFeatureCache.entries[flagKey]; ok {
-			// If TTL is set, check expiration (fallback mechanism)
-			// If entry exists and not expired, use cached value
-			// Events will have already invalidated stale entries
 			if time.Now().Before(entry.expires) {
-				value := entry.value.(string)
+				value := entry.value.(T)
 				envCache.openFeatureCache.mu.RUnlock()
 				return value
 			}
@@ -240,7 +240,7 @@ func getCachedFlagString(flagKey string, envVarValue string) string {
 	}
 
 	// Evaluate flag (cache miss or expired)
-	if flagValue, found := evaluateFlagString(ctx, flagKey); found {
+	if flagValue, found := evaluateFn(ctx, flagKey); found {
 		// Cache the value (TTL used as fallback when events not available)
 		if envCache.openFeatureCacheTTL > 0 {
 			envCache.openFeatureCache.mu.Lock()
@@ -254,160 +254,41 @@ func getCachedFlagString(flagKey string, envVarValue string) string {
 	}
 
 	return envVarValue
+}
+
+// getCachedFlagString gets a string value from OpenFeature (push/streaming updates via events, TTL as fallback) or falls back to env var
+func getCachedFlagString(flagKey string, envVarValue string) string {
+	return getCachedFlag(flagKey, envVarValue, evaluateFlagString)
 }
 
 // getCachedFlagInt gets an int value from OpenFeature (push/streaming updates via events, TTL as fallback) or falls back to env var
 func getCachedFlagInt(flagKey string, envVarValue int) int {
-	if !envCache.openFeatureEnabled {
-		return envVarValue
-	}
-
-	ctx := context.Background()
-
-	// Check cache first (entries are invalidated by push/streaming events, TTL is fallback)
-	if envCache.openFeatureCacheTTL > 0 {
-		envCache.openFeatureCache.mu.RLock()
-		if entry, ok := envCache.openFeatureCache.entries[flagKey]; ok {
-			if time.Now().Before(entry.expires) {
-				value := entry.value.(int)
-				envCache.openFeatureCache.mu.RUnlock()
-				return value
-			}
-		}
-		envCache.openFeatureCache.mu.RUnlock()
-	}
-
-	// Evaluate flag (cache miss or expired)
-	if flagValue, found := evaluateFlagInt(ctx, flagKey); found {
-		// Cache the value (TTL used as fallback when events not available)
-		if envCache.openFeatureCacheTTL > 0 {
-			envCache.openFeatureCache.mu.Lock()
-			envCache.openFeatureCache.entries[flagKey] = cacheEntry{
-				value:   flagValue,
-				expires: time.Now().Add(envCache.openFeatureCacheTTL),
-			}
-			envCache.openFeatureCache.mu.Unlock()
-		}
-		return flagValue
-	}
-
-	return envVarValue
+	return getCachedFlag(flagKey, envVarValue, evaluateFlagInt)
 }
 
 // getCachedFlagBool gets a bool value from OpenFeature (push/streaming updates via events, TTL as fallback) or falls back to env var
 func getCachedFlagBool(flagKey string, envVarValue bool) bool {
-	if !envCache.openFeatureEnabled {
-		return envVarValue
-	}
+	return getCachedFlag(flagKey, envVarValue, evaluateFlagBool)
+}
 
-	ctx := context.Background()
-
-	// Check cache first (entries are invalidated by push/streaming events, TTL is fallback)
-	if envCache.openFeatureCacheTTL > 0 {
-		envCache.openFeatureCache.mu.RLock()
-		if entry, ok := envCache.openFeatureCache.entries[flagKey]; ok {
-			if time.Now().Before(entry.expires) {
-				value := entry.value.(bool)
-				envCache.openFeatureCache.mu.RUnlock()
-				return value
-			}
+// evaluateFlagDuration evaluates a duration flag by parsing a string value
+func evaluateFlagDuration(ctx context.Context, flagKey string) (time.Duration, bool) {
+	if flagValue, found := evaluateFlagString(ctx, flagKey); found {
+		if parsed, err := time.ParseDuration(flagValue); err == nil && parsed > 0 {
+			return parsed, true
 		}
-		envCache.openFeatureCache.mu.RUnlock()
 	}
-
-	// Evaluate flag (cache miss or expired)
-	if flagValue, found := evaluateFlagBool(ctx, flagKey); found {
-		// Cache the value (TTL used as fallback when events not available)
-		if envCache.openFeatureCacheTTL > 0 {
-			envCache.openFeatureCache.mu.Lock()
-			envCache.openFeatureCache.entries[flagKey] = cacheEntry{
-				value:   flagValue,
-				expires: time.Now().Add(envCache.openFeatureCacheTTL),
-			}
-			envCache.openFeatureCache.mu.Unlock()
-		}
-		return flagValue
-	}
-
-	return envVarValue
+	return 0, false
 }
 
 // getCachedFlagDuration gets a duration value from OpenFeature (push/streaming updates via events, TTL as fallback) or falls back to env var
 func getCachedFlagDuration(flagKey string, envVarValue time.Duration) time.Duration {
-	if !envCache.openFeatureEnabled {
-		return envVarValue
-	}
-
-	ctx := context.Background()
-
-	// Check cache first (entries are invalidated by push/streaming events, TTL is fallback)
-	if envCache.openFeatureCacheTTL > 0 {
-		envCache.openFeatureCache.mu.RLock()
-		if entry, ok := envCache.openFeatureCache.entries[flagKey]; ok {
-			if time.Now().Before(entry.expires) {
-				value := entry.value.(time.Duration)
-				envCache.openFeatureCache.mu.RUnlock()
-				return value
-			}
-		}
-		envCache.openFeatureCache.mu.RUnlock()
-	}
-
-	// Evaluate flag as string and parse to duration (cache miss or expired)
-	if flagValue, found := evaluateFlagString(ctx, flagKey); found {
-		if parsed, err := time.ParseDuration(flagValue); err == nil && parsed > 0 {
-			// Cache the value (TTL used as fallback when events not available)
-			if envCache.openFeatureCacheTTL > 0 {
-				envCache.openFeatureCache.mu.Lock()
-				envCache.openFeatureCache.entries[flagKey] = cacheEntry{
-					value:   parsed,
-					expires: time.Now().Add(envCache.openFeatureCacheTTL),
-				}
-				envCache.openFeatureCache.mu.Unlock()
-			}
-			return parsed
-		}
-	}
-
-	return envVarValue
+	return getCachedFlag(flagKey, envVarValue, evaluateFlagDuration)
 }
 
 // getCachedFlagFloat gets a float value from OpenFeature (push/streaming updates via events, TTL as fallback) or falls back to env var
 func getCachedFlagFloat(flagKey string, envVarValue float64) float64 {
-	if !envCache.openFeatureEnabled {
-		return envVarValue
-	}
-
-	ctx := context.Background()
-
-	// Check cache first (entries are invalidated by push/streaming events, TTL is fallback)
-	if envCache.openFeatureCacheTTL > 0 {
-		envCache.openFeatureCache.mu.RLock()
-		if entry, ok := envCache.openFeatureCache.entries[flagKey]; ok {
-			if time.Now().Before(entry.expires) {
-				value := entry.value.(float64)
-				envCache.openFeatureCache.mu.RUnlock()
-				return value
-			}
-		}
-		envCache.openFeatureCache.mu.RUnlock()
-	}
-
-	// Evaluate flag (cache miss or expired)
-	if flagValue, found := evaluateFlagFloat(ctx, flagKey); found {
-		// Cache the value (TTL used as fallback when events not available)
-		if envCache.openFeatureCacheTTL > 0 {
-			envCache.openFeatureCache.mu.Lock()
-			envCache.openFeatureCache.entries[flagKey] = cacheEntry{
-				value:   flagValue,
-				expires: time.Now().Add(envCache.openFeatureCacheTTL),
-			}
-			envCache.openFeatureCache.mu.Unlock()
-		}
-		return flagValue
-	}
-
-	return envVarValue
+	return getCachedFlag(flagKey, envVarValue, evaluateFlagFloat)
 }
 
 // Helper functions to get cached values.
@@ -486,11 +367,6 @@ func getCachedLogLevel() string {
 func getCachedLogFormat() string {
 	ensureCacheInitialized()
 	return getCachedFlagString("LOG_FORMAT", envCache.logFormat)
-}
-
-func getCachedAsyncLogging() bool {
-	ensureCacheInitialized()
-	return getCachedFlagBool("ASYNC_LOGGING", envCache.asyncLogging)
 }
 
 func getCachedEnableErrorLogging() bool {
