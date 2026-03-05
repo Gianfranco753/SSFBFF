@@ -691,6 +691,12 @@ The server exposes the following Prometheus metrics:
 - `http_response_size_bytes` — Histogram of HTTP response body sizes by endpoint, method, and status code
 - `slow_requests_total` — Counter of slow requests that exceeded the threshold by endpoint and method
 
+**Metrics and Path Parameters:**
+
+All HTTP metrics use static route template paths (e.g., `/api/v1/users/{id}`) instead of dynamic resolved paths (e.g., `/api/v1/users/123`). This prevents metric cardinality explosion when endpoints have path parameters. For example, requests to `/api/v1/users/123`, `/api/v1/users/456`, etc. are all aggregated under the `/api/v1/users/{id}` metric label.
+
+Routes defined in OpenAPI automatically use their template paths for metrics. Routes not defined via OpenAPI (e.g., `/health`, `/metrics`) use their actual paths since they don't have parameters.
+
 **Upstream Metrics:**
 - `upstream_call_duration_seconds` — Histogram of upstream HTTP call durations by provider, endpoint, and status
 - `upstream_errors_total` — Counter of upstream errors by provider, endpoint, and error type

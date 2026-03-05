@@ -427,6 +427,7 @@ func generateConfigRoutes(routes []configRoute, pkg, genPkg string) ([]byte, err
 		if r.ProxyURL != "" {
 			// Proxy route: forward request to downstream server without modification
 			w("\tapp.%s(%q, func(c fiber.Ctx) error {\n", r.Method, r.Path)
+			w("\t\tc.Locals(\"route_template\", %q)\n", r.Path)
 			w("\t\tstartTime := time.Now()\n")
 			w("\t\tendpoint := %q\n", r.Path)
 			w("\t\tmethod := c.Method()\n")
@@ -567,6 +568,7 @@ func generateConfigRoutes(routes []configRoute, pkg, genPkg string) ([]byte, err
 			// Regular JSONata route
 			execName := strings.TrimPrefix(r.FuncName, "Transform")
 			w("\tapp.%s(%q, func(c fiber.Ctx) error {\n", r.Method, r.Path)
+			w("\t\tc.Locals(\"route_template\", %q)\n", r.Path)
 			w("\t\tstartTime := time.Now()\n")
 			w("\t\tendpoint := %q\n", r.Path)
 			w("\t\tmethod := c.Method()\n")

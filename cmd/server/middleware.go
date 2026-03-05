@@ -260,6 +260,20 @@ func otelWithTraceIDMiddleware() fiber.Handler {
 	}
 }
 
+// getEndpointTemplate returns the route template path for metrics.
+// It first checks c.Locals("route_template"), falling back to c.Path() if not set.
+// This ensures metrics use static template paths (e.g., "/users/{id}") 
+// instead of dynamic resolved paths (e.g., "/users/123").
+func getEndpointTemplate(c fiber.Ctx) string {
+	if template := c.Locals("route_template"); template != nil {
+		if path, ok := template.(string); ok && path != "" {
+			return path
+		}
+	}
+	// Fallback for routes not registered via apigen (e.g., /health, /metrics)
+	return c.Path()
+}
+
 // panicRecoveryMiddleware recovers from panics, logs them with context, and returns 500 errors.
 // Note: trace_id and span_id are automatically injected into logs in the async worker, so we don't need request_id.
 func panicRecoveryMiddleware(logger zerolog.Logger) fiber.Handler {
@@ -276,14 +290,14 @@ func panicRecoveryMiddleware(logger zerolog.Logger) fiber.Handler {
 			if r := recover(); r != nil {
 				buildEvent := func(l zerolog.Logger) *zerolog.Event {
 					return l.Error().
-						Str("endpoint", c.Path()).
+						Str("endpoint", getEndpointTemplate(c)).
 						Str("method", c.Method()).
 						Interface("panic", r)
 				}
 				
 				logAsync(zerolog.ErrorLevel, buildEvent, "panic recovered", c.Context(), logger)
 				
-				recordHTTPError(c.Path(), c.Method(), fiber.StatusInternalServerError)
+				recordHTTPError(getEndpointTemplate(c), c.Method(), fiber.StatusInternalServerError)
 				
 				// Use sync.Pool buffer instead of fiber.Map to avoid allocation
 				buf := errorResponsePool.Get().(*bytes.Buffer)
@@ -315,7 +329,7 @@ func errorHandlerMiddleware(logger zerolog.Logger) fiber.Handler {
 			if statusCode >= 400 {
 				buildEvent := func(l zerolog.Logger) *zerolog.Event {
 					return l.Error().
-						Str("endpoint", c.Path()).
+						Str("endpoint", getEndpointTemplate(c)).
 						Str("method", c.Method()).
 						Int("status_code", statusCode).
 						Err(err)
@@ -323,7 +337,7 @@ func errorHandlerMiddleware(logger zerolog.Logger) fiber.Handler {
 				
 				logAsync(zerolog.ErrorLevel, buildEvent, "request error", c.Context(), logger)
 				
-				recordHTTPError(c.Path(), c.Method(), statusCode)
+				recordHTTPError(getEndpointTemplate(c), c.Method(), statusCode)
 			}
 		}
 		
