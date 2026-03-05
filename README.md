@@ -1464,14 +1464,6 @@ The remaining gaps are mainly higher-order functions and regex functions.
 
 **Higher-Order Functions Effort**: These require implementing lambda expressions (anonymous functions), which is a significant architectural change. Estimated effort: **High** (2-3 weeks for full lambda support).
 
-#### Date/Time Functions
-| Function | Status | Example | Notes |
-|---|---|---|---|
-| `$now()` | ✅ | `$now()` → `"2024-01-15T10:30:00.123456789Z"` | Returns UTC timestamp in ISO 8601 format |
-| `$millis()` | ✅ | `$millis()` → `1705315800123.0` | Returns milliseconds since Unix Epoch |
-| `$fromMillis(number [, picture [, timezone]])` | ✅ | `$fromMillis(1705315800123)` → `"2024-01-15T10:30:00.123Z"` | **Limitation**: Picture string and timezone parameters are accepted for API compatibility but only ISO 8601 format and UTC timezone are supported for performance |
-| `$toMillis(timestamp [, picture])` | ✅ | `$toMillis("2024-01-15T10:30:00.123Z")` → `1705315800123.0` | **Limitation**: Picture parameter is accepted for API compatibility but only ISO 8601 format is supported for performance |
-
 #### Other Missing Features
 | Feature | Effort | Notes |
 |---|---|---|
