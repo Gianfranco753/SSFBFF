@@ -222,6 +222,9 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 		for _, dep := range deps {
 		dep := dep // capture loop variable
 		g.Go(func() error {
+			// Compute result key once (reused in all code paths)
+			resultKey := dep.Key()
+			
 			url, timeout, endpointCfg, optional, err := a.resolveURL(dep)
 			if err != nil {
 				a.logWithContext(gctx, zerolog.ErrorLevel, "failed to resolve upstream URL",
@@ -233,21 +236,26 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 				a.recordUpstreamError(dep.Provider, dep.Endpoint, "resolve_error")
 				if optional {
 					resultsMu.Lock()
-					results[dep.Key()] = []byte("null")
+					results[resultKey] = []byte("null")
 					resultsMu.Unlock()
 					return nil
 				}
 				return err
 			}
 
+			// Compute cache key once if caching is enabled (reused later for storage)
+			var cacheKey string
+			if endpointCfg.UseCache {
+				cacheKey = dep.CacheKey()
+			}
+
 			// Check cache if enabled (early return for zero overhead when disabled)
 			if endpointCfg.UseCache {
 				if cache, ok := FetchCacheFromContext(gctx); ok {
-					cacheKey := dep.CacheKey()
 					if cached, hit := cache.m.Load(cacheKey); hit {
 						// Cache hit - use cached response
 						resultsMu.Lock()
-						results[dep.Key()] = cached.([]byte)
+						results[resultKey] = cached.([]byte)
 						resultsMu.Unlock()
 						a.recordUpstreamCall(dep.Provider, dep.Endpoint, 0, "cache_hit")
 						return nil
@@ -294,7 +302,7 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 				
 				if optional {
 					resultsMu.Lock()
-					results[dep.Key()] = []byte("null")
+					results[resultKey] = []byte("null")
 					resultsMu.Unlock()
 					a.logWithContext(reqCtx, zerolog.WarnLevel, "optional provider failed, using null",
 						func(e *zerolog.Event) {
@@ -312,12 +320,12 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 			// Store in cache only on success and if enabled
 			if err == nil && statusCode < 400 && endpointCfg.UseCache {
 				if cache, ok := FetchCacheFromContext(gctx); ok {
-					cache.m.Store(dep.CacheKey(), body)
+					cache.m.Store(cacheKey, body)
 				}
 			}
 			
 			resultsMu.Lock()
-			results[dep.Key()] = body
+			results[resultKey] = body
 			resultsMu.Unlock()
 			return nil
 		})
