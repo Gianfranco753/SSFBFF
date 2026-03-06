@@ -1,5 +1,0 @@
-base_url: http://bank-svc:8080
-timeout: 3s
-optional: true  # failure stores null, chain continues
-endpoints:
-  accounts: /api/accounts

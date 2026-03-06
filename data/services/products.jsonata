@@ -1,1 +1,0 @@
-$fetch("products_service", "data")[price > 50].{name: product_name, total: $sum(reviews.rating)}

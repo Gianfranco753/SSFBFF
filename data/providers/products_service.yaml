@@ -1,4 +1,0 @@
-base_url: http://products-svc:8080
-timeout: 5s
-endpoints:
-  data: /data
