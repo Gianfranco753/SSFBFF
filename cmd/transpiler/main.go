@@ -46,6 +46,7 @@ func main() {
 		fatal("reading input: %v", err)
 	}
 	expression := strings.TrimSpace(string(exprBytes))
+	expression = transpiler.StripJSONataComments(expression)
 
 	ast, err := jparse.Parse(expression)
 	if err != nil {

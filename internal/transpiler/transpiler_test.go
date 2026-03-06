@@ -13,6 +13,34 @@ import (
 	"github.com/gcossani/ssfbff/internal/transpiler"
 )
 
+func TestStripJSONataComments(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"no comments", `foo.bar`, `foo.bar`},
+		{"empty", ``, ``},
+		{"comment at start", `/* x */ expr`, ` expr`},
+		{"comment in middle", `a /* x */ b`, `a  b`},
+		{"comment at end", `expr /* x */`, `expr `},
+		{"double-quoted string preserves comment", `"foo /* not */ bar"`, `"foo /* not */ bar"`},
+		{"single-quoted string preserves comment", `'foo /* not */ bar'`, `'foo /* not */ bar'`},
+		{"escaped double quote in string", `"a \" /* still in string */ b"`, `"a \" /* still in string */ b"`},
+		{"escaped single quote in string", `'a \' /* still in string */ b'`, `'a \' /* still in string */ b'`},
+		{"consecutive comments", `a /* c1 */ /* c2 */ b`, `a   b`},
+		{"comment to end of input", `code /* unclosed`, `code `},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := transpiler.StripJSONataComments(tt.in)
+			if got != tt.want {
+				t.Errorf("StripJSONataComments(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
 // --- $fetch() mode tests ---
 
 func TestHasFetchCalls(t *testing.T) {

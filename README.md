@@ -133,6 +133,8 @@ data/
     └── orders.jsonata
 ```
 
+You can use `/* ... */` comments in `.jsonata` files for documentation; they are removed at build time.
+
 ### `data/openapi.yaml`
 
 OpenAPI 3.0 specification where each operation uses `x-service-name` to map to a JSONata service file:
@@ -499,6 +501,8 @@ go run ./cmd/transpiler --input=<file.jsonata> --output=<file.go> --package=<pkg
 | `--input` | `.jsonata` source file | **(required)** |
 | `--output` | Generated `.go` file | `<input>_gen.go` |
 | `--package` | Package name in generated file | `main` |
+
+Source files may contain C-style block comments (`/* ... */`); they are stripped before parsing.
 
 ### `cmd/apigen`
 
