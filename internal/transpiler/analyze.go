@@ -60,7 +60,7 @@ type OutputField struct {
 // arithmetic, comparisons, boolean logic, string concatenation, conditionals,
 // and variable bindings. Used internally by fetchFilter mode.
 type Expr struct {
-	Kind   string // "field","arrayField","literal","funcCall","binary","unary","conditional","assign","varRef","error","response"
+	Kind   string // "field","arrayField","literal","funcCall","binary","unary","conditional","assign","varRef","error","response","arrayMap"
 	GoType string // inferred Go type: "float64","string","bool","any"
 
 	// Kind="field": reference to an input struct field.
@@ -116,6 +116,8 @@ type Expr struct {
 
 	// Kind="lambdaCall": invoke a lambda with one argument. Left = lambda Expr, Right = arg Expr.
 	// Used when composing lambdas in ~> chains.
+
+	// Kind="arrayMap": array-map path (e.g. [a..b].(expr) or arr.f($)). Left = array/range expr, Right = per-element expr (rootRef $ = current element).
 }
 
 // analyzeFilterPipeline walks a parsed JSONata AST and produces a QueryPlan.
@@ -347,6 +349,17 @@ func analyzeBlockAsResult(node jparse.Node, fc *fieldCollector) ([]*Expr, *Expr,
 	return bindings, last, nil
 }
 
+// isArrayLikeExpr returns true if e represents an array or range (suitable as LHS of array-map path).
+func isArrayLikeExpr(e *Expr) bool {
+	if e == nil {
+		return false
+	}
+	if e.Kind == "array" {
+		return true
+	}
+	return e.Kind == "funcCall" && e.FuncName == "_range"
+}
+
 // analyzeExpr recursively walks a JSONata AST node and produces an Expr tree.
 // It handles field references, literals, comparisons, boolean operators,
 // arithmetic, negation, string concatenation, conditionals, and function calls.
@@ -377,6 +390,22 @@ func analyzeExpr(node jparse.Node, fc *fieldCollector) (*Expr, error) {
 	case *jparse.PathNode:
 		if len(n.Steps) == 1 {
 			return analyzeExpr(n.Steps[0], fc)
+		}
+		if len(n.Steps) >= 2 {
+			base, err := analyzeExpr(n.Steps[0], fc)
+			if err != nil {
+				return nil, err
+			}
+			if isArrayLikeExpr(base) {
+				for i := 1; i < len(n.Steps); i++ {
+					body, err := analyzeExpr(n.Steps[i], fc)
+					if err != nil {
+						return nil, fmt.Errorf("array-map step %d: %w", i, err)
+					}
+					base = &Expr{Kind: "arrayMap", Left: base, Right: body, GoType: "any"}
+				}
+				return base, nil
+			}
 		}
 		// Multi-step path: if exactly 2 steps and both are names, treat as
 		// a field.subfield reference (used in $sum(items.price) arguments).

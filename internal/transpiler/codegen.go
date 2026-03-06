@@ -230,13 +230,14 @@ func writeTransformFunc(buf *bytes.Buffer, w func(string, ...any), plan *QueryPl
 // and returns a Go expression string that can be used inline.
 
 type exprEmitter struct {
-	w            func(string, ...any)
-	indent       string
-	elemVar      string
-	counter      int
-	contextParam string         // when set, rootRef ($) emits this (for lambda body context)
-	paramPrefix  string         // when set, varRef emits this+VarName (for lambda param refs)
-	funcVarNames map[string]bool // names of variables that hold lambdas (from bindings in scope)
+	w               func(string, ...any)
+	indent          string
+	elemVar         string
+	counter         int
+	contextParam    string         // when set, rootRef ($) emits this (for lambda body context)
+	paramPrefix     string         // when set, varRef uses it only for names in lambdaParamNames
+	funcVarNames    map[string]bool // names of variables that hold lambdas (from bindings in scope)
+	lambdaParamNames map[string]bool // when set, varRef uses paramPrefix only for these names (lambda params)
 }
 
 // collectFuncVarNames returns the set of variable names that are bound to lambdas
@@ -252,6 +253,66 @@ func collectFuncVarNames(bindings []*Expr) map[string]bool {
 		}
 		out[e.VarName] = true
 	}
+	return out
+}
+
+// hasRootRef returns true if the expression tree contains a rootRef ($).
+func hasRootRef(e *Expr) bool {
+	if e == nil {
+		return false
+	}
+	if e.Kind == "rootRef" {
+		return true
+	}
+	if hasRootRef(e.Left) || hasRootRef(e.Right) {
+		return true
+	}
+	if hasRootRef(e.Cond) || hasRootRef(e.Then) || hasRootRef(e.Else) {
+		return true
+	}
+	for _, arg := range e.FuncArgs {
+		if hasRootRef(arg) {
+			return true
+		}
+	}
+	return false
+}
+
+// collectVarRefNames returns the set of variable names (VarName) referenced in the expression tree.
+// Used to detect which bindings are referenced before definition (for forward declaration).
+func collectVarRefNames(e *Expr) map[string]bool {
+	if e == nil {
+		return nil
+	}
+	out := make(map[string]bool)
+	var walk func(*Expr)
+	walk = func(x *Expr) {
+		if x == nil {
+			return
+		}
+		if x.Kind == "varRef" && x.VarName != "" {
+			out[x.VarName] = true
+		}
+		// funcCall with a name may be a variable (e.g. $cos(...)); count for forward-declaration.
+		if x.Kind == "funcCall" && x.FuncName != "" {
+			out[x.FuncName] = true
+		}
+		walk(x.Left)
+		walk(x.Right)
+		walk(x.Cond)
+		walk(x.Then)
+		walk(x.Else)
+		for _, a := range x.FuncArgs {
+			walk(a)
+		}
+		if x.Kind == "assign" && x.Left != nil && x.Left.Kind == "lambda" {
+			for _, b := range x.Left.LambdaBindings {
+				walk(b)
+			}
+			walk(x.Left.LambdaBody)
+		}
+	}
+	walk(e)
 	return out
 }
 
@@ -290,6 +351,9 @@ func (em *exprEmitter) emit(e *Expr) string {
 
 	case "unary":
 		operand := em.emit(e.Left)
+		if e.Left != nil && e.Left.GoType == "any" {
+			operand = fmt.Sprintf("runtime.ToNumber(%s)", operand)
+		}
 		return fmt.Sprintf("(-%s)", operand)
 
 	case "conditional":
@@ -308,7 +372,7 @@ func (em *exprEmitter) emit(e *Expr) string {
 		return varName
 
 	case "varRef":
-		if em.paramPrefix != "" {
+		if em.lambdaParamNames != nil && em.lambdaParamNames[e.VarName] && em.paramPrefix != "" {
 			return em.paramPrefix + e.VarName
 		}
 		return "jsonataVar_" + e.VarName
@@ -343,7 +407,7 @@ func (em *exprEmitter) emit(e *Expr) string {
 		// Standalone lambda: assign to a temp var so it can be used as a value.
 		em.counter++
 		tempName := "jsonataLambda_" + strconv.Itoa(em.counter)
-		return em.emitLambdaToVar(tempName, e)
+		return em.emitLambdaToVar(tempName, e, false)
 
 	case "lambdaCall":
 		fn := em.emit(e.Left)
@@ -364,6 +428,27 @@ func (em *exprEmitter) emit(e *Expr) string {
 		em.w("%s// ERROR: $httpResponse() should be handled before evaluation\n", em.indent)
 		return "nil"
 
+	case "arrayMap":
+		em.counter++
+		resultVar := "arrayMapResult_" + strconv.Itoa(em.counter)
+		useElem := hasRootRef(e.Right)
+		arrExpr := em.emit(e.Left)
+		em.w("%svar %s []any\n", em.indent, resultVar)
+		if useElem {
+			elemVar := "arrayMapElem_" + strconv.Itoa(em.counter)
+			em.w("%sfor _, %s := range %s {\n", em.indent, elemVar, arrExpr)
+			savedContext := em.contextParam
+			em.contextParam = elemVar
+			em.w("%s\t%s = append(%s, %s)\n", em.indent, resultVar, resultVar, em.emit(e.Right))
+			em.contextParam = savedContext
+			em.w("%s}\n", em.indent)
+		} else {
+			em.w("%sfor range %s {\n", em.indent, arrExpr)
+			em.w("%s\t%s = append(%s, %s)\n", em.indent, resultVar, resultVar, em.emit(e.Right))
+			em.w("%s}\n", em.indent)
+		}
+		return resultVar
+
 	default:
 		return "nil"
 	}
@@ -375,6 +460,17 @@ func (em *exprEmitter) emitBinary(e *Expr) string {
 
 	if e.Op == "&" {
 		return fmt.Sprintf("runtime.ToString(%s) + runtime.ToString(%s)", left, right)
+	}
+	// Numeric ops and comparisons require concrete types; wrap any in runtime.ToNumber.
+	numericOps := map[string]bool{"+": true, "-": true, "*": true, "/": true, "%": true}
+	comparisonOps := map[string]bool{"<": true, "<=": true, ">": true, ">=": true, "==": true, "!=": true}
+	if numericOps[e.Op] || comparisonOps[e.Op] {
+		if e.Left != nil && e.Left.GoType == "any" {
+			left = fmt.Sprintf("runtime.ToNumber(%s)", left)
+		}
+		if e.Right != nil && e.Right.GoType == "any" {
+			right = fmt.Sprintf("runtime.ToNumber(%s)", right)
+		}
 	}
 	return fmt.Sprintf("(%s %s %s)", left, e.Op, right)
 }
@@ -394,8 +490,11 @@ func (em *exprEmitter) emitConditional(e *Expr) string {
 	em.w("%sif runtime.Truthy(%s) {\n", em.indent, cond)
 	em.w("%s\t%s = %s\n", em.indent, varName, thenVal)
 	if e.Else != nil {
-		elseVal := em.emit(e.Else)
 		em.w("%s} else {\n", em.indent)
+		savedIndent := em.indent
+		em.indent = em.indent + "\t"
+		elseVal := em.emit(e.Else)
+		em.indent = savedIndent
 		em.w("%s\t%s = %s\n", em.indent, varName, elseVal)
 	}
 	em.w("%s}\n", em.indent)
@@ -404,27 +503,35 @@ func (em *exprEmitter) emitConditional(e *Expr) string {
 }
 
 // emitLambdaToVar writes a Go function literal for a JSONata lambda and assigns it
-// to targetVarName. Used by emitLambdaAssign (for $x := function(...){...}) and
-// for standalone lambdas (assigned to a temp var).
-func (em *exprEmitter) emitLambdaToVar(targetVarName string, lambda *Expr) string {
+// to targetVarName. When useAssignment is true, emits "=" instead of ":=" (for forward-declared vars).
+func (em *exprEmitter) emitLambdaToVar(targetVarName string, lambda *Expr, useAssignment bool) string {
 	params := make([]string, len(lambda.LambdaParams))
 	for i, p := range lambda.LambdaParams {
 		params[i] = "jsonataParam_" + p + " any"
 	}
 	paramList := strings.Join(params, ", ")
 	innerIndent := em.indent + "\t"
+	lambdaParams := make(map[string]bool)
+	for _, p := range lambda.LambdaParams {
+		lambdaParams[p] = true
+	}
 	inner := &exprEmitter{
-		w:            em.w,
-		indent:       innerIndent,
-		elemVar:      em.elemVar,
-		counter:      em.counter,
-		paramPrefix:  "jsonataParam_", // so varRef in body resolves to lambda params
-		funcVarNames: mergeFuncVarNames(em.funcVarNames, collectFuncVarNames(lambda.LambdaBindings)),
+		w:                em.w,
+		indent:           innerIndent,
+		elemVar:          em.elemVar,
+		counter:          em.counter,
+		paramPrefix:      "jsonataParam_",
+		funcVarNames:     mergeFuncVarNames(em.funcVarNames, collectFuncVarNames(lambda.LambdaBindings)),
+		lambdaParamNames: lambdaParams,
 	}
 	if len(lambda.LambdaParams) > 0 {
 		inner.contextParam = "jsonataParam_" + lambda.LambdaParams[0]
 	}
-	em.w("%s%s := func(%s) any {\n", em.indent, targetVarName, paramList)
+	assignOp := ":="
+	if useAssignment {
+		assignOp = "="
+	}
+	em.w("%s%s %s func(%s) any {\n", em.indent, targetVarName, assignOp, paramList)
 	for _, b := range lambda.LambdaBindings {
 		_ = inner.emit(b)
 	}
@@ -437,7 +544,7 @@ func (em *exprEmitter) emitLambdaToVar(targetVarName string, lambda *Expr) strin
 // emitLambdaAssign writes a Go function literal for a JSONata lambda and assigns it
 // to jsonataVar_<varName>. Used when the RHS of := is function(...) { ... }.
 func (em *exprEmitter) emitLambdaAssign(varName string, lambda *Expr) string {
-	return em.emitLambdaToVar("jsonataVar_"+varName, lambda)
+	return em.emitLambdaToVar("jsonataVar_"+varName, lambda, false)
 }
 
 func (em *exprEmitter) emitFuncCall(e *Expr) string {
@@ -485,6 +592,10 @@ func (em *exprEmitter) emitAggregate(e *Expr) string {
 
 func (em *exprEmitter) mapFuncCall(name string, args []string) string {
 	all := strings.Join(args, ", ")
+	// User-defined lambdas shadow builtins (e.g. $floor := lambda overrides builtin $floor).
+	if em.funcVarNames != nil && em.funcVarNames[name] {
+		return fmt.Sprintf("jsonataVar_%s(%s)", name, all)
+	}
 	switch name {
 	// String functions
 	case "string":
@@ -524,6 +635,9 @@ func (em *exprEmitter) mapFuncCall(name string, args []string) string {
 	case "round":
 		return fmt.Sprintf("runtime.Round(%s)", all)
 	case "power":
+		if len(args) == 2 {
+			return fmt.Sprintf("runtime.Power(runtime.ToNumber(%s), runtime.ToNumber(%s))", args[0], args[1])
+		}
 		return fmt.Sprintf("runtime.Power(%s)", all)
 	case "sqrt":
 		return fmt.Sprintf("runtime.Sqrt(%s)", all)
@@ -540,6 +654,9 @@ func (em *exprEmitter) mapFuncCall(name string, args []string) string {
 
 	// Internal functions (mapped from special syntax)
 	case "_range":
+		if len(args) == 2 {
+			return fmt.Sprintf("runtime.Range(runtime.ToNumber(%s), runtime.ToNumber(%s))", args[0], args[1])
+		}
 		return fmt.Sprintf("runtime.Range(%s)", all)
 	case "_in":
 		return fmt.Sprintf("runtime.In(%s)", all)
@@ -581,9 +698,6 @@ func (em *exprEmitter) mapFuncCall(name string, args []string) string {
 		return fmt.Sprintf("runtime.ToMillis(%s)", all)
 
 	default:
-		if em.funcVarNames != nil && em.funcVarNames[name] {
-			return fmt.Sprintf("jsonataVar_%s(%s)", name, all)
-		}
 		return fmt.Sprintf("nil /* unsupported: $%s(%s) */", name, all)
 	}
 }
@@ -626,7 +740,8 @@ func GenerateProvider(plan *ProviderPlan, packageName, sourceFile, expression st
 	w("// Expression: %s\n\n", expressionForComment(expression))
 	w("package %s\n\n", packageName)
 	w("import (\n")
-	needsStreamingEncoder := len(plan.Fields) > 0 || plan.RootExpr != nil
+	// bytes/jsontext only for object output (Fields); root-expr uses jsonv2.Marshal only.
+	needsStreamingEncoder := len(plan.Fields) > 0
 	if needsStreamingEncoder {
 		w("\t\"bytes\"\n")
 		w("\t\"encoding/json/jsontext\"\n")
@@ -896,6 +1011,7 @@ func writeProviderDepsFunc(w func(string, ...any), plan *ProviderPlan, _ bool) {
 // writeRootExprTransformBody emits the transform body when the plan has a single root
 // expression (and optional bindings). The response body is the marshalled value of
 // that expression, not a JSON object.
+// Lambdas are forward-declared so mutual recursion (e.g. $sin calling $cos and vice versa) compiles.
 func writeRootExprTransformBody(w func(string, ...any), plan *ProviderPlan) {
 	em := &exprEmitter{
 		w:            w,
@@ -904,8 +1020,43 @@ func writeRootExprTransformBody(w func(string, ...any), plan *ProviderPlan) {
 		funcVarNames: collectFuncVarNames(plan.RootBindings),
 	}
 
+	// Forward-declare only lambdas that are referenced before their definition (e.g. mutual recursion).
+	needForwardDeclare := make(map[string]bool)
+	for j, b := range plan.RootBindings {
+		if b == nil || b.Kind != "assign" || b.Left == nil || b.Left.Kind != "lambda" {
+			continue
+		}
+		for i := 0; i < j; i++ {
+			refs := collectVarRefNames(plan.RootBindings[i])
+			if refs[b.VarName] {
+				needForwardDeclare[b.VarName] = true
+				break
+			}
+		}
+	}
 	for _, b := range plan.RootBindings {
-		_ = em.emit(b)
+		if b != nil && b.Kind == "assign" && b.Left != nil && b.Left.Kind == "lambda" && needForwardDeclare[b.VarName] {
+			params := make([]string, len(b.Left.LambdaParams))
+			for i, p := range b.Left.LambdaParams {
+				params[i] = "jsonataParam_" + p + " any"
+			}
+			w("\t\tvar jsonataVar_%s func(%s) any\n", b.VarName, strings.Join(params, ", "))
+		}
+	}
+	for _, b := range plan.RootBindings {
+		if b != nil && b.Kind == "assign" && b.Left != nil && b.Left.Kind == "lambda" {
+			useAssign := needForwardDeclare[b.VarName]
+			_ = em.emitLambdaToVar("jsonataVar_"+b.VarName, b.Left, useAssign)
+		} else {
+			_ = em.emit(b)
+		}
+	}
+	// Reference lambdas so the compiler does not report "declared and not used" when they are
+	// only referenced inside unsupported code (e.g. $reduce).
+	for _, b := range plan.RootBindings {
+		if b != nil && b.Kind == "assign" && b.Left != nil && b.Left.Kind == "lambda" {
+			w("\t\t_ = jsonataVar_%s\n", b.VarName)
+		}
 	}
 
 	root := plan.RootExpr

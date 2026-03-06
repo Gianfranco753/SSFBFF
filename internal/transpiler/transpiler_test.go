@@ -1741,6 +1741,32 @@ func TestAnalyzeFetchCallsEmptyBlockRejected(t *testing.T) {
 	}
 }
 
+// TestAnalyzeFetchCallsRootExprArrayMap verifies that a top-level array-map path
+// (e.g. [a..b].(expr)) produces a plan with RootExpr of kind arrayMap.
+func TestAnalyzeFetchCallsRootExprArrayMap(t *testing.T) {
+	expr := `[1..3].($ * 2)`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformArrayMap")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+	if plan.RootExpr == nil {
+		t.Fatal("RootExpr should be set for array-map root")
+	}
+	if plan.RootExpr.Kind != "arrayMap" {
+		t.Errorf("RootExpr.Kind = %q, want arrayMap", plan.RootExpr.Kind)
+	}
+	if plan.RootExpr.Left == nil || plan.RootExpr.Right == nil {
+		t.Error("arrayMap should have Left (array/range) and Right (per-element expr)")
+	}
+	if plan.RootExpr.Left.Kind != "funcCall" || plan.RootExpr.Left.FuncName != "_range" {
+		t.Errorf("arrayMap Left should be _range, got Kind=%q FuncName=%q", plan.RootExpr.Left.Kind, plan.RootExpr.Left.FuncName)
+	}
+}
+
 // TestGenerateProviderRootExprArray verifies that generating code for a root-expr array plan
 // produces compilable Go that uses jsonv2.Marshal and returns a single value.
 func TestGenerateProviderRootExprArray(t *testing.T) {
@@ -1766,6 +1792,34 @@ func TestGenerateProviderRootExprArray(t *testing.T) {
 	}
 	if strings.Contains(code, "BeginObject") {
 		t.Error("root-expr plan should not emit BeginObject/EndObject")
+	}
+}
+
+// TestGenerateProviderRootExprArrayMap verifies that generating code for a root-expr
+// array-map path produces code that uses a range loop and append (arrayMap codegen).
+func TestGenerateProviderRootExprArrayMap(t *testing.T) {
+	expr := `[1..3].($ * 2)`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformArrayMap")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+	src, err := transpiler.GenerateProvider(plan, "testpkg", "array_map.jsonata", expr)
+	if err != nil {
+		t.Fatalf("generate error: %v", err)
+	}
+	code := string(src)
+	if !strings.Contains(code, "arrayMapResult_") {
+		t.Error("generated code for array-map should contain arrayMapResult_ variable")
+	}
+	if !strings.Contains(code, "for _,") && !strings.Contains(code, "for _, ") {
+		t.Error("generated code for array-map should contain for-range loop")
+	}
+	if !strings.Contains(code, "runtime.Range") {
+		t.Error("generated code for [1..3] should use runtime.Range")
 	}
 }
 

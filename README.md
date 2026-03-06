@@ -63,10 +63,19 @@ $fetch("orders_service", "data")[price > 100].{id: order_id, total: $sum(items.p
 
 ### Range + array map
 
-You can return an array of objects built from a numeric range using the pattern `[a..b].{key: value}`. The response body is a JSON array; each element is the result of the projection with `$` bound to the current number in the range (inclusive):
+You can return an array built from a numeric range in two ways:
+
+- **Object projection** — `[a..b].{key: value}`: the response body is a JSON array of objects; each element is the projection with `$` bound to the current number (inclusive).
+- **Generic array-map** — `[a..b].(expr)` or chained maps `[0..n].f($).g($)`: the first step is an array or range; each following step is a transform applied to every element, with `$` as the current element. The transform can be any expression (literal, function call, arithmetic, etc.).
+
+Examples:
 
 ```jsonata
 [0..24].{index: $, label: $string($)}
+```
+
+```jsonata
+[1..5].($ * 2)
 ```
 
 With bindings for the range bounds:
@@ -83,6 +92,7 @@ With bindings for the range bounds:
 - ✅ **Valid**: `{"data": $fetch("provider", "endpoint").field}` (inside object literal, mapping data)
 - ✅ **Valid**: `[1, 2, 3]` or `( $x := 1; [ $x, 2, 3 ] )` — top-level array (response body is the array)
 - ✅ **Valid**: `[0..24].{index: $}` — range + array map (response body is array of objects)
+- ✅ **Valid**: `[1..10].($ * 2)` or `[0..n].f($).g($)` — generic array-map paths (array/range then transform steps)
 - ✅ **Valid**: `42` or a block whose last expression is a number or string — response body is that value
 - ✅ **Use proxy**: For complete pass-through without any transformation, define a route in `data/proxies.yaml`
 
