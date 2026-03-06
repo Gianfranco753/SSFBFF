@@ -1,1 +1,5 @@
-{"user": $service("get_user").name, "balance": $fetch("bank_service", "accounts").amount, "auth": $request().headers.Authorization}
+{
+    "user": $service("get_user").name,
+    "balance": $fetch("bank_service", "accounts").amount,
+    "auth": $request().headers.Authorization
+}
