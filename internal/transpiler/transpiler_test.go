@@ -1244,6 +1244,119 @@ func main() {
 	t.Logf("generated code output:\n%s", output)
 }
 
+// --- First-class functions ---
+
+// TestFirstClassFuncAnalyzer verifies that a block with a lambda assignment and a call
+// to that variable produces a plan with RootBindings (assign with lambda) and RootExpr (funcCall "f").
+func TestFirstClassFuncAnalyzer(t *testing.T) {
+	expr := `($f := function($x) { $x * 2 }; $f(5))`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "FirstClass")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+	if plan.RootExpr == nil {
+		t.Fatal("plan.RootExpr should not be nil")
+	}
+	if len(plan.RootBindings) != 1 {
+		t.Fatalf("RootBindings count = %d, want 1", len(plan.RootBindings))
+	}
+	binding := plan.RootBindings[0]
+	if binding.Kind != "assign" || binding.Left == nil || binding.Left.Kind != "lambda" {
+		t.Errorf("first binding should be assign of lambda, got Kind=%s Left.Kind=%s", binding.Kind, safeKind(binding.Left))
+	}
+	if plan.RootExpr.Kind != "funcCall" || plan.RootExpr.FuncName != "f" {
+		t.Errorf("RootExpr = Kind %s FuncName %q, want funcCall \"f\"", plan.RootExpr.Kind, plan.RootExpr.FuncName)
+	}
+	if len(plan.RootExpr.FuncArgs) != 1 {
+		t.Errorf("RootExpr.FuncArgs length = %d, want 1", len(plan.RootExpr.FuncArgs))
+	}
+}
+
+func safeKind(e *transpiler.Expr) string {
+	if e == nil {
+		return "<nil>"
+	}
+	return e.Kind
+}
+
+// TestFirstClassFuncCodegen verifies that ($f := function($x) { $x * 2 }; $f(5))
+// generates a call to jsonataVar_f(...) and does not emit unsupported.
+func TestFirstClassFuncCodegen(t *testing.T) {
+	expr := `($f := function($x) { $x * 2 }; $f(5))`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "FirstClass")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+	src, err := transpiler.GenerateProvider(plan, "testpkg", "first_class.jsonata", expr)
+	if err != nil {
+		t.Fatalf("generate error: %v", err)
+	}
+	code := string(src)
+	if !strings.Contains(code, "jsonataVar_f(") {
+		t.Errorf("generated code should call jsonataVar_f(...); got:\n%s", code)
+	}
+	if strings.Contains(code, "nil /* unsupported: $f(") {
+		t.Errorf("generated code should not emit unsupported for $f(...); got:\n%s", code)
+	}
+}
+
+// TestStandaloneLambdaCodegen verifies that a standalone lambda in an expression
+// is assigned to a temp variable (jsonataLambda_N) so the code is valid.
+func TestStandaloneLambdaCodegen(t *testing.T) {
+	// Block whose last expression is a lambda (no assignment).
+	expr := `($x := 1; function($y) { $y })`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "StandaloneLambda")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+	src, err := transpiler.GenerateProvider(plan, "testpkg", "standalone_lambda.jsonata", expr)
+	if err != nil {
+		t.Fatalf("generate error: %v", err)
+	}
+	code := string(src)
+	if !strings.Contains(code, "jsonataLambda_") {
+		t.Errorf("generated code should assign standalone lambda to jsonataLambda_N; got:\n%s", code)
+	}
+}
+
+// TestFirstClassFuncUnknownVarRegression verifies that a call to an unknown variable
+// (not bound to a lambda) still emits the unsupported comment and does not generate
+// jsonataVar_<name>(...), so we do not accidentally treat any variable as callable.
+func TestFirstClassFuncUnknownVarRegression(t *testing.T) {
+	expr := `($x := 1; $notAFunc(1))`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "UnknownVar")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+	src, err := transpiler.GenerateProvider(plan, "testpkg", "unknown_var.jsonata", expr)
+	if err != nil {
+		t.Fatalf("generate error: %v", err)
+	}
+	code := string(src)
+	if !strings.Contains(code, "nil /* unsupported: $notAFunc(") {
+		t.Errorf("generated code should emit unsupported for $notAFunc(...); got:\n%s", code)
+	}
+	if strings.Contains(code, "jsonataVar_notAFunc(") {
+		t.Errorf("generated code should not call jsonataVar_notAFunc (unknown var); got:\n%s", code)
+	}
+}
+
 // --- Test helpers ---
 
 func copyRuntimePackage(t *testing.T, dir string) {

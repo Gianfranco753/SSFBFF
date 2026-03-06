@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"go/format"
+	"strconv"
 	"strings"
 )
 
@@ -167,7 +168,7 @@ func writeTransformFunc(buf *bytes.Buffer, w func(string, ...any), plan *QueryPl
 		w("\t\t\t}\n\n")
 	}
 
-	em := &exprEmitter{w: w, indent: "\t\t\t", elemVar: "elem"}
+	em := &exprEmitter{w: w, indent: "\t\t\t", elemVar: "elem", funcVarNames: collectFuncVarNames(plan.Bindings)}
 
 	// Apply filters.
 	if len(plan.Filters) > 0 {
@@ -233,8 +234,41 @@ type exprEmitter struct {
 	indent       string
 	elemVar      string
 	counter      int
-	contextParam string // when set, rootRef ($) emits this (for lambda body context)
-	paramPrefix  string // when set, varRef emits this+VarName (for lambda param refs)
+	contextParam string         // when set, rootRef ($) emits this (for lambda body context)
+	paramPrefix  string         // when set, varRef emits this+VarName (for lambda param refs)
+	funcVarNames map[string]bool // names of variables that hold lambdas (from bindings in scope)
+}
+
+// collectFuncVarNames returns the set of variable names that are bound to lambdas
+// in the given bindings. Used so codegen can emit variable-as-callee for $f(args).
+func collectFuncVarNames(bindings []*Expr) map[string]bool {
+	var out map[string]bool
+	for _, e := range bindings {
+		if e == nil || e.Kind != "assign" || e.Left == nil || e.Left.Kind != "lambda" {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]bool)
+		}
+		out[e.VarName] = true
+	}
+	return out
+}
+
+// mergeFuncVarNames merges parent and fromBindings into a new map. Used when
+// building the inner emitter for a lambda so it can call function vars from outer scope.
+func mergeFuncVarNames(parent, fromBindings map[string]bool) map[string]bool {
+	if len(parent) == 0 && len(fromBindings) == 0 {
+		return nil
+	}
+	out := make(map[string]bool)
+	for k := range parent {
+		out[k] = true
+	}
+	for k := range fromBindings {
+		out[k] = true
+	}
+	return out
 }
 
 func (em *exprEmitter) emit(e *Expr) string {
@@ -306,9 +340,10 @@ func (em *exprEmitter) emit(e *Expr) string {
 		return "data"
 
 	case "lambda":
-		// Lambdas are emitted via emitLambdaAssign when bound to a variable.
-		// Standalone lambda (e.g. in a test) would need a temp var.
-		return "nil"
+		// Standalone lambda: assign to a temp var so it can be used as a value.
+		em.counter++
+		tempName := "jsonataLambda_" + strconv.Itoa(em.counter)
+		return em.emitLambdaToVar(tempName, e)
 
 	case "lambdaCall":
 		fn := em.emit(e.Left)
@@ -368,10 +403,10 @@ func (em *exprEmitter) emitConditional(e *Expr) string {
 	return varName
 }
 
-// emitLambdaAssign writes a Go function literal for a JSONata lambda and assigns it
-// to jsonataVar_<varName>. Used when the RHS of := is function(...) { ... }.
-func (em *exprEmitter) emitLambdaAssign(varName string, lambda *Expr) string {
-	goVar := "jsonataVar_" + varName
+// emitLambdaToVar writes a Go function literal for a JSONata lambda and assigns it
+// to targetVarName. Used by emitLambdaAssign (for $x := function(...){...}) and
+// for standalone lambdas (assigned to a temp var).
+func (em *exprEmitter) emitLambdaToVar(targetVarName string, lambda *Expr) string {
 	params := make([]string, len(lambda.LambdaParams))
 	for i, p := range lambda.LambdaParams {
 		params[i] = "jsonataParam_" + p + " any"
@@ -379,23 +414,30 @@ func (em *exprEmitter) emitLambdaAssign(varName string, lambda *Expr) string {
 	paramList := strings.Join(params, ", ")
 	innerIndent := em.indent + "\t"
 	inner := &exprEmitter{
-		w:           em.w,
-		indent:      innerIndent,
-		elemVar:     em.elemVar,
-		counter:     em.counter,
-		paramPrefix: "jsonataParam_", // so varRef in body resolves to lambda params
+		w:            em.w,
+		indent:       innerIndent,
+		elemVar:      em.elemVar,
+		counter:      em.counter,
+		paramPrefix:  "jsonataParam_", // so varRef in body resolves to lambda params
+		funcVarNames: mergeFuncVarNames(em.funcVarNames, collectFuncVarNames(lambda.LambdaBindings)),
 	}
 	if len(lambda.LambdaParams) > 0 {
 		inner.contextParam = "jsonataParam_" + lambda.LambdaParams[0]
 	}
-	em.w("%s%s := func(%s) any {\n", em.indent, goVar, paramList)
+	em.w("%s%s := func(%s) any {\n", em.indent, targetVarName, paramList)
 	for _, b := range lambda.LambdaBindings {
 		_ = inner.emit(b)
 	}
 	bodyVal := inner.emit(lambda.LambdaBody)
 	em.w("%sreturn %s\n", innerIndent, bodyVal)
 	em.w("%s}\n", em.indent)
-	return goVar
+	return targetVarName
+}
+
+// emitLambdaAssign writes a Go function literal for a JSONata lambda and assigns it
+// to jsonataVar_<varName>. Used when the RHS of := is function(...) { ... }.
+func (em *exprEmitter) emitLambdaAssign(varName string, lambda *Expr) string {
+	return em.emitLambdaToVar("jsonataVar_"+varName, lambda)
 }
 
 func (em *exprEmitter) emitFuncCall(e *Expr) string {
@@ -539,6 +581,9 @@ func (em *exprEmitter) mapFuncCall(name string, args []string) string {
 		return fmt.Sprintf("runtime.ToMillis(%s)", all)
 
 	default:
+		if em.funcVarNames != nil && em.funcVarNames[name] {
+			return fmt.Sprintf("jsonataVar_%s(%s)", name, all)
+		}
 		return fmt.Sprintf("nil /* unsupported: $%s(%s) */", name, all)
 	}
 }
@@ -853,9 +898,10 @@ func writeProviderDepsFunc(w func(string, ...any), plan *ProviderPlan, _ bool) {
 // that expression, not a JSON object.
 func writeRootExprTransformBody(w func(string, ...any), plan *ProviderPlan) {
 	em := &exprEmitter{
-		w:       w,
-		indent:  "\t\t",
-		elemVar: "elem",
+		w:            w,
+		indent:       "\t\t",
+		elemVar:      "elem",
+		funcVarNames: collectFuncVarNames(plan.RootBindings),
 	}
 
 	for _, b := range plan.RootBindings {
@@ -910,9 +956,10 @@ func writeRootExprTransformBody(w func(string, ...any), plan *ProviderPlan) {
 func writeRangeMapTransformBody(w func(string, ...any), plan *ProviderPlan) {
 	rm := plan.RangeMap
 	em := &exprEmitter{
-		w:       w,
-		indent:  "\t\t",
-		elemVar: "elem",
+		w:            w,
+		indent:       "\t\t",
+		elemVar:      "elem",
+		funcVarNames: collectFuncVarNames(plan.RootBindings),
 	}
 
 	for _, b := range plan.RootBindings {
@@ -930,6 +977,7 @@ func writeRangeMapTransformBody(w func(string, ...any), plan *ProviderPlan) {
 		indent:       "\t\t\t",
 		elemVar:      "elem",
 		contextParam: "elem",
+		funcVarNames: collectFuncVarNames(plan.RootBindings),
 	}
 	w("\t\tm := make(map[string]any)\n")
 	for _, of := range rm.OutputFields {
@@ -992,9 +1040,10 @@ func writeProviderTransformFunc(w func(string, ...any), plan *ProviderPlan, hasD
 			// If field is directly a response, evaluate body and headers, then return
 			w("\t// Response field - evaluate and return\n")
 			em := &exprEmitter{
-				w:       w,
-				indent:  "\t\t",
-				elemVar: "elem",
+				w:            w,
+				indent:       "\t\t",
+				elemVar:      "elem",
+				funcVarNames: collectFuncVarNames(plan.RootBindings),
 			}
 			if field.BodyExpr != nil {
 				bodyVal := em.emit(field.BodyExpr)
@@ -1023,9 +1072,10 @@ func writeProviderTransformFunc(w func(string, ...any), plan *ProviderPlan, hasD
 			// Complex expression - evaluate it and check if result is error/response
 			// Use a provider-mode exprEmitter to evaluate the expression
 			em := &exprEmitter{
-				w:       w,
-				indent:  "\t\t",
-				elemVar: "elem", // Not used in provider mode, but needed for interface
+				w:            w,
+				indent:       "\t\t",
+				elemVar:      "elem", // Not used in provider mode, but needed for interface
+				funcVarNames: collectFuncVarNames(plan.RootBindings),
 			}
 			// Check if expression contains error or response
 			if field.ValueExpr.Kind == "error" {

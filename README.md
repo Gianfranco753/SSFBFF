@@ -1360,7 +1360,7 @@ docker build -f Dockerfile.builder -t gcossani/ssfbff-builder:latest .
 ## JSONata Coverage — 86% of spec
 
 **69 of 80** core features from the [JSONata specification](https://docs.jsonata.org/) are supported.
-The remaining gaps are mainly higher-order functions and regex functions.
+The remaining gaps are mainly higher-order functions and regex functions. The counts below use a curated core set; the full feature matrix also lists additional spec features (e.g. encoding/URL and object transform) for completeness. **First-class functions** are supported: variables holding lambdas can be called (`$f(args)`), lambdas can be assigned and used in `~>` chains, and standalone lambdas in expressions are emitted via a temp variable.
 
 | Category | Supported | Total | Coverage |
 |---|:---:|:---:|:---:|
@@ -1380,6 +1380,8 @@ The remaining gaps are mainly higher-order functions and regex functions.
 | Date/Time Functions | 4 | 4 | 100% |
 | Other | 0 | 3 | 0% |
 
+*Other = regex literals, lambda expressions, `$eval()`.*
+
 <details>
 <summary>Full feature matrix</summary>
 
@@ -1398,6 +1400,8 @@ The remaining gaps are mainly higher-order functions and regex functions.
 | `:=` binding | ✅ | `$x := price * qty` |
 | `$` context | ✅ | `$.orders` |
 | `@` (join) | ❌ | Not supported (parser recognizes it; transpiler does not) |
+| Object transform (targeted copy/update) | ❌ | Spec: `head ~> | location | update |` — not supported |
+| Functions as first-class values | ✅ | `$f := function($x){ $x*2 }; $f(5)` — call variable as function; standalone lambdas supported |
 
 ### Operators
 | Feature | Status | Example |
@@ -1438,6 +1442,9 @@ The remaining gaps are mainly higher-order functions and regex functions.
 | `$split()` | ✅ | `$split("a,b", ",")` |
 | `$match()` | ❌ | `$match("abc", /[a-z]/)` |
 | `$replace()` | ❌ | `$replace("hello", "l", "r")` |
+| `$base64encode()` / `$base64decode()` | ❌ | Encoding/decoding (spec) |
+| `$encodeUrl()` / `$decodeUrl()` | ❌ | URL encoding (spec) |
+| `$encodeUrlComponent()` / `$decodeUrlComponent()` | ❌ | URL component encoding (spec) |
 
 ### Numeric Functions
 | Feature | Status | Example |
@@ -1452,6 +1459,8 @@ The remaining gaps are mainly higher-order functions and regex functions.
 | `$random()` | ✅ | `$random()` |
 | `$formatNumber()` | ❌ | `$formatNumber(1234.5, "#,###.00")` |
 | `$parseInteger()` | ❌ | `$parseInteger("FF", 16)` |
+| `$formatBase()` | ❌ | `$formatBase(255, 16)` → `"ff"` (spec) |
+| `$formatInteger()` | ❌ | `$formatInteger(1999, 'I')` → `"MCMXCIX"` (spec) |
 
 ### Aggregation Functions
 | Feature | Status | Example |
@@ -1519,14 +1528,28 @@ The remaining gaps are mainly higher-order functions and regex functions.
 | `$sift()` | High | Requires lambda expression support |
 | `$each()` | High | Requires lambda expression support |
 
-**Higher-Order Functions Effort**: These require implementing lambda expressions (anonymous functions), which is a significant architectural change. Estimated effort: **High** (2-3 weeks for full lambda support).
+**Higher-Order Functions**: First-class *calls* (calling a variable that holds a lambda, e.g. `$f(5)`) are implemented. The missing piece is the built-in implementations of `$map`, `$filter`, etc. that accept a function argument.
+
+#### String Functions — encoding/URL (6 missing, spec)
+| Function | Effort | Notes |
+|---|---|---|
+| `$base64encode()` / `$base64decode()` | Low | Base64 encoding/decoding |
+| `$encodeUrl()` / `$decodeUrl()` | Low | Full URL encoding |
+| `$encodeUrlComponent()` / `$decodeUrlComponent()` | Low | URL component encoding |
+
+#### Numeric Functions — additional (2 missing, spec)
+| Function | Effort | Notes |
+|---|---|---|
+| `$formatBase(number [, radix])` | Low | Integer to string in given base (2–36) |
+| `$formatInteger(number, picture)` | High | Picture string (e.g. Roman numerals, words) |
 
 #### Other Missing Features
 | Feature | Effort | Notes |
 |---|---|---|
 | Regex literals (`/pattern/i`) | Medium | Requires regex parsing and compilation |
-| Lambda expressions | High | Required for higher-order functions |
+| Lambda expressions | Partial | Define/assign lambdas, call variables that hold lambdas, use in `~>` chains — supported. Passing functions to built-ins (`$map`, `$filter`, etc.) not yet supported. |
 | `$eval()` | High | Dynamic expression evaluation (security concerns) |
+| Object transform (targeted copy/update) | High | Spec pipe syntax: copy object and apply targeted updates/deletes |
 
 ### Implementation Priority Recommendations
 
@@ -1541,7 +1564,7 @@ The remaining gaps are mainly higher-order functions and regex functions.
 2. `$parseInteger()` (base conversion)
 
 **High Priority (Architectural):**
-1. Lambda expressions (enables all higher-order functions)
+1. Higher-order built-ins (`$map`, `$filter`, etc.) — first-class calls are done; built-ins that accept a function argument remain.
 2. Regex literal support (enables `$match()`, `$replace()`)
 
 **Not Recommended:**
