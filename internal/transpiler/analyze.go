@@ -103,6 +103,19 @@ type Expr struct {
 	ResponseStatusCode int                // HTTP status code
 	ResponseBodyExpr    *Expr              // Expression for response body
 	ResponseHeaders     map[string]*Expr   // Custom headers (optional)
+
+	// Kind="lambda": user-defined function ($plot := function($x) { ... }).
+	LambdaParams   []string // parameter names (without $)
+	LambdaBindings []*Expr  // optional bindings inside the function body (block)
+	LambdaBody     *Expr    // last expression / return value of the function
+
+	// Kind="builtinRef": reference to a JSONata built-in function ($string, $number, …).
+	// Used when the name appears as a variable (e.g. LHS of ~> chain).
+	// FuncName holds the built-in name for codegen.
+	// (FuncName is also used for Kind="funcCall")
+
+	// Kind="lambdaCall": invoke a lambda with one argument. Left = lambda Expr, Right = arg Expr.
+	// Used when composing lambdas in ~> chains.
 }
 
 // analyzeFilterPipeline walks a parsed JSONata AST and produces a QueryPlan.
@@ -300,6 +313,40 @@ func analyzeProjection(pair [2]jparse.Node, fc *fieldCollector) (OutputField, er
 }
 
 // --- Expression analysis ---
+// analyzeBlockAsResult analyzes a node that may be a block (expr1; expr2; ...; last).
+// Returns (bindings, result expr) for use inside lambda bodies. Single expressions
+// return (nil, analyzed expr).
+func analyzeBlockAsResult(node jparse.Node, fc *fieldCollector) ([]*Expr, *Expr, error) {
+	block, ok := node.(*jparse.BlockNode)
+	if !ok {
+		expr, err := analyzeExpr(node, fc)
+		return nil, expr, err
+	}
+	if len(block.Exprs) < 1 {
+		return nil, nil, fmt.Errorf("empty block")
+	}
+	if len(block.Exprs) == 1 {
+		expr, err := analyzeExpr(block.Exprs[0], fc)
+		return nil, expr, err
+	}
+	var bindings []*Expr
+	for _, bNode := range block.Exprs[:len(block.Exprs)-1] {
+		b, err := analyzeExpr(bNode, fc)
+		if err != nil {
+			return nil, nil, err
+		}
+		if b.Kind != "assign" {
+			return nil, nil, fmt.Errorf("expected variable binding in block, got %s", b.Kind)
+		}
+		bindings = append(bindings, b)
+	}
+	last, err := analyzeExpr(block.Exprs[len(block.Exprs)-1], fc)
+	if err != nil {
+		return nil, nil, err
+	}
+	return bindings, last, nil
+}
+
 // analyzeExpr recursively walks a JSONata AST node and produces an Expr tree.
 // It handles field references, literals, comparisons, boolean operators,
 // arithmetic, negation, string concatenation, conditionals, and function calls.
@@ -426,10 +473,14 @@ func analyzeExpr(node jparse.Node, fc *fieldCollector) (*Expr, error) {
 			return &Expr{Kind: "rootRef", GoType: "any"}, nil
 		}
 		goType, ok := fc.varTypes[n.Name]
-		if !ok {
-			return nil, fmt.Errorf("undefined variable $%s", n.Name)
+		if ok {
+			return &Expr{Kind: "varRef", VarName: n.Name, GoType: goType}, nil
 		}
-		return &Expr{Kind: "varRef", VarName: n.Name, GoType: goType}, nil
+		// Allow built-in function names (e.g. $string in $string ~> $substringBefore(?, '.')).
+		if isBuiltinFunc(n.Name) {
+			return &Expr{Kind: "builtinRef", FuncName: n.Name, GoType: "any"}, nil
+		}
+		return nil, fmt.Errorf("undefined variable $%s", n.Name)
 
 	case *jparse.ArrayNode:
 		// [start..end] — jparse wraps a RangeNode in a single-item ArrayNode.
@@ -465,22 +516,48 @@ func analyzeExpr(node jparse.Node, fc *fieldCollector) (*Expr, error) {
 		if err != nil {
 			return nil, fmt.Errorf("chain LHS: %w", err)
 		}
-		// x ~> $func  →  $func(x)
-		// x ~> $func(extra)  →  $func(x, extra)
+		// When LHS is a function (builtinRef or lambda), this is function composition:
+		// $string ~> $substringBefore(?, '.') means x -> substringBefore(string(x), '.').
+		ctxArg := &Expr{Kind: "varRef", VarName: "_x", GoType: "any"}
+		var firstArg *Expr
+		if lhs.Kind == "builtinRef" {
+			firstArg = &Expr{Kind: "funcCall", FuncName: lhs.FuncName, FuncArgs: []*Expr{ctxArg}, GoType: "any"}
+		} else if lhs.Kind == "lambda" {
+			firstArg = invokeLambda(lhs, ctxArg)
+		} else {
+			firstArg = lhs
+		}
+		var body *Expr
 		switch rhs := n.RHS.(type) {
 		case *jparse.VariableNode:
-			return &Expr{
-				Kind:     "funcCall",
-				FuncName: rhs.Name,
-				FuncArgs: []*Expr{lhs},
-				GoType:   inferFuncReturnType(rhs.Name),
-			}, nil
+			if lhs.Kind == "builtinRef" {
+				body = &Expr{
+					Kind:     "funcCall",
+					FuncName: rhs.Name,
+					FuncArgs: []*Expr{{Kind: "funcCall", FuncName: lhs.FuncName, FuncArgs: []*Expr{ctxArg}, GoType: "any"}},
+					GoType:   inferFuncReturnType(rhs.Name),
+				}
+			} else if lhs.Kind == "lambda" {
+				body = &Expr{
+					Kind:     "funcCall",
+					FuncName: rhs.Name,
+					FuncArgs: []*Expr{invokeLambda(lhs, ctxArg)},
+					GoType:   inferFuncReturnType(rhs.Name),
+				}
+			} else {
+				body = &Expr{
+					Kind:     "funcCall",
+					FuncName: rhs.Name,
+					FuncArgs: []*Expr{lhs},
+					GoType:   inferFuncReturnType(rhs.Name),
+				}
+			}
 		case *jparse.FunctionCallNode:
 			fname, err := extractVariableName(rhs.Func)
 			if err != nil {
 				return nil, fmt.Errorf("chain function name: %w", err)
 			}
-			args := []*Expr{lhs}
+			args := []*Expr{firstArg}
 			for _, a := range rhs.Args {
 				arg, err := analyzeExpr(a, fc)
 				if err != nil {
@@ -488,13 +565,60 @@ func analyzeExpr(node jparse.Node, fc *fieldCollector) (*Expr, error) {
 				}
 				args = append(args, arg)
 			}
-			return &Expr{Kind: "funcCall", FuncName: fname, FuncArgs: args, GoType: inferFuncReturnType(fname)}, nil
+			body = &Expr{Kind: "funcCall", FuncName: fname, FuncArgs: args, GoType: inferFuncReturnType(fname)}
+		case *jparse.PartialNode:
+			fname, err := extractVariableName(rhs.Func)
+			if err != nil {
+				return nil, fmt.Errorf("chain partial function name: %w", err)
+			}
+			var args []*Expr
+			for _, a := range rhs.Args {
+				if _, isPlaceholder := a.(*jparse.PlaceholderNode); isPlaceholder {
+					args = append(args, firstArg)
+				} else {
+					arg, err := analyzeExpr(a, fc)
+					if err != nil {
+						return nil, fmt.Errorf("chain partial $%s argument: %w", fname, err)
+					}
+					args = append(args, arg)
+				}
+			}
+			body = &Expr{Kind: "funcCall", FuncName: fname, FuncArgs: args, GoType: inferFuncReturnType(fname)}
 		default:
 			return nil, fmt.Errorf("unsupported ~> RHS type %T", n.RHS)
 		}
+		if body != nil && (lhs.Kind == "builtinRef" || lhs.Kind == "lambda") {
+			return &Expr{
+				Kind:         "lambda",
+				LambdaParams: []string{"_x"},
+				LambdaBody:   body,
+				GoType:       body.GoType,
+			}, nil
+		}
+		return body, nil
 
 	case *jparse.WildcardNode:
 		return nil, fmt.Errorf("wildcard (*) must appear as a path step, not standalone")
+
+	case *jparse.LambdaNode:
+		lambdaFC := &fieldCollector{numeric: map[string]bool{}, varTypes: map[string]string{}}
+		for k, v := range fc.varTypes {
+			lambdaFC.varTypes[k] = v
+		}
+		for _, p := range n.ParamNames {
+			lambdaFC.varTypes[p] = "any"
+		}
+		bindings, body, err := analyzeBlockAsResult(n.Body, lambdaFC)
+		if err != nil {
+			return nil, fmt.Errorf("lambda body: %w", err)
+		}
+		return &Expr{
+			Kind:           "lambda",
+			LambdaParams:   n.ParamNames,
+			LambdaBindings: bindings,
+			LambdaBody:     body,
+			GoType:         "any",
+		}, nil
 
 	case *jparse.BlockNode:
 		// Parenthesized expression: (expr). Unwrap the single child.
@@ -851,6 +975,28 @@ func isAggregateFunc(name string) bool {
 	return false
 }
 
+// invokeLambda returns an Expr that represents calling the lambda with the given argument.
+func invokeLambda(lambda *Expr, arg *Expr) *Expr {
+	return &Expr{Kind: "lambdaCall", Left: lambda, Right: arg, GoType: lambda.GoType}
+}
+
+// isBuiltinFunc returns true for JSONata built-in function names so they can
+// be used as variables (e.g. $string in $string ~> $substringBefore(?, '.')).
+func isBuiltinFunc(name string) bool {
+	switch name {
+	case "string", "length", "substring", "substringBefore", "substringAfter",
+		"uppercase", "lowercase", "trim", "contains", "join", "pad", "split",
+		"number", "abs", "floor", "ceil", "round", "power", "sqrt", "random",
+		"boolean", "not", "exists",
+		"sort", "reverse", "append", "distinct", "shuffle", "zip",
+		"keys", "merge", "type", "values", "spread",
+		"now", "millis", "fromMillis", "toMillis",
+		"sum", "count", "min", "max", "average", "reduce":
+		return true
+	}
+	return false
+}
+
 func isNumericFunc(name string) bool {
 	switch name {
 	case "number", "abs", "floor", "ceil", "round", "power", "sqrt":
@@ -1083,10 +1229,14 @@ func (fc *fieldCollector) build() []StructField {
 // $fetch() calls, $service() calls, and/or request functions.
 type ProviderPlan struct {
 	FuncName     string             // e.g. "TransformDashboard"
-	Fields       []ProviderField    // output fields in order
+	Fields       []ProviderField    // output fields in order (unused when RootExpr is set)
 	Deps         []ProviderDepEntry // unique provider+endpoint pairs needed
 	Services     []string           // unique service names referenced via $service()
 	NeedsRequest bool               // true if any field or fetch config uses request functions
+
+	// When set, the response body is the value of RootExpr (after evaluating RootBindings), not an object built from Fields.
+	RootExpr     *Expr  // single expression whose value is the entire response body
+	RootBindings []*Expr // variable bindings evaluated in order before RootExpr (assign expressions)
 }
 
 // ProviderField describes one key in the output JSON object. Kind determines
@@ -1325,9 +1475,15 @@ func AnalyzeFetchCalls(root jparse.Node, funcName string) (*ProviderPlan, error)
 		}, nil
 	}
 
+	// Empty block is invalid.
+	if block, ok := root.(*jparse.BlockNode); ok && len(block.Exprs) == 0 {
+		return nil, fmt.Errorf("empty block (no expressions)")
+	}
+
 	obj := unwrapObject(root)
 	if obj == nil {
-		return nil, fmt.Errorf("expression must be an object literal, got %T", root)
+		// Top-level is a block whose last expression is not an object, or a non-object root (array, primitive, path).
+		return buildRootExprPlan(root, funcName)
 	}
 
 	plan := &ProviderPlan{FuncName: funcName}
@@ -1427,7 +1583,7 @@ func isBareFetchCall(root jparse.Node) bool {
 }
 
 // unwrapObject extracts an ObjectNode from the root, handling the case where
-// jparse wraps it in a PathNode.
+// jparse wraps it in a PathNode or a BlockNode whose last expression is an object.
 func unwrapObject(root jparse.Node) *jparse.ObjectNode {
 	if obj, ok := root.(*jparse.ObjectNode); ok {
 		return obj
@@ -1437,7 +1593,150 @@ func unwrapObject(root jparse.Node) *jparse.ObjectNode {
 			return obj
 		}
 	}
+	if block, ok := root.(*jparse.BlockNode); ok && len(block.Exprs) >= 1 {
+		last := block.Exprs[len(block.Exprs)-1]
+		if obj, ok := last.(*jparse.ObjectNode); ok {
+			return obj
+		}
+	}
 	return nil
+}
+
+// buildRootExprPlan builds a ProviderPlan for a top-level expression whose result is
+// a single value (array, primitive, or any non-object). Root may be a BlockNode
+// (bindings + last expr) or a single expression node.
+func buildRootExprPlan(root jparse.Node, funcName string) (*ProviderPlan, error) {
+	var bindingNodes []jparse.Node
+	var lastExpr jparse.Node
+
+	if block, ok := root.(*jparse.BlockNode); ok {
+		bindingNodes = block.Exprs[:len(block.Exprs)-1]
+		lastExpr = block.Exprs[len(block.Exprs)-1]
+	} else {
+		lastExpr = root
+	}
+
+	fc := &fieldCollector{numeric: map[string]bool{}, varTypes: map[string]string{}}
+	var rootBindings []*Expr
+
+	for _, bNode := range bindingNodes {
+		binding, err := analyzeExpr(bNode, fc)
+		if err != nil {
+			return nil, fmt.Errorf("analyzing variable binding: %w", err)
+		}
+		if binding.Kind != "assign" {
+			return nil, fmt.Errorf("expected variable binding (:=) in block, got %s", binding.Kind)
+		}
+		rootBindings = append(rootBindings, binding)
+	}
+
+	rootExpr, err := analyzeExpr(lastExpr, fc)
+	if err != nil {
+		return nil, fmt.Errorf("analyzing root expression: %w", err)
+	}
+
+	plan := &ProviderPlan{
+		FuncName:     funcName,
+		RootExpr:     rootExpr,
+		RootBindings: rootBindings,
+	}
+	collectPlanRefsFromAST(plan, root)
+	return plan, nil
+}
+
+// collectPlanRefsFromAST walks the jparse AST and populates plan.Deps, plan.Services,
+// and plan.NeedsRequest for root-expr plans (so Execute and request extraction work).
+func collectPlanRefsFromAST(plan *ProviderPlan, node jparse.Node) {
+	seenDep := map[string]bool{}
+	seenSvc := map[string]bool{}
+
+	var walk func(jparse.Node)
+	walk = func(n jparse.Node) {
+		if n == nil {
+			return
+		}
+		if fnCall, ok := n.(*jparse.FunctionCallNode); ok {
+			if v, ok := fnCall.Func.(*jparse.VariableNode); ok {
+				switch v.Name {
+				case "fetch":
+					if len(fnCall.Args) >= 2 {
+						if p, ok := fnCall.Args[0].(*jparse.StringNode); ok && p != nil {
+							if e, ok := fnCall.Args[1].(*jparse.StringNode); ok && e != nil {
+								key := p.Value + "." + e.Value
+								if !seenDep[key] {
+									seenDep[key] = true
+									plan.Deps = append(plan.Deps, ProviderDepEntry{Provider: p.Value, Endpoint: e.Value})
+								}
+							}
+						}
+					}
+				case "service":
+					if len(fnCall.Args) == 1 {
+						if s, ok := fnCall.Args[0].(*jparse.StringNode); ok && s != nil {
+							key := "$service." + s.Value
+							if !seenSvc[key] {
+								seenSvc[key] = true
+								plan.Services = append(plan.Services, s.Value)
+							}
+						}
+					}
+				case "request":
+					plan.NeedsRequest = true
+				}
+			}
+		}
+		switch n := n.(type) {
+		case *jparse.PathNode:
+			for _, step := range n.Steps {
+				walk(step)
+			}
+		case *jparse.BlockNode:
+			for _, e := range n.Exprs {
+				walk(e)
+			}
+		case *jparse.ObjectNode:
+			for _, pair := range n.Pairs {
+				walk(pair[0])
+				walk(pair[1])
+			}
+		case *jparse.FunctionCallNode:
+			walk(n.Func)
+			for _, arg := range n.Args {
+				walk(arg)
+			}
+		case *jparse.ConditionalNode:
+			walk(n.If)
+			walk(n.Then)
+			walk(n.Else)
+		case *jparse.PredicateNode:
+			walk(n.Expr)
+			for _, f := range n.Filters {
+				walk(f)
+			}
+		case *jparse.AssignmentNode:
+			walk(n.Value)
+		case *jparse.FunctionApplicationNode:
+			walk(n.LHS)
+			walk(n.RHS)
+		case *jparse.ArrayNode:
+			for _, item := range n.Items {
+				walk(item)
+			}
+		case *jparse.LambdaNode:
+			walk(n.Body)
+		case *jparse.SortNode:
+			walk(n.Expr)
+			for _, t := range n.Terms {
+				walk(t.Expr)
+			}
+		case *jparse.PartialNode:
+			walk(n.Func)
+			for _, a := range n.Args {
+				walk(a)
+			}
+		}
+	}
+	walk(node)
 }
 
 // tryAnalyzeFetchFilter detects the $fetch(provider, endpoint)[filter].{proj}

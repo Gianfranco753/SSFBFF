@@ -1364,6 +1364,129 @@ func TestGenerateHttpResponseCode(t *testing.T) {
 	}
 }
 
+// TestAnalyzeFetchCallsRootExprArray verifies that a top-level array (or block ending in array)
+// produces a plan with RootExpr and no Fields.
+func TestAnalyzeFetchCallsRootExprArray(t *testing.T) {
+	expr := `[1, 2, 3]`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformArray")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+	if plan.RootExpr == nil {
+		t.Error("RootExpr should be set for array root")
+	}
+	if len(plan.Fields) != 0 {
+		t.Errorf("Fields should be empty for root-expr plan, got %d", len(plan.Fields))
+	}
+}
+
+// TestAnalyzeFetchCallsRootExprBlockArray verifies that a block whose last expression is an array
+// produces RootExpr and RootBindings.
+func TestAnalyzeFetchCallsRootExprBlockArray(t *testing.T) {
+	expr := `( $x := 1; [ $x, 2, 3 ] )`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformBlockArray")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+	if plan.RootExpr == nil {
+		t.Error("RootExpr should be set")
+	}
+	if len(plan.RootBindings) != 1 {
+		t.Errorf("RootBindings length = %d, want 1", len(plan.RootBindings))
+	}
+	if len(plan.Fields) != 0 {
+		t.Errorf("Fields should be empty, got %d", len(plan.Fields))
+	}
+}
+
+// TestAnalyzeFetchCallsRootExprPrimitive verifies that a top-level primitive produces RootExpr.
+func TestAnalyzeFetchCallsRootExprPrimitive(t *testing.T) {
+	expr := `42`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformNum")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+	if plan.RootExpr == nil {
+		t.Error("RootExpr should be set for primitive root")
+	}
+}
+
+// TestAnalyzeFetchCallsBlockLastObject verifies that a block whose last expression is an object
+// still produces an object plan (no RootExpr), preserving existing behaviour.
+func TestAnalyzeFetchCallsBlockLastObject(t *testing.T) {
+	expr := `( $x := 1; { "a": 1 } )`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformBlockObject")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+	if plan.RootExpr != nil {
+		t.Error("RootExpr should be nil when last expression is object (use object path)")
+	}
+	if len(plan.Fields) != 1 || plan.Fields[0].OutputKey != "a" {
+		t.Errorf("expected one field \"a\", got %v", plan.Fields)
+	}
+}
+
+// TestAnalyzeFetchCallsEmptyBlockRejected verifies that an empty block () is rejected.
+func TestAnalyzeFetchCallsEmptyBlockRejected(t *testing.T) {
+	expr := `()`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	_, err = transpiler.AnalyzeFetchCalls(ast, "TransformEmpty")
+	if err == nil {
+		t.Error("expected error for empty block")
+	}
+	if !strings.Contains(err.Error(), "empty block") {
+		t.Errorf("error should mention empty block, got: %v", err)
+	}
+}
+
+// TestGenerateProviderRootExprArray verifies that generating code for a root-expr array plan
+// produces compilable Go that uses jsonv2.Marshal and returns a single value.
+func TestGenerateProviderRootExprArray(t *testing.T) {
+	expr := `[1, 2, 3]`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformArray")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+	src, err := transpiler.GenerateProvider(plan, "testpkg", "array.jsonata", expr)
+	if err != nil {
+		t.Fatalf("generate error: %v", err)
+	}
+	code := string(src)
+	if !strings.Contains(code, "jsonv2.Marshal") {
+		t.Error("generated code should use jsonv2.Marshal for root-expr")
+	}
+	if !strings.Contains(code, "bodyBytes") || !strings.Contains(code, "Body:") {
+		t.Error("generated code should set Body from marshalled value")
+	}
+	if strings.Contains(code, "BeginObject") {
+		t.Error("root-expr plan should not emit BeginObject/EndObject")
+	}
+}
+
 func writeTestFiles(t *testing.T, dir string, generatedSrc []byte, harness string) {
 	t.Helper()
 

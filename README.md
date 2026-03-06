@@ -38,6 +38,8 @@ At runtime, each request either fans out to multiple upstreams in parallel or fe
 
 ## Expression Modes
 
+The **top-level program** can be any valid JSONata expression. The HTTP response body is that value: an object, an array, or a primitive (string, number, boolean, null). You can use a block `( expr1; expr2; ...; lastExpr )` so earlier expressions are variable bindings and the last expression is the result.
+
 All expressions use provider mode with `$fetch()` to declare upstream dependencies. Filtering and projection can be applied to fetched data:
 
 ### Fetch mode — multiple upstreams
@@ -65,6 +67,8 @@ $fetch("orders_service", "data")[price > 100].{id: order_id, total: $sum(items.p
 - ✅ **Valid**: `$fetch("provider", "endpoint").field` (field access is transformation)
 - ✅ **Valid**: `$fetch("provider", "endpoint")[filter].{projection}` (has filter/projection)
 - ✅ **Valid**: `{"data": $fetch("provider", "endpoint").field}` (inside object literal, mapping data)
+- ✅ **Valid**: `[1, 2, 3]` or `( $x := 1; [ $x, 2, 3 ] )` — top-level array (response body is the array)
+- ✅ **Valid**: `42` or a block whose last expression is a number or string — response body is that value
 - ✅ **Use proxy**: For complete pass-through without any transformation, define a route in `data/proxies.yaml`
 
 ## JSONata Extensions
