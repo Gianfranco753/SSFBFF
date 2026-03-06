@@ -1075,6 +1075,175 @@ func main() {
 	t.Logf("generated code output:\n%s", output)
 }
 
+// --- range map ([a..b].{key: value}) tests ---
+
+// TestAnalyzeRangeMap verifies that [a..b].{proj} is recognized as RangeMap plan
+// with correct StartExpr, EndExpr, and OutputFields.
+func TestAnalyzeRangeMap(t *testing.T) {
+	expr := `[0..3].{n: $}`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformRangeMap")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	if plan.RangeMap == nil {
+		t.Fatal("Plan.RangeMap should not be nil")
+	}
+	rm := plan.RangeMap
+
+	if rm.StartExpr == nil || rm.StartExpr.Kind != "literal" || rm.StartExpr.LiteralValue != "0" {
+		t.Errorf("StartExpr = %+v, want literal 0", rm.StartExpr)
+	}
+	if rm.EndExpr == nil || rm.EndExpr.Kind != "literal" || rm.EndExpr.LiteralValue != "3" {
+		t.Errorf("EndExpr = %+v, want literal 3", rm.EndExpr)
+	}
+	if len(rm.OutputFields) != 1 {
+		t.Fatalf("OutputFields count = %d, want 1", len(rm.OutputFields))
+	}
+	if rm.OutputFields[0].JSONName != "n" || rm.OutputFields[0].Value == nil || rm.OutputFields[0].Value.Kind != "rootRef" {
+		t.Errorf("OutputFields[0] = %+v, want JSONName n and Value rootRef", rm.OutputFields[0])
+	}
+}
+
+// TestAnalyzeRangeMapWithBindings verifies (bindings; [a..b].{...}) is recognized.
+func TestAnalyzeRangeMapWithBindings(t *testing.T) {
+	expr := `($start := 1; $end := 2; [$start..$end].{x: $})`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformRangeMap")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	if plan.RangeMap == nil {
+		t.Fatal("Plan.RangeMap should not be nil")
+	}
+	if len(plan.RootBindings) != 2 {
+		t.Errorf("RootBindings count = %d, want 2", len(plan.RootBindings))
+	}
+	rm := plan.RangeMap
+	if len(rm.OutputFields) != 1 || rm.OutputFields[0].JSONName != "x" {
+		t.Errorf("OutputFields = %+v, want one field x", rm.OutputFields)
+	}
+}
+
+// TestGenerateRangeMapCode verifies that GenerateProvider for a RangeMap plan
+// emits runtime.Range, loop, and marshal.
+func TestGenerateRangeMapCode(t *testing.T) {
+	expr := `[0..3].{n: $}`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformRangeMap")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	src, err := transpiler.GenerateProvider(plan, "testpkg", "range_map.jsonata", expr)
+	if err != nil {
+		t.Fatalf("generate error: %v", err)
+	}
+
+	code := string(src)
+	mustContain := []string{
+		"package testpkg",
+		"goexperiment.jsonv2",
+		"runtime.Range",
+		"for _, elem := range arr",
+		`m["n"]`,
+		"jsonv2.Marshal(results)",
+		"TransformRangeMap",
+	}
+
+	for _, s := range mustContain {
+		if !strings.Contains(code, s) {
+			t.Errorf("generated code missing %q", s)
+		}
+	}
+}
+
+// TestRangeMapEndToEnd generates a range-map transform, compiles and runs it,
+// and checks the response body is the expected JSON array.
+func TestRangeMapEndToEnd(t *testing.T) {
+	expr := `[0..3].{n: $}`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformRangeMap")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	src, err := transpiler.GenerateProvider(plan, "main", "range_map.jsonata", expr)
+	if err != nil {
+		t.Fatalf("generate error: %v", err)
+	}
+
+	dir := t.TempDir()
+	copyRuntimePackage(t, dir)
+
+	writeTestFiles(t, dir, src, `//go:build goexperiment.jsonv2
+
+package main
+
+import (
+	"fmt"
+	"os"
+
+	"testharness/runtime"
+)
+
+func main() {
+	req := runtime.RequestContext{}
+	resp, err := TransformRangeMap(req)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	if resp == nil {
+		fmt.Fprintf(os.Stderr, "nil response\n")
+		os.Exit(1)
+	}
+	fmt.Print(string(resp.Body))
+}
+`)
+
+	modCmd := exec.Command("go", "mod", "tidy")
+	modCmd.Dir = dir
+	modCmd.Env = append(os.Environ(), "GOEXPERIMENT=jsonv2")
+	if err := modCmd.Run(); err != nil {
+		t.Fatalf("go mod tidy failed: %v", err)
+	}
+
+	cmd := exec.Command("go", "run", ".")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GOEXPERIMENT=jsonv2")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("running generated code failed:\n%s\nerror: %v", output, err)
+	}
+
+	// Expect JSON array of 4 objects: [{"n":0},{"n":1},{"n":2},{"n":3}]
+	expected := `[{"n":0},{"n":1},{"n":2},{"n":3}]`
+	got := strings.TrimSpace(string(output))
+	if got != expected {
+		t.Errorf("output = %q, want %q", got, expected)
+	}
+	t.Logf("generated code output:\n%s", output)
+}
+
 // --- Test helpers ---
 
 func copyRuntimePackage(t *testing.T, dir string) {

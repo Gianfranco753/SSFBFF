@@ -61,6 +61,20 @@ You can filter and project fetched data using the pattern `$fetch("provider", "e
 $fetch("orders_service", "data")[price > 100].{id: order_id, total: $sum(items.price)}
 ```
 
+### Range + array map
+
+You can return an array of objects built from a numeric range using the pattern `[a..b].{key: value}`. The response body is a JSON array; each element is the result of the projection with `$` bound to the current number in the range (inclusive):
+
+```jsonata
+[0..24].{index: $, label: $string($)}
+```
+
+With bindings for the range bounds:
+
+```jsonata
+($start := 1; $end := 5; [$start..$end].{n: $})
+```
+
 **Important**: Generator expressions that only fetch data without any transformation are not allowed and will result in a build-time error. Field access (e.g., `$fetch(...).field`) is considered transformation and is allowed. If you need to pass data through completely unchanged, use a proxy route in `proxies.yaml` instead. For example:
 
 - ❌ **Invalid**: `$fetch("provider", "endpoint")` (completely bare fetch without any transformation)
@@ -68,6 +82,7 @@ $fetch("orders_service", "data")[price > 100].{id: order_id, total: $sum(items.p
 - ✅ **Valid**: `$fetch("provider", "endpoint")[filter].{projection}` (has filter/projection)
 - ✅ **Valid**: `{"data": $fetch("provider", "endpoint").field}` (inside object literal, mapping data)
 - ✅ **Valid**: `[1, 2, 3]` or `( $x := 1; [ $x, 2, 3 ] )` — top-level array (response body is the array)
+- ✅ **Valid**: `[0..24].{index: $}` — range + array map (response body is array of objects)
 - ✅ **Valid**: `42` or a block whose last expression is a number or string — response body is that value
 - ✅ **Use proxy**: For complete pass-through without any transformation, define a route in `data/proxies.yaml`
 

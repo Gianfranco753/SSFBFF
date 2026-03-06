@@ -1237,6 +1237,16 @@ type ProviderPlan struct {
 	// When set, the response body is the value of RootExpr (after evaluating RootBindings), not an object built from Fields.
 	RootExpr     *Expr  // single expression whose value is the entire response body
 	RootBindings []*Expr // variable bindings evaluated in order before RootExpr (assign expressions)
+
+	// When set, the response body is an array from mapping a projection over [StartExpr..EndExpr] (range + array map pattern).
+	RangeMap *RangeMapPlan
+}
+
+// RangeMapPlan is the plan for top-level [a..b].{key: value}. Response is a JSON array of objects.
+type RangeMapPlan struct {
+	StartExpr    *Expr         // range start (e.g. literal 0 or variable)
+	EndExpr      *Expr         // range end (e.g. literal 24 or variable)
+	OutputFields []OutputField // projection; expressions may use rootRef ($) for current element
 }
 
 // ProviderField describes one key in the output JSON object. Kind determines
@@ -1448,6 +1458,11 @@ func AnalyzeFetchCalls(root jparse.Node, funcName string) (*ProviderPlan, error)
 				Endpoint: field.Endpoint,
 			}},
 		}
+		return plan, nil
+	}
+
+	// Detect [a..b].{key: value} (range + array map) top-level pattern.
+	if plan, ok := tryAnalyzeRangeMap(root, funcName); ok {
 		return plan, nil
 	}
 
@@ -1812,6 +1827,99 @@ func tryAnalyzeFetchFilter(root jparse.Node, funcName string) (ProviderField, bo
 		Endpoint:   epArg.Value,
 		FilterPlan: queryPlan,
 	}, true
+}
+
+// tryAnalyzeRangeMap detects the top-level [a..b].{key: value} pattern (range + array map).
+// Supports (bindings; [a..b].{...}). Returns a ProviderPlan with RangeMap set and optional RootBindings, or (nil, false).
+func tryAnalyzeRangeMap(root jparse.Node, funcName string) (*ProviderPlan, bool) {
+	var bindingNodes []jparse.Node
+	var lastExpr jparse.Node
+
+	if block, ok := root.(*jparse.BlockNode); ok && len(block.Exprs) >= 1 {
+		bindingNodes = block.Exprs[:len(block.Exprs)-1]
+		lastExpr = block.Exprs[len(block.Exprs)-1]
+	} else {
+		lastExpr = root
+	}
+
+	path, ok := lastExpr.(*jparse.PathNode)
+	if !ok || len(path.Steps) != 2 {
+		return nil, false
+	}
+
+	// Step 0: must be [a..b] — ArrayNode with single RangeNode item.
+	step0, ok := path.Steps[0].(*jparse.ArrayNode)
+	if !ok || len(step0.Items) != 1 {
+		return nil, false
+	}
+	rangeNode, ok := step0.Items[0].(*jparse.RangeNode)
+	if !ok {
+		return nil, false
+	}
+
+	// Step 1: object projection — ObjectNode or BlockNode whose last expr is ObjectNode.
+	var obj *jparse.ObjectNode
+	switch step1 := path.Steps[1].(type) {
+	case *jparse.ObjectNode:
+		obj = step1
+	case *jparse.BlockNode:
+		if len(step1.Exprs) < 1 {
+			return nil, false
+		}
+		last, ok := step1.Exprs[len(step1.Exprs)-1].(*jparse.ObjectNode)
+		if !ok {
+			return nil, false
+		}
+		obj = last
+	default:
+		return nil, false
+	}
+
+	fc := &fieldCollector{numeric: map[string]bool{}, varTypes: map[string]string{}}
+	plan := &ProviderPlan{FuncName: funcName}
+
+	// Analyze bindings first so range/projection can reference their variables.
+	for _, bNode := range bindingNodes {
+		binding, err := analyzeExpr(bNode, fc)
+		if err != nil {
+			return nil, false
+		}
+		if binding.Kind != "assign" {
+			return nil, false
+		}
+		fc.varTypes[binding.VarName] = binding.GoType
+		plan.RootBindings = append(plan.RootBindings, binding)
+	}
+
+	startExpr, err := analyzeExpr(rangeNode.LHS, fc)
+	if err != nil {
+		return nil, false
+	}
+	endExpr, err := analyzeExpr(rangeNode.RHS, fc)
+	if err != nil {
+		return nil, false
+	}
+
+	var outputFields []OutputField
+	for _, pair := range obj.Pairs {
+		out, err := analyzeProjection(pair, fc)
+		if err != nil {
+			return nil, false
+		}
+		outputFields = append(outputFields, out)
+	}
+	for i := range outputFields {
+		resolveFieldTypes(outputFields[i].Value, fc)
+		outputFields[i].GoType = outputFields[i].Value.GoType
+	}
+
+	plan.RangeMap = &RangeMapPlan{
+		StartExpr:    startExpr,
+		EndExpr:      endExpr,
+		OutputFields: outputFields,
+	}
+
+	return plan, true
 }
 
 // analyzeValueNode determines the kind of a value expression and extracts its
