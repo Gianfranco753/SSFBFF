@@ -268,10 +268,10 @@ endpoints:
 ### 1. Write the JSONata expression
 
 ```bash
-# Filter mode
-echo 'users[active = true].{name: full_name, email: email}' > data/services/users.jsonata
+# Pure transform expression
+echo '$fetch("user_service", "profile")[active = true].{name: full_name, email: email}' > data/services/users.jsonata
 
-# Or fetch mode
+# Expression with upstream fetch
 echo '{"owner": $fetch("user_service", "profile").name}' > data/services/summary.jsonata
 ```
 
@@ -312,7 +312,7 @@ In `data/openapi.yaml`:
 
 **Optional**: Add request validation by including `parameters` and/or `requestBody` in the operation. See the [Request Validation](#request-validation) section for details.
 
-### 4. Define providers (fetch mode only)
+### 4. Define providers
 
 Create `data/providers/user_service.yaml` if it doesn't exist.
 
@@ -331,7 +331,7 @@ GOEXPERIMENT=jsonv2 go run ./cmd/server/
 
 **Note:** The `generate-generate-go.sh` script automatically keeps `internal/generated/generate.go` in sync with your `data/services/` directory. Run it whenever you add, remove, or rename JSONata files.
 
-The generator auto-detects the mode — if the expression contains `$fetch()` or `$service()`, it generates aggregator-aware routes; otherwise, single-upstream filter routes.
+The generator automatically detects whether the expression depends on upstream services. Expressions that use `$fetch()` or `$service()` generate aggregator-aware routes; expressions without upstream dependencies generate direct transform routes.
 
 ## Request Validation
 
