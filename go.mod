@@ -3,12 +3,12 @@ module github.com/gcossani/ssfbff
 go 1.25.0
 
 require (
-	github.com/blues/jsonata-go v1.5.4
 	github.com/gofiber/contrib/v3/otel v1.1.0
 	github.com/gofiber/fiber/v3 v3.1.0
 	github.com/open-feature/go-sdk v1.17.1
 	github.com/prometheus/client_golang v1.20.5
 	github.com/rs/zerolog v1.33.0
+	github.com/xiatechs/jsonata-go v1.8.8
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.66.0
 	go.opentelemetry.io/otel v1.41.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.41.0

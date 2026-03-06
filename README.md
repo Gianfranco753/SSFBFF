@@ -1374,6 +1374,7 @@ The remaining gaps are mainly higher-order functions and regex functions.
 | `~>` chain | ✅ | `$ ~> $sum()` |
 | `:=` binding | ✅ | `$x := price * qty` |
 | `$` context | ✅ | `$.orders` |
+| `@` (join) | ❌ | Not supported (parser recognizes it; transpiler does not) |
 
 ### Operators
 | Feature | Status | Example |

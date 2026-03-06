@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/blues/jsonata-go/jparse"
+	"github.com/xiatechs/jsonata-go/jparse"
 	"github.com/gcossani/ssfbff/internal/transpiler"
 )
 

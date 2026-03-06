@@ -18,7 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/blues/jsonata-go/jparse"
+	"github.com/xiatechs/jsonata-go/jparse"
 	"github.com/gcossani/ssfbff/internal/transpiler"
 )
 

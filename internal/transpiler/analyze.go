@@ -5,7 +5,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/blues/jsonata-go/jparse"
+	"github.com/xiatechs/jsonata-go/jparse"
 )
 
 // QueryPlan is the intermediate representation extracted from a JSONata AST
