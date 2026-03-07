@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/xiatechs/jsonata-go/jparse"
 	"github.com/gcossani/ssfbff/internal/transpiler"
+	"github.com/xiatechs/jsonata-go/jparse"
 )
 
 func TestStripJSONataComments(t *testing.T) {
@@ -92,6 +92,11 @@ func TestHasFetchCalls(t *testing.T) {
 		{
 			name: "$service() with $fetch()",
 			expr: `{"user": $service("get_user").name, "data": $fetch("svc", "ep").val}`,
+			want: true,
+		},
+		{
+			name: "$params() call",
+			expr: `{"user_id": $params().id}`,
 			want: true,
 		},
 		{
@@ -281,6 +286,39 @@ func TestAnalyzeRequestFunctions(t *testing.T) {
 	bodyField := plan.Fields[6]
 	if len(bodyField.BodyPath) != 2 || bodyField.BodyPath[0] != "user" || bodyField.BodyPath[1] != "name" {
 		t.Errorf("body field BodyPath = %v, want [user name]", bodyField.BodyPath)
+	}
+}
+
+func TestAnalyzeParamsFunctions(t *testing.T) {
+	expr := `{"user_id": $params().id, "raw": $params()}`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformParams")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	if len(plan.Fields) != 2 {
+		t.Fatalf("Fields count = %d, want 2", len(plan.Fields))
+	}
+
+	idField := plan.Fields[0]
+	if idField.Kind != "serviceParam" {
+		t.Fatalf("field[0].Kind = %q, want serviceParam", idField.Kind)
+	}
+	if len(idField.ParamsPath) != 1 || idField.ParamsPath[0] != "id" {
+		t.Errorf("field[0].ParamsPath = %v, want [id]", idField.ParamsPath)
+	}
+
+	rawField := plan.Fields[1]
+	if rawField.Kind != "serviceParam" {
+		t.Fatalf("field[1].Kind = %q, want serviceParam", rawField.Kind)
+	}
+	if len(rawField.ParamsPath) != 0 {
+		t.Errorf("field[1].ParamsPath = %v, want empty path", rawField.ParamsPath)
 	}
 }
 
@@ -610,7 +648,7 @@ func main() {
 // --- $service() tests ---
 
 func TestAnalyzeServiceCalls(t *testing.T) {
-	expr := `{"user": $service("get_user").name, "balance": $fetch("bank_svc", "accounts").amount}`
+	expr := `{"user": $service("get_user", {"id": $request().params.id, "auth": $request().headers.Authorization}).name, "balance": $fetch("bank_svc", "accounts").amount}`
 	ast, err := jparse.Parse(expr)
 	if err != nil {
 		t.Fatalf("parse error: %v", err)
@@ -629,6 +667,9 @@ func TestAnalyzeServiceCalls(t *testing.T) {
 	if userField.Kind != "service" || userField.ServiceName != "get_user" {
 		t.Errorf("field[0] = %+v, want Kind=service, ServiceName=get_user", userField)
 	}
+	if userField.ServiceParamsExpr == nil {
+		t.Fatal("field[0].ServiceParamsExpr should not be nil")
+	}
 	if len(userField.JSONPath) != 1 || userField.JSONPath[0] != "name" {
 		t.Errorf("field[0] JSONPath = %v, want [name]", userField.JSONPath)
 	}
@@ -643,6 +684,49 @@ func TestAnalyzeServiceCalls(t *testing.T) {
 	}
 	if len(plan.Services) != 1 || plan.Services[0] != "get_user" {
 		t.Errorf("Services = %v, want [get_user]", plan.Services)
+	}
+	if len(plan.ServiceCalls) != 1 {
+		t.Fatalf("ServiceCalls count = %d, want 1", len(plan.ServiceCalls))
+	}
+	if plan.ServiceCalls[0].ResultKey != "$service.get_user" {
+		t.Errorf("ServiceCalls[0].ResultKey = %q, want %q", plan.ServiceCalls[0].ResultKey, "$service.get_user")
+	}
+}
+
+func TestAnalyzeServiceCallValidation(t *testing.T) {
+	tests := []struct {
+		name string
+		expr string
+		want string
+	}{
+		{
+			name: "too many args",
+			expr: `{"user": $service("get_user", {"id": "1"}, {"extra": true})}`,
+			want: "$service() requires 1 or 2 arguments",
+		},
+		{
+			name: "non object params",
+			expr: `{"user": $service("get_user", "abc")}`,
+			want: "$service() second argument must be an object",
+		},
+		{
+			name: "fetch in params",
+			expr: `{"user": $service("get_user", {"id": $fetch("user_svc", "profile").id})}`,
+			want: "$service() params cannot contain $fetch()",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ast, err := jparse.Parse(tt.expr)
+			if err != nil {
+				t.Fatalf("parse error: %v", err)
+			}
+			_, err = transpiler.AnalyzeFetchCalls(ast, "TransformDashboard")
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("AnalyzeFetchCalls error = %v, want substring %q", err, tt.want)
+			}
+		})
 	}
 }
 
@@ -704,7 +788,9 @@ func TestGenerateExecuteFunc(t *testing.T) {
 		"TransformDashboardDeps(req)",
 		"agg.Fetch(ctx, deps)",
 		"errgroup.WithContext(ctx)",
-		"ExecuteGetUser(gctx, agg, req)",
+		"childReq := req",
+		"childReq.ServiceParams = nil",
+		"ExecuteGetUser(gctx, agg, childReq)",
 		`results["$service.get_user"]`,
 		"TransformDashboard(results, req)",
 	}
@@ -713,6 +799,41 @@ func TestGenerateExecuteFunc(t *testing.T) {
 		if !strings.Contains(code, s) {
 			t.Errorf("generated code missing %q\n\ngenerated:\n%s", s, code)
 		}
+	}
+}
+
+func TestGenerateExecuteFuncWithServiceParams(t *testing.T) {
+	expr := `{"user": $service("get_user", {"id": $request().params.id, "auth": $request().headers.Authorization}).name}`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformDashboard")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	src, err := transpiler.GenerateProvider(plan, "testpkg", "dashboard.jsonata", expr)
+	if err != nil {
+		t.Fatalf("generate error: %v", err)
+	}
+
+	code := string(src)
+	mustContain := []string{
+		`childReq.ServiceParams = map[string]any{`,
+		`req.Params["id"]`,
+		`req.Headers["Authorization"]`,
+		`ExecuteGetUser(gctx, agg, childReq)`,
+	}
+
+	for _, s := range mustContain {
+		if !strings.Contains(code, s) {
+			t.Errorf("generated code missing %q\n\ngenerated:\n%s", s, code)
+		}
+	}
+	if strings.Contains(code, `jsonv2.Marshal(`) {
+		t.Errorf("generated code should not marshal service params:\n%s", code)
 	}
 }
 
@@ -879,6 +1000,182 @@ require (
 		t.Fatalf("generated code did not PASS:\n%s", output)
 	}
 	t.Logf("generated code output:\n%s", output)
+}
+
+func TestServiceCompositionWithParamsEndToEnd(t *testing.T) {
+	innerExpr := `{"id": $fetch("user_svc", "profile", {"headers": {"Authorization": $params().auth, "X-User-ID": $params().id}}).id, "name": $fetch("user_svc", "profile", {"headers": {"Authorization": $params().auth, "X-User-ID": $params().id}}).name}`
+	innerAST, err := jparse.Parse(innerExpr)
+	if err != nil {
+		t.Fatalf("parse inner: %v", err)
+	}
+	innerPlan, err := transpiler.AnalyzeFetchCalls(innerAST, "TransformGetUser")
+	if err != nil {
+		t.Fatalf("analyze inner: %v", err)
+	}
+	innerSrc, err := transpiler.GenerateProvider(innerPlan, "main", "get_user.jsonata", innerExpr)
+	if err != nil {
+		t.Fatalf("generate inner: %v", err)
+	}
+
+	outerExpr := `{"user_name": $service("get_user", {"id": $request().params.id, "auth": $request().headers.Authorization}).name, "balance": $fetch("bank_svc", "accounts").amount}`
+	outerAST, err := jparse.Parse(outerExpr)
+	if err != nil {
+		t.Fatalf("parse outer: %v", err)
+	}
+	outerPlan, err := transpiler.AnalyzeFetchCalls(outerAST, "TransformDashboard")
+	if err != nil {
+		t.Fatalf("analyze outer: %v", err)
+	}
+	outerSrc, err := transpiler.GenerateProvider(outerPlan, "main", "dashboard.jsonata", outerExpr)
+	if err != nil {
+		t.Fatalf("generate outer: %v", err)
+	}
+
+	dir := t.TempDir()
+	copyRuntimePackage(t, dir)
+	copyAggregatorPackage(t, dir)
+
+	fixImports := func(src []byte) []byte {
+		s := string(src)
+		s = strings.ReplaceAll(s, `"github.com/gcossani/ssfbff/runtime"`, `"testharness/runtime"`)
+		s = strings.ReplaceAll(s, `"github.com/gcossani/ssfbff/internal/aggregator"`, `"testharness/aggregator"`)
+		s = strings.ReplaceAll(s, `"golang.org/x/sync/errgroup"`, `"testharness/errgroup"`)
+		return []byte(s)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "get_user_gen.go"), fixImports(innerSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "dashboard_gen.go"), fixImports(outerSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	harness := `//go:build goexperiment.jsonv2
+
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"testharness/aggregator"
+	"testharness/runtime"
+	"time"
+)
+
+func main() {
+	providers := map[string]aggregator.ProviderConfig{
+		"user_svc": {
+			BaseURL:   os.Getenv("UPSTREAM_USER_SVC_URL"),
+			Timeout:   5 * time.Second,
+			Endpoints: map[string]aggregator.EndpointConfig{"profile": {Path: "/profile"}},
+		},
+		"bank_svc": {
+			BaseURL:   os.Getenv("UPSTREAM_BANK_SVC_URL"),
+			Timeout:   5 * time.Second,
+			Endpoints: map[string]aggregator.EndpointConfig{"accounts": {Path: "/accounts"}},
+		},
+	}
+
+	clientFactory := func(cfg aggregator.ProviderConfig) *http.Client {
+		return http.DefaultClient
+	}
+	agg := aggregator.New(providers, clientFactory)
+	reqCtx := runtime.RequestContext{
+		Headers: map[string]string{"Authorization": "Bearer child-token"},
+		Params:  map[string]string{"id": "user-123"},
+	}
+
+	resp, err := ExecuteDashboard(context.Background(), agg, reqCtx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	if resp == nil {
+		fmt.Fprintf(os.Stderr, "error: response is nil\n")
+		os.Exit(1)
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal(resp.Body, &parsed); err != nil {
+		fmt.Fprintf(os.Stderr, "parse error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if parsed["user_name"] != "Alice-user-123" {
+		fmt.Fprintf(os.Stderr, "expected user_name=Alice-user-123, got %v\n", parsed["user_name"])
+		os.Exit(1)
+	}
+	if parsed["balance"] != 42500.75 {
+		fmt.Fprintf(os.Stderr, "expected balance=42500.75, got %v\n", parsed["balance"])
+		os.Exit(1)
+	}
+
+	fmt.Println("PASS")
+}
+`
+
+	if err := os.WriteFile(filepath.Join(dir, "main.go"), []byte(harness), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	gomod := `module testharness
+
+go 1.26
+
+require (
+	github.com/rs/zerolog v1.33.0
+)
+`
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(gomod), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	modCmd := exec.Command("go", "mod", "tidy")
+	modCmd.Dir = dir
+	modCmd.Env = append(os.Environ(), "GOEXPERIMENT=jsonv2")
+	if err := modCmd.Run(); err != nil {
+		t.Fatalf("go mod tidy failed: %v", err)
+	}
+
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/profile":
+			if got := r.Header.Get("Authorization"); got != "Bearer child-token" {
+				http.Error(w, "missing Authorization", http.StatusUnauthorized)
+				return
+			}
+			if got := r.Header.Get("X-User-ID"); got != "user-123" {
+				http.Error(w, "missing X-User-ID", http.StatusBadRequest)
+				return
+			}
+			w.Write([]byte(`{"id": 42, "name": "Alice-user-123"}`))
+		case "/accounts":
+			w.Write([]byte(`{"amount": 42500.75, "currency": "USD"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer mockServer.Close()
+
+	cmd := exec.Command("go", "run", ".")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		"GOEXPERIMENT=jsonv2",
+		"UPSTREAM_USER_SVC_URL="+mockServer.URL,
+		"UPSTREAM_BANK_SVC_URL="+mockServer.URL,
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("running generated code failed:\n%s\nerror: %v", output, err)
+	}
+
+	if !strings.Contains(string(output), "PASS") {
+		t.Fatalf("generated code did not PASS:\n%s", output)
+	}
 }
 
 // --- fetchFilter tests ---
@@ -1536,7 +1833,7 @@ func TestAnalyzeHttpResponse(t *testing.T) {
 	if field.BodyExpr == nil {
 		t.Error("field.BodyExpr should not be nil")
 	}
-	if field.Headers == nil || len(field.Headers) == 0 {
+	if len(field.Headers) == 0 {
 		t.Error("field.Headers should not be empty")
 	}
 }

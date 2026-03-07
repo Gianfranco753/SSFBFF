@@ -34,6 +34,12 @@ type RequestContext struct {
 	Path    string
 	Method  string
 	Body    []byte
+
+	// ServiceParams carries immutable per-child inputs created by a parent
+	// $service("child", {...}) call. It is separate from route params so
+	// nested services can read explicit inputs via $params() without mutating
+	// shared request state.
+	ServiceParams any
 }
 
 // RequestFieldSet describes which incoming request fields a transform needs.
@@ -195,6 +201,48 @@ func ExtractPath(data []byte, path ...string) (jsontext.Value, error) {
 
 	// Empty path — return the entire document as-is.
 	return jsontext.Value(data), nil
+}
+
+// LookupJSON returns a decoded JSON value from data at the given path.
+// It returns nil when the value is missing or invalid, which makes it suitable
+// for expression evaluation where graceful degradation is preferred over hard
+// failures.
+func LookupJSON(data []byte, path ...string) any {
+	val, err := ExtractPath(data, path...)
+	if err != nil {
+		return nil
+	}
+
+	var decoded any
+	if err := jsonv2.Unmarshal(val, &decoded); err != nil {
+		return nil
+	}
+	return decoded
+}
+
+// LookupPath reads a nested value from an in-memory Go value. It is used for
+// child-service params so generated code can pass params directly without a
+// JSON marshal/unmarshal roundtrip between parent and child services.
+func LookupPath(data any, path ...string) any {
+	if len(path) == 0 {
+		return data
+	}
+
+	current := data
+	for _, key := range path {
+		if current == nil {
+			return nil
+		}
+
+		obj, ok := current.(map[string]any)
+		if !ok {
+			return nil
+		}
+
+		current = obj[key]
+	}
+
+	return current
 }
 
 // SumFloat64 returns the sum of all values in the slice.

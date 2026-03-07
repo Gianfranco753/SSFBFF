@@ -110,7 +110,7 @@ $fetch("payment_service", "charge", {
 }).status
 ```
 
-Config keys: `method` (default `"GET"`), `headers`, `body`. Values can be static strings or `$request()` paths.
+Config keys: `method` (default `"GET"`), `headers`, `body`. Values can be static strings or `$request()` paths. Inside child services, fetch config values can also read `$params()`.
 
 ### `$request()`
 
@@ -127,14 +127,33 @@ Reads incoming HTTP request data via dot-path navigation:
 | `$request().body` | `$request().body` |
 | `$request().body.field` | `$request().body.user.name` |
 
-### `$service(name)`
+### `$service(name, params?)`
 
-Calls another generated transform pipeline in-process, enabling service composition:
+Calls another generated transform pipeline in-process, enabling service composition. The optional second argument is an explicit params object that the child service can read via `$params()`:
 
 ```jsonata
 {
-  "user": $service("get_user").name,
+  "user": $service("get_user", {
+    "auth": $request().headers.Authorization
+  }).name,
   "balance": $fetch("bank_service", "accounts").amount
+}
+```
+
+`params` should be a plain value object built from literals, `$request()`, `$params()`, and simple expression composition. It must not contain `$fetch()` calls; fetch the value in the parent service first and then pass the result explicitly.
+
+### `$params()`
+
+Reads the immutable params object passed to a child service by `$service(name, params?)`:
+
+```jsonata
+{
+  "id": $fetch("user_service", "profile", {
+    "headers": {"Authorization": $params().auth}
+  }).id,
+  "name": $fetch("user_service", "profile", {
+    "headers": {"Authorization": $params().auth}
+  }).name
 }
 ```
 
@@ -143,7 +162,7 @@ Calls another generated transform pipeline in-process, enabling service composit
 2. All `$service()` calls run in parallel (each executes its own pipeline recursively)
 3. Transform assembles the final output
 
-Sequential provider calls are achieved by composing services — each service has a flat execution model.
+Sequential provider calls are achieved by composing services — each service has a flat execution model. Child params are explicit and immutable, so sibling `$service()` calls never communicate through shared mutable request state.
 
 ## Data Directory
 
@@ -1590,7 +1609,8 @@ The remaining gaps are mainly higher-order functions and regex functions. The co
 | `$fetch(provider, endpoint)` | `$fetch("user_service", "profile").name` |
 | `$fetch()` with config | `$fetch("svc", "ep", {"method": "POST"}).val` |
 | `$request()` context | `$request().headers.Authorization` |
-| `$service(name)` composition | `$service("get_user").name` |
+| `$service(name, params?)` composition | `$service("get_user", {"auth": $request().headers.Authorization}).name` |
+| `$params()` child inputs | `$params().auth` |
 | `$httpError(statusCode, message, code?)` | `$httpError(404, "Not found", "NOT_FOUND")` |
 | `$httpResponse(statusCode, body, headers?)` | `$httpResponse(201, $fetch("orders", "create"))` |
 

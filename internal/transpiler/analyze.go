@@ -60,7 +60,7 @@ type OutputField struct {
 // arithmetic, comparisons, boolean logic, string concatenation, conditionals,
 // and variable bindings. Used internally by fetchFilter mode.
 type Expr struct {
-	Kind   string // "field","arrayField","literal","funcCall","binary","unary","conditional","assign","varRef","error","response","arrayMap"
+	Kind   string // "field","arrayField","literal","funcCall","binary","unary","conditional","assign","varRef","requestValue","error","response","arrayMap"
 	GoType string // inferred Go type: "float64","string","bool","any"
 
 	// Kind="field": reference to an input struct field.
@@ -93,6 +93,11 @@ type Expr struct {
 	// Kind="assign": variable binding ($x := expr).
 	// Kind="varRef": variable reference ($x).
 	VarName string // variable name (without $ prefix)
+
+	// Kind="requestValue": reads from request context or child-service params.
+	RequestSource string   // "header","cookie","query","param","path","method","body","serviceParam"
+	RequestArg    string   // for header/cookie/query/param: key name
+	RequestPath   []string // for body/serviceParam: trailing path segments
 
 	// Kind="error": signals an HTTP error should be returned.
 	StatusCode  int    // HTTP status code
@@ -388,6 +393,19 @@ func analyzeExpr(node jparse.Node, fc *fieldCollector) (*Expr, error) {
 		return baseExpr, nil
 
 	case *jparse.PathNode:
+		if len(n.Steps) > 0 {
+			if fnCall, ok := n.Steps[0].(*jparse.FunctionCallNode); ok {
+				var trailingPath []string
+				for _, step := range n.Steps[1:] {
+					name, ok := step.(*jparse.NameNode)
+					if !ok {
+						return nil, fmt.Errorf("expected name in path after function call, got %T", step)
+					}
+					trailingPath = append(trailingPath, name.Value)
+				}
+				return analyzeContextExprCall(fnCall, trailingPath)
+			}
+		}
 		if len(n.Steps) == 1 {
 			return analyzeExpr(n.Steps[0], fc)
 		}
@@ -816,6 +834,10 @@ func analyzeExpr(node jparse.Node, fc *fieldCollector) (*Expr, error) {
 		funcName, err := extractVariableName(n.Func)
 		if err != nil {
 			return nil, fmt.Errorf("function name: %w", err)
+		}
+
+		if funcName == "request" || funcName == "params" {
+			return analyzeContextExprCall(n, nil)
 		}
 
 		// Handle $httpError() function
@@ -1261,6 +1283,7 @@ type ProviderPlan struct {
 	Fields       []ProviderField    // output fields in order (unused when RootExpr is set)
 	Deps         []ProviderDepEntry // unique provider+endpoint pairs needed
 	Services     []string           // unique service names referenced via $service()
+	ServiceCalls []ServiceCall      // service invocations in evaluation order
 	NeedsRequest bool               // true if any field or fetch config uses request functions
 
 	// When set, the response body is the value of RootExpr (after evaluating RootBindings), not an object built from Fields.
@@ -1278,12 +1301,20 @@ type RangeMapPlan struct {
 	OutputFields []OutputField // projection; expressions may use rootRef ($) for current element
 }
 
+// ServiceCall describes one $service(...) invocation. ResultKey is unique per
+// call so repeated child-service invocations do not collide in the results map.
+type ServiceCall struct {
+	ServiceName string
+	ResultKey   string
+	ParamsExpr  *Expr
+}
+
 // ProviderField describes one key in the output JSON object. Kind determines
 // which group of fields is populated — readers only need to look at Kind and
 // the corresponding group.
 type ProviderField struct {
 	OutputKey string
-	Kind      string // "fetch", "fetchFilter", "service", "header", "cookie", "query", "param", "path", "method", "body", "static", "error", "response"
+	Kind      string // "fetch", "fetchFilter", "service", "header", "cookie", "query", "param", "path", "method", "body", "serviceParam", "static", "error", "response"
 
 	// Kind="fetch": value comes from a pre-fetched upstream response.
 	Provider    string
@@ -1298,13 +1329,18 @@ type ProviderField struct {
 
 	// Kind="service": value comes from another generated transform pipeline.
 	// JSONPath is reused for the path into the service result.
-	ServiceName string
+	ServiceName      string
+	ServiceResultKey string
+	ServiceParamsExpr *Expr
 
 	// Kind="header"/"cookie"/"query"/"param": value from $request().headers.X etc.
 	Arg string
 
 	// Kind="body": value extracted from $request().body via path navigation.
 	BodyPath []string // empty = entire body
+
+	// Kind="serviceParam": value extracted from $params() via path navigation.
+	ParamsPath []string // empty = entire params object
 
 	// Kind="static": a literal string value.
 	StaticValue string
@@ -1337,11 +1373,11 @@ type ConfigEntry struct {
 }
 
 // ConfigValue is a simple expression used inside a FetchConfig. It's either
-// a static string or a $request() path (e.g. $request().headers.Authorization).
+// a static string, a $request() path, or a $params() path.
 type ConfigValue struct {
-	Kind   string   // "static", "header", "cookie", "query", "param", "path", "method", "body"
+	Kind   string   // "static", "header", "cookie", "query", "param", "path", "method", "body", "serviceParam"
 	Arg    string   // for header/cookie/query/param: the key name from the path
-	Path   []string // for body: path segments after $request().body
+	Path   []string // for body/serviceParam: path segments after $request().body or $params()
 	Static string   // for static: the literal value
 }
 
@@ -1426,6 +1462,25 @@ func (p *ProviderPlan) RequestFields() RequestFieldSet {
 					addKey(b.Value.Kind, b.Value.Arg)
 				}
 			}
+		}
+
+		if f.ServiceParamsExpr != nil {
+			collectRequestRefsFromExpr(f.ServiceParamsExpr, addKey)
+		}
+		if f.ValueExpr != nil {
+			collectRequestRefsFromExpr(f.ValueExpr, addKey)
+		}
+	}
+
+	for _, b := range p.RootBindings {
+		collectRequestRefsFromExpr(b, addKey)
+	}
+	collectRequestRefsFromExpr(p.RootExpr, addKey)
+	if p.RangeMap != nil {
+		collectRequestRefsFromExpr(p.RangeMap.StartExpr, addKey)
+		collectRequestRefsFromExpr(p.RangeMap.EndExpr, addKey)
+		for _, out := range p.RangeMap.OutputFields {
+			collectRequestRefsFromExpr(out.Value, addKey)
 		}
 	}
 
@@ -1532,6 +1587,7 @@ func AnalyzeFetchCalls(root jparse.Node, funcName string) (*ProviderPlan, error)
 
 	plan := &ProviderPlan{FuncName: funcName}
 	seen := map[string]bool{}
+	serviceCount := map[string]int{}
 
 	for _, pair := range obj.Pairs {
 		keyName, err := extractSingleName(pair[0])
@@ -1553,8 +1609,6 @@ func AnalyzeFetchCalls(root jparse.Node, funcName string) (*ProviderPlan, error)
 			plan.NeedsRequest = true
 		}
 
-		plan.Fields = append(plan.Fields, field)
-
 		// Register unique fetch deps.
 		if field.Kind == "fetch" {
 			depKey := field.Provider + "." + field.Endpoint
@@ -1569,14 +1623,22 @@ func AnalyzeFetchCalls(root jparse.Node, funcName string) (*ProviderPlan, error)
 
 		// Register unique service deps.
 		if field.Kind == "service" {
+			serviceCount[field.ServiceName]++
+			field.ServiceResultKey = serviceResultKey(field.ServiceName, serviceCount[field.ServiceName])
 			svcKey := "$service." + field.ServiceName
 			if !seen[svcKey] {
 				seen[svcKey] = true
 				plan.Services = append(plan.Services, field.ServiceName)
 			}
+			plan.ServiceCalls = append(plan.ServiceCalls, ServiceCall{
+				ServiceName: field.ServiceName,
+				ResultKey:   field.ServiceResultKey,
+				ParamsExpr:  field.ServiceParamsExpr,
+			})
 		}
-	}
 
+		plan.Fields = append(plan.Fields, field)
+	}
 	return plan, nil
 }
 
@@ -1598,8 +1660,8 @@ func HasFetchCalls(root jparse.Node) bool {
 			}
 		}
 	case *jparse.FunctionCallNode:
-		if v, ok := n.Func.(*jparse.VariableNode); ok {
-			if v.Name == "fetch" || v.Name == "request" || v.Name == "service" || v.Name == "httpError" || v.Name == "httpResponse" {
+			if v, ok := n.Func.(*jparse.VariableNode); ok {
+				if v.Name == "fetch" || v.Name == "request" || v.Name == "params" || v.Name == "service" || v.Name == "httpError" || v.Name == "httpResponse" {
 				return true
 			}
 		}
@@ -1693,6 +1755,7 @@ func buildRootExprPlan(root jparse.Node, funcName string) (*ProviderPlan, error)
 func collectPlanRefsFromAST(plan *ProviderPlan, node jparse.Node) {
 	seenDep := map[string]bool{}
 	seenSvc := map[string]bool{}
+	serviceCount := map[string]int{}
 
 	var walk func(jparse.Node)
 	walk = func(n jparse.Node) {
@@ -1715,13 +1778,26 @@ func collectPlanRefsFromAST(plan *ProviderPlan, node jparse.Node) {
 						}
 					}
 				case "service":
-					if len(fnCall.Args) == 1 {
+					if len(fnCall.Args) >= 1 {
 						if s, ok := fnCall.Args[0].(*jparse.StringNode); ok && s != nil {
 							key := "$service." + s.Value
 							if !seenSvc[key] {
 								seenSvc[key] = true
 								plan.Services = append(plan.Services, s.Value)
 							}
+							serviceCount[s.Value]++
+							call := ServiceCall{
+								ServiceName: s.Value,
+								ResultKey:   serviceResultKey(s.Value, serviceCount[s.Value]),
+							}
+							if len(fnCall.Args) == 2 {
+								fc := &fieldCollector{numeric: map[string]bool{}, varTypes: map[string]string{}}
+								paramsExpr, err := analyzeExpr(fnCall.Args[1], fc)
+								if err == nil {
+									call.ParamsExpr = paramsExpr
+								}
+							}
+							plan.ServiceCalls = append(plan.ServiceCalls, call)
 						}
 					}
 				case "request":
@@ -2036,6 +2112,12 @@ func analyzeFunctionCall(fnCall *jparse.FunctionCallNode, trailingPath []string)
 		}
 		return analyzeRequestPath(trailingPath)
 
+	case "params":
+		if len(fnCall.Args) != 0 {
+			return ProviderField{}, fmt.Errorf("$params() takes no arguments, got %d", len(fnCall.Args))
+		}
+		return analyzeParamsPath(trailingPath)
+
 	case "httpError":
 		if len(trailingPath) > 0 {
 			return ProviderField{}, fmt.Errorf("$httpError() does not support path navigation")
@@ -2089,6 +2171,71 @@ func analyzeRequestPath(path []string) (ProviderField, error) {
 	}
 }
 
+func analyzeParamsPath(path []string) (ProviderField, error) {
+	return ProviderField{
+		Kind:       "serviceParam",
+		ParamsPath: path,
+	}, nil
+}
+
+func analyzeContextExprCall(fnCall *jparse.FunctionCallNode, trailingPath []string) (*Expr, error) {
+	fnVar, ok := fnCall.Func.(*jparse.VariableNode)
+	if !ok {
+		return nil, fmt.Errorf("expected a named function, got %T", fnCall.Func)
+	}
+
+	if len(fnCall.Args) != 0 {
+		return nil, fmt.Errorf("$%s() takes no arguments, got %d", fnVar.Name, len(fnCall.Args))
+	}
+
+	switch fnVar.Name {
+	case "request":
+		return analyzeRequestExprPath(trailingPath)
+	case "params":
+		return &Expr{
+			Kind:          "requestValue",
+			RequestSource: "serviceParam",
+			RequestPath:   trailingPath,
+			GoType:        "any",
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported function $%s", fnVar.Name)
+	}
+}
+
+func analyzeRequestExprPath(path []string) (*Expr, error) {
+	if len(path) == 0 {
+		return nil, fmt.Errorf("$request() requires a category (e.g. $request().headers.Name)")
+	}
+
+	category := path[0]
+	switch category {
+	case "headers", "cookies", "query", "params":
+		if len(path) < 2 {
+			return nil, fmt.Errorf("$request().%s requires a key name (e.g. $request().%s.Name)", category, category)
+		}
+		return &Expr{
+			Kind:          "requestValue",
+			RequestSource: categoryToKind[category],
+			RequestArg:    path[1],
+			GoType:        "any",
+		}, nil
+	case "path":
+		return &Expr{Kind: "requestValue", RequestSource: "path", GoType: "string"}, nil
+	case "method":
+		return &Expr{Kind: "requestValue", RequestSource: "method", GoType: "string"}, nil
+	case "body":
+		return &Expr{
+			Kind:          "requestValue",
+			RequestSource: "body",
+			RequestPath:   path[1:],
+			GoType:        "any",
+		}, nil
+	default:
+		return nil, fmt.Errorf("$request().%s is not a valid category (use headers/cookies/query/params/path/method/body)", category)
+	}
+}
+
 // categoryToKind maps $request() path segments to internal Kind values.
 var categoryToKind = map[string]string{
 	"headers": "header",
@@ -2131,24 +2278,147 @@ func analyzeFetchFn(fnCall *jparse.FunctionCallNode, trailingPath []string) (Pro
 	return field, nil
 }
 
-// analyzeServiceFn parses a $service("name") call. It takes one string argument
-// (the service name) and optional trailing path segments for extracting nested
-// values from the service result.
+// analyzeServiceFn parses a $service("name", params?) call. It takes a required
+// string service name, an optional params object, and optional trailing path
+// segments for extracting nested values from the service result.
 func analyzeServiceFn(fnCall *jparse.FunctionCallNode, trailingPath []string) (ProviderField, error) {
-	if len(fnCall.Args) != 1 {
-		return ProviderField{}, fmt.Errorf("$service() requires exactly 1 argument, got %d", len(fnCall.Args))
+	if len(fnCall.Args) < 1 || len(fnCall.Args) > 2 {
+		return ProviderField{}, fmt.Errorf("$service() requires 1 or 2 arguments, got %d", len(fnCall.Args))
 	}
 
 	nameArg, ok := fnCall.Args[0].(*jparse.StringNode)
 	if !ok {
-		return ProviderField{}, fmt.Errorf("$service() argument must be a string literal, got %T", fnCall.Args[0])
+		return ProviderField{}, fmt.Errorf("$service() first argument must be a string literal, got %T", fnCall.Args[0])
 	}
 
-	return ProviderField{
+	field := ProviderField{
 		Kind:        "service",
 		ServiceName: nameArg.Value,
 		JSONPath:    trailingPath,
-	}, nil
+	}
+	if len(fnCall.Args) == 2 {
+		if _, ok := fnCall.Args[1].(*jparse.ObjectNode); !ok {
+			return ProviderField{}, fmt.Errorf("$service() second argument must be an object, got %T", fnCall.Args[1])
+		}
+		if err := validateServiceParamsNode(fnCall.Args[1]); err != nil {
+			return ProviderField{}, err
+		}
+		fc := &fieldCollector{numeric: map[string]bool{}, varTypes: map[string]string{}}
+		paramsExpr, err := analyzeExpr(fnCall.Args[1], fc)
+		if err != nil {
+			return ProviderField{}, fmt.Errorf("$service() params: %w", err)
+		}
+		field.ServiceParamsExpr = paramsExpr
+	}
+	return field, nil
+}
+
+func validateServiceParamsNode(node jparse.Node) error {
+	if node == nil {
+		return nil
+	}
+
+	if fnCall, ok := node.(*jparse.FunctionCallNode); ok {
+		if fnVar, ok := fnCall.Func.(*jparse.VariableNode); ok && fnVar.Name == "fetch" {
+			return fmt.Errorf("$service() params cannot contain $fetch(); fetch the value in the parent service first and pass it explicitly")
+		}
+	}
+
+	switch n := node.(type) {
+	case *jparse.PathNode:
+		for _, step := range n.Steps {
+			if err := validateServiceParamsNode(step); err != nil {
+				return err
+			}
+		}
+	case *jparse.BlockNode:
+		for _, expr := range n.Exprs {
+			if err := validateServiceParamsNode(expr); err != nil {
+				return err
+			}
+		}
+	case *jparse.ObjectNode:
+		for _, pair := range n.Pairs {
+			if err := validateServiceParamsNode(pair[0]); err != nil {
+				return err
+			}
+			if err := validateServiceParamsNode(pair[1]); err != nil {
+				return err
+			}
+		}
+	case *jparse.FunctionCallNode:
+		if err := validateServiceParamsNode(n.Func); err != nil {
+			return err
+		}
+		for _, arg := range n.Args {
+			if err := validateServiceParamsNode(arg); err != nil {
+				return err
+			}
+		}
+	case *jparse.ConditionalNode:
+		if err := validateServiceParamsNode(n.If); err != nil {
+			return err
+		}
+		if err := validateServiceParamsNode(n.Then); err != nil {
+			return err
+		}
+		if err := validateServiceParamsNode(n.Else); err != nil {
+			return err
+		}
+	case *jparse.PredicateNode:
+		if err := validateServiceParamsNode(n.Expr); err != nil {
+			return err
+		}
+		for _, filter := range n.Filters {
+			if err := validateServiceParamsNode(filter); err != nil {
+				return err
+			}
+		}
+	case *jparse.AssignmentNode:
+		return validateServiceParamsNode(n.Value)
+	case *jparse.FunctionApplicationNode:
+		if err := validateServiceParamsNode(n.LHS); err != nil {
+			return err
+		}
+		if err := validateServiceParamsNode(n.RHS); err != nil {
+			return err
+		}
+	case *jparse.ArrayNode:
+		for _, item := range n.Items {
+			if err := validateServiceParamsNode(item); err != nil {
+				return err
+			}
+		}
+	case *jparse.RangeNode:
+		if err := validateServiceParamsNode(n.LHS); err != nil {
+			return err
+		}
+		if err := validateServiceParamsNode(n.RHS); err != nil {
+			return err
+		}
+	case *jparse.LambdaNode:
+		return validateServiceParamsNode(n.Body)
+	case *jparse.SortNode:
+		if err := validateServiceParamsNode(n.Expr); err != nil {
+			return err
+		}
+		for _, term := range n.Terms {
+			if err := validateServiceParamsNode(term.Expr); err != nil {
+				return err
+			}
+		}
+	case *jparse.PartialNode:
+		if err := validateServiceParamsNode(n.Func); err != nil {
+			return err
+		}
+		for _, arg := range n.Args {
+			if err := validateServiceParamsNode(arg); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }
 
 // analyzeErrorFn parses a $httpError(statusCode, message, code?) call.
@@ -2345,15 +2615,20 @@ func analyzeConfigFuncCall(fnCall *jparse.FunctionCallNode, trailing []string) (
 		return ConfigValue{}, fmt.Errorf("expected a named function, got %T", fnCall.Func)
 	}
 
-	if fnVar.Name != "request" {
-		return ConfigValue{}, fmt.Errorf("unsupported function $%s in config (use $request())", fnVar.Name)
+	switch fnVar.Name {
+	case "request":
+		if len(fnCall.Args) != 0 {
+			return ConfigValue{}, fmt.Errorf("$request() takes no arguments, got %d", len(fnCall.Args))
+		}
+		return analyzeConfigRequestPath(trailing)
+	case "params":
+		if len(fnCall.Args) != 0 {
+			return ConfigValue{}, fmt.Errorf("$params() takes no arguments, got %d", len(fnCall.Args))
+		}
+		return ConfigValue{Kind: "serviceParam", Path: trailing}, nil
+	default:
+		return ConfigValue{}, fmt.Errorf("unsupported function $%s in config (use $request() or $params())", fnVar.Name)
 	}
-
-	if len(fnCall.Args) != 0 {
-		return ConfigValue{}, fmt.Errorf("$request() takes no arguments, got %d", len(fnCall.Args))
-	}
-
-	return analyzeConfigRequestPath(trailing)
 }
 
 // analyzeConfigRequestPath maps $request() trailing path segments to a ConfigValue.
@@ -2400,6 +2675,49 @@ func fetchConfigNeedsRequest(cfg *FetchConfig) bool {
 		}
 	}
 	return false
+}
+
+func collectRequestRefsFromExpr(expr *Expr, addKey func(kind, arg string)) {
+	if expr == nil {
+		return
+	}
+
+	if expr.Kind == "requestValue" {
+		switch expr.RequestSource {
+		case "header", "cookie", "query", "param":
+			addKey(expr.RequestSource, expr.RequestArg)
+		case "path":
+			addKey("path", "")
+		case "method":
+			addKey("method", "")
+		case "body":
+			addKey("body", "")
+		}
+	}
+
+	collectRequestRefsFromExpr(expr.Left, addKey)
+	collectRequestRefsFromExpr(expr.Right, addKey)
+	collectRequestRefsFromExpr(expr.Cond, addKey)
+	collectRequestRefsFromExpr(expr.Then, addKey)
+	collectRequestRefsFromExpr(expr.Else, addKey)
+	for _, arg := range expr.FuncArgs {
+		collectRequestRefsFromExpr(arg, addKey)
+	}
+	for _, binding := range expr.LambdaBindings {
+		collectRequestRefsFromExpr(binding, addKey)
+	}
+	collectRequestRefsFromExpr(expr.LambdaBody, addKey)
+	collectRequestRefsFromExpr(expr.ResponseBodyExpr, addKey)
+	for _, headerExpr := range expr.ResponseHeaders {
+		collectRequestRefsFromExpr(headerExpr, addKey)
+	}
+}
+
+func serviceResultKey(serviceName string, occurrence int) string {
+	if occurrence <= 1 {
+		return "$service." + serviceName
+	}
+	return fmt.Sprintf("$service.%s#%d", serviceName, occurrence)
 }
 
 // --- Helpers ---

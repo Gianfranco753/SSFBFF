@@ -377,6 +377,9 @@ func (em *exprEmitter) emit(e *Expr) string {
 		}
 		return "jsonataVar_" + e.VarName
 
+	case "requestValue":
+		return em.emitRequestValue(e)
+
 	case "array":
 		items := make([]string, len(e.FuncArgs))
 		for i, item := range e.FuncArgs {
@@ -473,6 +476,23 @@ func (em *exprEmitter) emitBinary(e *Expr) string {
 		}
 	}
 	return fmt.Sprintf("(%s %s %s)", left, e.Op, right)
+}
+
+func (em *exprEmitter) emitRequestValue(e *Expr) string {
+	switch e.RequestSource {
+	case "header", "cookie", "query", "param":
+		return fmt.Sprintf("req.%s[%q]", requestFuncToMap(e.RequestSource), e.RequestArg)
+	case "path":
+		return "req.Path"
+	case "method":
+		return "req.Method"
+	case "body":
+		return lookupJSONExpr("req.Body", e.RequestPath)
+	case "serviceParam":
+		return lookupValueExpr("req.ServiceParams", e.RequestPath)
+	default:
+		return "nil"
+	}
 }
 
 func (em *exprEmitter) emitConditional(e *Expr) string {
@@ -727,7 +747,7 @@ func GenerateProvider(plan *ProviderPlan, packageName, sourceFile, expression st
 	}
 
 	hasDeps := len(plan.Deps) > 0
-	hasServices := len(plan.Services) > 0
+	hasServices := len(plan.ServiceCalls) > 0
 	needsExecute := hasDeps || hasServices
 	hasRootExpr := plan.RootExpr != nil
 	hasRangeMap := plan.RangeMap != nil
@@ -1400,8 +1420,11 @@ func writeProviderTransformFunc(w func(string, ...any), plan *ProviderPlan, hasD
 				w("\tenc.WriteValue(req.Body)\n\n")
 			}
 
+		case "serviceParam":
+			w("\tenc.WriteValue(%s)\n\n", lookupValueExpr("req.ServiceParams", field.ParamsPath))
+
 		case "service":
-			svcKey := "$service." + field.ServiceName
+			svcKey := field.ServiceResultKey
 			if len(field.JSONPath) > 0 {
 				pathArgs := ""
 				for _, p := range field.JSONPath {
@@ -1440,7 +1463,7 @@ func writeProviderTransformFunc(w func(string, ...any), plan *ProviderPlan, hasD
 func writeExecuteFunc(w func(string, ...any), plan *ProviderPlan) {
 	baseName := strings.TrimPrefix(plan.FuncName, "Transform")
 	hasDeps := len(plan.Deps) > 0
-	hasServices := len(plan.Services) > 0
+	hasServices := len(plan.ServiceCalls) > 0
 
 	w("func Execute%s(ctx context.Context, agg *aggregator.Aggregator, req runtime.RequestContext) (*runtime.Response, error) {\n", baseName)
 
@@ -1457,16 +1480,24 @@ func writeExecuteFunc(w func(string, ...any), plan *ProviderPlan) {
 	if hasServices {
 		w("\tg, gctx := errgroup.WithContext(ctx)\n")
 		w("\tvar mu sync.Mutex\n\n")
-		for _, svc := range plan.Services {
-			execFn := "Execute" + exportedName(svc)
-			svcKey := "$service." + svc
+		em := &exprEmitter{w: w, indent: "\t\t", elemVar: "elem"}
+		for _, svc := range plan.ServiceCalls {
+			execFn := "Execute" + exportedName(svc.ServiceName)
+			svcName := svc.ServiceName
+			svcKey := svc.ResultKey
 			w("\tg.Go(func() error {\n")
-			w("\t\tr, err := %s(gctx, agg, req)\n", execFn)
+			w("\t\tchildReq := req\n")
+			w("\t\tchildReq.ServiceParams = nil\n")
+			if svc.ParamsExpr != nil {
+				paramValue := em.emit(svc.ParamsExpr)
+				w("\t\tchildReq.ServiceParams = %s\n", paramValue)
+			}
+			w("\t\tr, err := %s(gctx, agg, childReq)\n", execFn)
 			w("\t\tif err != nil {\n")
-			w("\t\t\treturn fmt.Errorf(\"service %s: %%w\", err)\n", svc)
+			w("\t\t\treturn fmt.Errorf(\"service %s: %%w\", err)\n", svcName)
 			w("\t\t}\n")
 			w("\t\tif r == nil {\n")
-			w("\t\t\treturn fmt.Errorf(\"service %s: empty response\")\n", svc)
+			w("\t\t\treturn fmt.Errorf(\"service %s: empty response\")\n", svcName)
 			w("\t\t}\n")
 			w("\t\tmu.Lock()\n")
 			w("\t\tresults[%q] = r.Body\n", svcKey)
@@ -1498,6 +1529,8 @@ func configValueToGoExpr(cv ConfigValue, reqVar string) string {
 		return reqVar + ".Path"
 	case "method":
 		return reqVar + ".Method"
+	case "serviceParam":
+		return fmt.Sprintf("runtime.ToString(%s)", lookupValueExpr(reqVar+".ServiceParams", cv.Path))
 	default:
 		return `""`
 	}
@@ -1527,6 +1560,8 @@ func writeConfigValueToken(w func(string, ...any), cv ConfigValue, reqVar, inden
 		} else {
 			w("%se.WriteValue(%s.Body)\n", indent, reqVar)
 		}
+	case "serviceParam":
+		w("%se.WriteValue(%s)\n", indent, lookupValueExpr(reqVar+".ServiceParams", cv.Path))
 	}
 }
 
@@ -1543,6 +1578,30 @@ func requestFuncToMap(kind string) string {
 	default:
 		return "Headers"
 	}
+}
+
+func lookupJSONExpr(dataExpr string, path []string) string {
+	if len(path) == 0 {
+		return fmt.Sprintf("runtime.LookupJSON(%s)", dataExpr)
+	}
+
+	pathArgs := make([]string, len(path))
+	for i, part := range path {
+		pathArgs[i] = fmt.Sprintf("%q", part)
+	}
+	return fmt.Sprintf("runtime.LookupJSON(%s, %s)", dataExpr, strings.Join(pathArgs, ", "))
+}
+
+func lookupValueExpr(dataExpr string, path []string) string {
+	if len(path) == 0 {
+		return dataExpr
+	}
+
+	pathArgs := make([]string, len(path))
+	for i, part := range path {
+		pathArgs[i] = fmt.Sprintf("%q", part)
+	}
+	return fmt.Sprintf("runtime.LookupPath(%s, %s)", dataExpr, strings.Join(pathArgs, ", "))
 }
 
 // unexportedName returns a lowercase version of a Go name for local variables/types.

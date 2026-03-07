@@ -150,6 +150,18 @@ func TestParseConfig(t *testing.T) {
 	}
 }
 
+func TestScanRequestKeysWithServiceParams(t *testing.T) {
+	expr := `{"user": $service("get_user", {"id": $request().params.id, "auth": $request().headers.Authorization}).name}`
+	rk := scanRequestKeys(expr)
+
+	if len(rk.Headers) != 1 || rk.Headers[0] != "Authorization" {
+		t.Fatalf("Headers = %v, want [Authorization]", rk.Headers)
+	}
+	if !rk.Params {
+		t.Fatal("Params should be true when service params reference $request().params")
+	}
+}
+
 func TestGenerateSpecRoutes(t *testing.T) {
 	routes := []configRoute{
 		{Method: "Get", Path: "/api/v1/orders", FuncName: "TransformOrders"},

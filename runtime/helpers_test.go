@@ -121,6 +121,60 @@ func TestExtractPath(t *testing.T) {
 	}
 }
 
+func TestLookupPath(t *testing.T) {
+	tests := []struct {
+		name string
+		data any
+		path []string
+		want any
+	}{
+		{
+			name: "empty path returns original value",
+			data: map[string]any{"auth": "Bearer token"},
+			path: nil,
+			want: map[string]any{"auth": "Bearer token"},
+		},
+		{
+			name: "top-level value",
+			data: map[string]any{"auth": "Bearer token"},
+			path: []string{"auth"},
+			want: "Bearer token",
+		},
+		{
+			name: "nested value",
+			data: map[string]any{
+				"user": map[string]any{
+					"id":   "user-123",
+					"auth": "Bearer token",
+				},
+			},
+			path: []string{"user", "id"},
+			want: "user-123",
+		},
+		{
+			name: "missing path returns nil",
+			data: map[string]any{"auth": "Bearer token"},
+			path: []string{"missing"},
+			want: nil,
+		},
+		{
+			name: "scalar with extra path returns nil",
+			data: map[string]any{"id": "user-123"},
+			path: []string{"id", "nested"},
+			want: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := LookupPath(tt.data, tt.path...)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("LookupPath(%v, %v) = %#v, want %#v", tt.data, tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestSumFloat64(t *testing.T) {
 	tests := []struct {
 		name   string

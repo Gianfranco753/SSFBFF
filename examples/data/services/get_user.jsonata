@@ -1,1 +1,1 @@
-{"id": $fetch("user_service", "profile", {"headers": {"Authorization": $request().headers.Authorization}}).id, "name": $fetch("user_service", "profile", {"headers": {"Authorization": $request().headers.Authorization}}).name}
+{"id": $fetch("user_service", "profile", {"headers": {"Authorization": $params().auth}}).id, "name": $fetch("user_service", "profile", {"headers": {"Authorization": $params().auth}}).name}
