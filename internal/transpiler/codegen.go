@@ -769,10 +769,12 @@ func GenerateProvider(plan *ProviderPlan, packageName, sourceFile, expression st
 	if needsExecute {
 		w("\t\"context\"\n")
 	}
-	if hasDeps || hasServices || hasRootExpr || hasRangeMap {
+	// Add fmt and jsonv2 only when the transform actually emits Marshal/Errorf (response body or conditional response).
+	needsFmtAndJsonv2InTransform := hasDeps || hasServices || hasRootExpr || hasRangeMap || planNeedsResponseMarshal(plan)
+	if needsFmtAndJsonv2InTransform {
 		w("\t\"fmt\"\n")
 	}
-	if hasRootExpr || hasRangeMap {
+	if hasRootExpr || hasRangeMap || planNeedsResponseMarshal(plan) {
 		w("\tjsonv2 \"encoding/json/v2\"\n")
 	}
 	if hasServices {
@@ -803,6 +805,30 @@ func GenerateProvider(plan *ProviderPlan, packageName, sourceFile, expression st
 	}
 
 	return format.Source(buf.Bytes())
+}
+
+// planNeedsResponseMarshal returns true if the transform will emit jsonv2.Marshal or fmt.Errorf
+// (so we need those imports). This includes response bodies and conditional branches that marshal the then-value.
+func planNeedsResponseMarshal(plan *ProviderPlan) bool {
+	for _, f := range plan.Fields {
+		if f.Kind == "response" {
+			return true
+		}
+		if f.Kind == "expr" && f.ValueExpr != nil {
+			if f.ValueExpr.Kind == "response" {
+				return true
+			}
+			if f.ValueExpr.Kind == "conditional" {
+				if f.ValueExpr.Then != nil && f.ValueExpr.Then.Kind == "response" {
+					return true
+				}
+				if f.ValueExpr.Else != nil && (f.ValueExpr.Else.Kind == "response" || f.ValueExpr.Else.Kind == "error") {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // generateFetchFilter produces code for a $fetch(p,e)[filter].{projection}
@@ -1320,6 +1346,48 @@ func writeProviderTransformFunc(w func(string, ...any), plan *ProviderPlan, hasD
 							w("\tenc.WriteValue(%s)\n\n", elseVal)
 						}
 					}
+				} else if field.ValueExpr.Else != nil && field.ValueExpr.Else.Kind == "error" {
+					// cond ? normal : $httpError(...)
+					w("\tif runtime.Truthy(%s) {\n", condVal)
+					thenVal := em.emit(field.ValueExpr.Then)
+					w("\t\tbodyBytes, err := jsonv2.Marshal(%s)\n", thenVal)
+					w("\t\tif err != nil {\n")
+					w("\t\t\treturn nil, fmt.Errorf(\"marshal: %%w\", err)\n")
+					w("\t\t}\n")
+					w("\t\tenc.WriteValue(jsontext.Value(bodyBytes))\n")
+					w("\t} else {\n")
+					w("\t\tenc.WriteToken(jsontext.EndObject)\n")
+					if field.ValueExpr.Else.ErrorCode != "" {
+						w("\t\treturn nil, runtime.NewHTTPError(%d, %q, %q)\n", field.ValueExpr.Else.StatusCode, field.ValueExpr.Else.ErrorMessage, field.ValueExpr.Else.ErrorCode)
+					} else {
+						w("\t\treturn nil, runtime.NewHTTPError(%d, %q)\n", field.ValueExpr.Else.StatusCode, field.ValueExpr.Else.ErrorMessage)
+					}
+					w("\t}\n")
+				} else if field.ValueExpr.Else != nil && field.ValueExpr.Else.Kind == "response" {
+					// cond ? normal : $httpResponse(...)
+					w("\tif runtime.Truthy(%s) {\n", condVal)
+					thenVal := em.emit(field.ValueExpr.Then)
+					w("\t\tbodyBytes, err := jsonv2.Marshal(%s)\n", thenVal)
+					w("\t\tif err != nil {\n")
+					w("\t\t\treturn nil, fmt.Errorf(\"marshal: %%w\", err)\n")
+					w("\t\t}\n")
+					w("\t\tenc.WriteValue(jsontext.Value(bodyBytes))\n")
+					w("\t} else {\n")
+					bodyVal := em.emit(field.ValueExpr.Else.ResponseBodyExpr)
+					w("\t\tbodyBytes, err := jsonv2.Marshal(%s)\n", bodyVal)
+					w("\t\tif err != nil {\n")
+					w("\t\t\treturn nil, fmt.Errorf(\"marshal response body: %%w\", err)\n")
+					w("\t\t}\n")
+					w("\t\theaders := make(map[string]string)\n")
+					if field.ValueExpr.Else.ResponseHeaders != nil {
+						for headerName, headerExpr := range field.ValueExpr.Else.ResponseHeaders {
+							headerVal := em.emit(headerExpr)
+							w("\t\theaders[%q] = runtime.ToString(%s)\n", headerName, headerVal)
+						}
+					}
+					w("\t\tenc.WriteToken(jsontext.EndObject)\n")
+					w("\t\treturn &runtime.Response{StatusCode: %d, Headers: headers, Body: bodyBytes}, nil\n", field.ValueExpr.Else.ResponseStatusCode)
+					w("\t}\n")
 				} else if field.ValueExpr.Then.Kind == "response" {
 					w("\tif runtime.Truthy(%s) {\n", condVal)
 					bodyVal := em.emit(field.ValueExpr.Then.ResponseBodyExpr)

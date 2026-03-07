@@ -446,6 +446,201 @@ func TestGenerateProviderWithFetchConfig(t *testing.T) {
 	}
 }
 
+// TestHttpResponseRedirectEndToEnd runs generated code for $httpResponse(301, ..., Location) and checks redirect semantics.
+func TestHttpResponseRedirectEndToEnd(t *testing.T) {
+	expr := `$httpResponse(301, null, {"Location": "/next"})`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformRedirect")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+	src, err := transpiler.GenerateProvider(plan, "main", "redirect.jsonata", expr)
+	if err != nil {
+		t.Fatalf("generate error: %v", err)
+	}
+
+	dir := t.TempDir()
+	copyRuntimePackage(t, dir)
+	copyAggregatorPackage(t, dir)
+
+	harness := `//go:build goexperiment.jsonv2
+
+package main
+
+import (
+	"fmt"
+	"os"
+	"testharness/runtime"
+)
+
+func main() {
+	req := runtime.RequestContext{}
+	resp, err := TransformRedirect(req)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	if resp == nil {
+		fmt.Fprintf(os.Stderr, "response is nil\n")
+		os.Exit(1)
+	}
+	if resp.StatusCode != 301 {
+		fmt.Fprintf(os.Stderr, "StatusCode = %d, want 301\n", resp.StatusCode)
+		os.Exit(1)
+	}
+	if resp.Headers["Location"] != "/next" {
+		fmt.Fprintf(os.Stderr, "Location = %q, want /next\n", resp.Headers["Location"])
+		os.Exit(1)
+	}
+	fmt.Println("PASS")
+}
+`
+	writeTestFiles(t, dir, src, harness)
+	runGoModTidyAndRun(t, dir)
+}
+
+// TestHttpResponse204EndToEnd runs generated code for $httpResponse(204, null) and checks 204 No Content.
+func TestHttpResponse204EndToEnd(t *testing.T) {
+	expr := `$httpResponse(204, null)`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformNoContent")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+	src, err := transpiler.GenerateProvider(plan, "main", "no_content.jsonata", expr)
+	if err != nil {
+		t.Fatalf("generate error: %v", err)
+	}
+
+	dir := t.TempDir()
+	copyRuntimePackage(t, dir)
+	copyAggregatorPackage(t, dir)
+
+	harness := `//go:build goexperiment.jsonv2
+
+package main
+
+import (
+	"fmt"
+	"os"
+	"testharness/runtime"
+)
+
+func main() {
+	req := runtime.RequestContext{}
+	resp, err := TransformNoContent(req)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	if resp == nil {
+		fmt.Fprintf(os.Stderr, "response is nil\n")
+		os.Exit(1)
+	}
+	if resp.StatusCode != 204 {
+		fmt.Fprintf(os.Stderr, "StatusCode = %d, want 204\n", resp.StatusCode)
+		os.Exit(1)
+	}
+	// Body may be nil or JSON "null" (4 bytes) depending on codegen
+	if resp.Body != nil && len(resp.Body) != 0 && string(resp.Body) != "null" {
+		fmt.Fprintf(os.Stderr, "204 body should be empty or null, got %q\n", resp.Body)
+		os.Exit(1)
+	}
+	fmt.Println("PASS")
+}
+`
+	writeTestFiles(t, dir, src, harness)
+	runGoModTidyAndRun(t, dir)
+}
+
+// TestHttpErrorInConditionalElseEndToEnd runs generated code for cond ? normal : $httpError() and verifies the else branch returns the error.
+func TestHttpErrorInConditionalElseEndToEnd(t *testing.T) {
+	expr := `false ? {"a": 1} : $httpError(404, "not found")`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformCondErr")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+	src, err := transpiler.GenerateProvider(plan, "main", "cond_err.jsonata", expr)
+	if err != nil {
+		t.Fatalf("generate error: %v", err)
+	}
+
+	dir := t.TempDir()
+	copyRuntimePackage(t, dir)
+	copyAggregatorPackage(t, dir)
+
+	harness := `//go:build goexperiment.jsonv2
+
+package main
+
+import (
+	"fmt"
+	"os"
+	"testharness/runtime"
+)
+
+func main() {
+	req := runtime.RequestContext{}
+	resp, err := TransformCondErr(req)
+	if err == nil {
+		fmt.Fprintf(os.Stderr, "expected error from else branch, got nil\n")
+		os.Exit(1)
+	}
+	if resp != nil {
+		fmt.Fprintf(os.Stderr, "expected nil response when error, got %v\n", resp)
+		os.Exit(1)
+	}
+	httpErr, ok := err.(*runtime.HTTPError)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "expected *runtime.HTTPError, got %T\n", err)
+		os.Exit(1)
+	}
+	if httpErr.StatusCode != 404 {
+		fmt.Fprintf(os.Stderr, "StatusCode = %d, want 404\n", httpErr.StatusCode)
+		os.Exit(1)
+	}
+	if httpErr.Message != "not found" {
+		fmt.Fprintf(os.Stderr, "Message = %q, want \"not found\"\n", httpErr.Message)
+		os.Exit(1)
+	}
+	fmt.Println("PASS")
+}
+`
+	writeTestFiles(t, dir, src, harness)
+	runGoModTidyAndRun(t, dir)
+}
+
+func runGoModTidyAndRun(t *testing.T, dir string) {
+	t.Helper()
+	modCmd := exec.Command("go", "mod", "tidy")
+	modCmd.Dir = dir
+	modCmd.Env = append(os.Environ(), "GOEXPERIMENT=jsonv2")
+	if err := modCmd.Run(); err != nil {
+		t.Fatalf("go mod tidy failed: %v", err)
+	}
+	cmd := exec.Command("go", "run", ".")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GOEXPERIMENT=jsonv2")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("running generated code failed:\n%s\nerror: %v", output, err)
+	}
+	if !strings.Contains(string(output), "PASS") {
+		t.Fatalf("generated code did not PASS:\n%s", output)
+	}
+	t.Logf("generated code output:\n%s", output)
+}
+
 // TestFetchEndToEnd generates a $fetch()-based transform, writes it alongside
 // a harness that simulates pre-fetched provider results, compiles and runs it.
 func TestFetchEndToEnd(t *testing.T) {
@@ -1876,6 +2071,62 @@ func TestAnalyzeHttpErrorInConditional(t *testing.T) {
 	}
 }
 
+// TestAnalyzeHttpErrorInConditionalElse verifies that $httpError() in the else branch is parsed.
+func TestAnalyzeHttpErrorInConditionalElse(t *testing.T) {
+	expr := `$request().params.id = "" ? {"ok": true} : $httpError(400, "id required")`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformCheckId")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	if len(plan.Fields) != 1 {
+		t.Fatalf("Fields count = %d, want 1", len(plan.Fields))
+	}
+	field := plan.Fields[0]
+	if field.Kind != "expr" || field.ValueExpr == nil || field.ValueExpr.Kind != "conditional" {
+		t.Fatalf("expected expr with conditional, got Kind=%q ValueExpr=%v", field.Kind, field.ValueExpr)
+	}
+	if field.ValueExpr.Else == nil || field.ValueExpr.Else.Kind != "error" {
+		t.Errorf("Else branch should be error, got %v", field.ValueExpr.Else)
+	}
+	if field.ValueExpr.Else != nil && field.ValueExpr.Else.StatusCode != 400 {
+		t.Errorf("Else.StatusCode = %d, want 400", field.ValueExpr.Else.StatusCode)
+	}
+}
+
+// TestAnalyzeHttpResponseInConditionalElse verifies that $httpResponse() in the else branch is parsed.
+func TestAnalyzeHttpResponseInConditionalElse(t *testing.T) {
+	expr := `false ? {"a": 1} : $httpResponse(204, null)`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformMaybeEmpty")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	if len(plan.Fields) != 1 {
+		t.Fatalf("Fields count = %d, want 1", len(plan.Fields))
+	}
+	field := plan.Fields[0]
+	if field.Kind != "expr" || field.ValueExpr == nil || field.ValueExpr.Kind != "conditional" {
+		t.Fatalf("expected expr with conditional, got Kind=%q ValueExpr=%v", field.Kind, field.ValueExpr)
+	}
+	if field.ValueExpr.Else == nil || field.ValueExpr.Else.Kind != "response" {
+		t.Errorf("Else branch should be response, got %v", field.ValueExpr.Else)
+	}
+	if field.ValueExpr.Else != nil && field.ValueExpr.Else.ResponseStatusCode != 204 {
+		t.Errorf("Else.ResponseStatusCode = %d, want 204", field.ValueExpr.Else.ResponseStatusCode)
+	}
+}
+
 // TestGenerateHttpErrorCode verifies that generated code for $httpError() is correct.
 func TestGenerateHttpErrorCode(t *testing.T) {
 	expr := `$httpError(404, "Not found")`
@@ -1940,6 +2191,122 @@ func TestGenerateHttpResponseCode(t *testing.T) {
 		if !strings.Contains(code, s) {
 			t.Errorf("generated code missing %q", s)
 		}
+	}
+}
+
+// TestGenerateConditionalElseHttpErrorCode verifies codegen when the else branch returns $httpError().
+func TestGenerateConditionalElseHttpErrorCode(t *testing.T) {
+	expr := `$request().params.id = "" ? {"ok": true} : $httpError(400, "id required")`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformCheckId")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	src, err := transpiler.GenerateProvider(plan, "testpkg", "check_id.jsonata", expr)
+	if err != nil {
+		t.Fatalf("generate error: %v", err)
+	}
+
+	code := string(src)
+	mustContain := []string{
+		"runtime.NewHTTPError(400",
+		`"id required"`,
+		"req.Params",
+	}
+	for _, s := range mustContain {
+		if !strings.Contains(code, s) {
+			t.Errorf("generated code missing %q", s)
+		}
+	}
+}
+
+// TestRequestFields verifies that RequestFields() collects and dedupes refs from fields, fetch config, and root bindings.
+func TestRequestFields(t *testing.T) {
+	expr := `{
+		"h": $request().headers.Auth,
+		"c": $request().cookies.Sess,
+		"q": $request().query.Page,
+		"p": $request().params.Id,
+		"data": $fetch("svc", "ep", {"headers": {"X-Token": $request().headers.XToken}, "body": {"user": $request().body.user}}).value
+	}`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformRequestFields")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	rf := plan.RequestFields()
+
+	if len(rf.Headers) != 2 {
+		t.Errorf("Headers = %v, want [Auth, XToken] (deduped)", rf.Headers)
+	}
+	wantHeaders := map[string]bool{"Auth": true, "XToken": true}
+	for _, h := range rf.Headers {
+		if !wantHeaders[h] {
+			t.Errorf("unexpected header %q", h)
+		}
+	}
+	if len(rf.Cookies) != 1 || rf.Cookies[0] != "Sess" {
+		t.Errorf("Cookies = %v, want [Sess]", rf.Cookies)
+	}
+	if len(rf.Query) != 1 || rf.Query[0] != "Page" {
+		t.Errorf("Query = %v, want [Page]", rf.Query)
+	}
+	if len(rf.Params) != 1 || rf.Params[0] != "Id" {
+		t.Errorf("Params = %v, want [Id]", rf.Params)
+	}
+	if !rf.NeedBody {
+		t.Error("NeedBody should be true (body used in fetch config)")
+	}
+}
+
+// TestRequestFieldsDedup verifies that duplicate request refs are deduped.
+func TestRequestFieldsDedup(t *testing.T) {
+	expr := `{"a": $request().headers.X, "b": $request().headers.X, "c": $request().params.id}`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformDedup")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	rf := plan.RequestFields()
+	if len(rf.Headers) != 1 || rf.Headers[0] != "X" {
+		t.Errorf("Headers should be deduped to [X], got %v", rf.Headers)
+	}
+	if len(rf.Params) != 1 || rf.Params[0] != "id" {
+		t.Errorf("Params = %v, want [id]", rf.Params)
+	}
+}
+
+// TestRequestFieldsFromRootBindings verifies that request refs in root bindings are collected.
+func TestRequestFieldsFromRootBindings(t *testing.T) {
+	expr := `( $id := $request().params.id; [ {"id": $id} ] )`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformRootBinding")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	rf := plan.RequestFields()
+	if len(rf.Params) != 1 || rf.Params[0] != "id" {
+		t.Errorf("Params from root binding = %v, want [id]", rf.Params)
 	}
 }
 

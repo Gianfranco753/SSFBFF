@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"testing"
 	"time"
+
+	jsonv2 "encoding/json/v2"
 )
 
 func TestExtractPath(t *testing.T) {
@@ -258,6 +260,207 @@ func TestProviderDepKey(t *testing.T) {
 	dep := ProviderDep{Provider: "user_svc", Endpoint: "profile"}
 	if got := dep.Key(); got != "user_svc.profile" {
 		t.Errorf("Key() = %q, want %q", got, "user_svc.profile")
+	}
+}
+
+func TestProviderDepCacheKey(t *testing.T) {
+	tests := []struct {
+		name string
+		dep  ProviderDep
+		want string
+	}{
+		{
+			name: "minimal GET",
+			dep:  ProviderDep{Provider: "svc", Endpoint: "ep"},
+			want: "svc.ep:GET::0",
+		},
+		{
+			name: "explicit GET",
+			dep:  ProviderDep{Provider: "svc", Endpoint: "ep", Method: "GET"},
+			want: "svc.ep:GET::0",
+		},
+		{
+			name: "POST with empty body",
+			dep:  ProviderDep{Provider: "svc", Endpoint: "ep", Method: "POST"},
+			want: "svc.ep:POST::0",
+		},
+		{
+			name: "with headers",
+			dep: ProviderDep{
+				Provider: "svc", Endpoint: "ep",
+				Headers: map[string]string{"A": "1", "B": "2"},
+			},
+			want: "svc.ep:GET:A:1|B:2:0",
+		},
+		{
+			name: "with body",
+			dep:  ProviderDep{Provider: "svc", Endpoint: "ep", Body: []byte(`{"x":1}`)},
+			want: "svc.ep:GET::", // hash suffix varies; we only check prefix and that it's non-zero
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.dep.CacheKey()
+			if tt.name == "with body" {
+				if !hasPrefix(got, "svc.ep:GET::") || got == "svc.ep:GET::0" {
+					t.Errorf("CacheKey() with body = %q, want prefix svc.ep:GET:: and non-zero body hash", got)
+				}
+				return
+			}
+			if got != tt.want {
+				t.Errorf("CacheKey() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+	// Header order independence: same headers in different order yield same key
+	a := ProviderDep{Provider: "p", Endpoint: "e", Headers: map[string]string{"X": "1", "Y": "2"}}
+	b := ProviderDep{Provider: "p", Endpoint: "e", Headers: map[string]string{"Y": "2", "X": "1"}}
+	if a.CacheKey() != b.CacheKey() {
+		t.Errorf("CacheKey() should be order-independent: %q vs %q", a.CacheKey(), b.CacheKey())
+	}
+}
+
+func hasPrefix(s, prefix string) bool {
+	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
+}
+
+func TestLookupJSON(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+		path []string
+		want any
+	}{
+		{
+			name: "valid path",
+			data: []byte(`{"user": {"name": "Alice", "age": 30}}`),
+			path: []string{"user", "name"},
+			want: "Alice",
+		},
+		{
+			name: "missing path returns nil",
+			data: []byte(`{"a": 1}`),
+			path: []string{"missing"},
+			want: nil,
+		},
+		{
+			name: "invalid JSON returns nil",
+			data: []byte(`{invalid`),
+			path: []string{"key"},
+			want: nil,
+		},
+		{
+			name: "empty path returns root",
+			data: []byte(`{"x": 42}`),
+			path: nil,
+			want: map[string]any{"x": float64(42)},
+		},
+		{
+			name: "null value",
+			data: []byte(`{"n": null}`),
+			path: []string{"n"},
+			want: nil,
+		},
+		{
+			name: "number",
+			data: []byte(`{"count": 100}`),
+			path: []string{"count"},
+			want: float64(100),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := LookupJSON(tt.data, tt.path...)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("LookupJSON(...) = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNewHTTPErrorAndToResponse(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		message    string
+		code       []string
+		wantCode   string
+	}{
+		{
+			name: "inferred 500",
+			statusCode: 500,
+			message:    "server error",
+			code:       nil,
+			wantCode:   ErrorCodeInternalError,
+		},
+		{
+			name: "inferred 400",
+			statusCode: 400,
+			message:    "bad request",
+			code:       nil,
+			wantCode:   ErrorCodeInvalidRequest,
+		},
+		{
+			name: "502 falls under >=500",
+			statusCode: 502,
+			message:    "bad gateway",
+			code:       nil,
+			wantCode:   ErrorCodeInternalError,
+		},
+		{
+			name: "504 falls under >=500",
+			statusCode: 504,
+			message:    "gateway timeout",
+			code:       nil,
+			wantCode:   ErrorCodeInternalError,
+		},
+		{
+			name: "explicit code",
+			statusCode: 418,
+			message:    "teapot",
+			code:       []string{"TEAPOT"},
+			wantCode:   "TEAPOT",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var he *HTTPError
+			if len(tt.code) > 0 {
+				he = NewHTTPError(tt.statusCode, tt.message, tt.code[0])
+			} else {
+				he = NewHTTPError(tt.statusCode, tt.message)
+			}
+			if he.StatusCode != tt.statusCode || he.Message != tt.message {
+				t.Errorf("NewHTTPError: StatusCode=%d Message=%q", he.StatusCode, he.Message)
+			}
+			if he.Code != tt.wantCode {
+				t.Errorf("Code = %q, want %q", he.Code, tt.wantCode)
+			}
+			resp, err := he.ToResponse()
+			if err != nil {
+				t.Fatalf("ToResponse: %v", err)
+			}
+			if resp.StatusCode != tt.statusCode {
+				t.Errorf("ToResponse StatusCode = %d, want %d", resp.StatusCode, tt.statusCode)
+			}
+			if resp.Headers["Content-Type"] != "application/json" {
+				t.Errorf("Content-Type = %q", resp.Headers["Content-Type"])
+			}
+			if len(resp.Body) == 0 {
+				t.Error("ToResponse body should not be empty")
+			}
+			// Body should be valid JSON with error, status, code
+			var m map[string]any
+			if err := jsonv2.Unmarshal(resp.Body, &m); err != nil {
+				t.Fatalf("ToResponse body invalid JSON: %v", err)
+			}
+			if m["error"] != tt.message || m["code"] != tt.wantCode {
+				t.Errorf("body = %v", m)
+			}
+			if status, ok := m["status"].(float64); !ok || int(status) != tt.statusCode {
+				t.Errorf("body status = %v, want %d", m["status"], tt.statusCode)
+			}
+		})
 	}
 }
 

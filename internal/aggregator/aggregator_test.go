@@ -7,10 +7,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/gcossani/ssfbff/runtime"
+	"github.com/rs/zerolog"
 )
 
 // testClientFactory creates a simple default http.Client factory for tests.
@@ -598,5 +600,124 @@ func TestFetchCacheOnlyStoresSuccess(t *testing.T) {
 	}
 	if got := string(results["user_svc.profile"]); got != `{"name":"Alice"}` {
 		t.Errorf("result = %q, want %q", got, `{"name":"Alice"}`)
+	}
+}
+
+// TestNewWithObservability_NilConfig verifies that nil observability config does not panic and Fetch still works.
+func TestNewWithObservability_NilConfig(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	agg := NewWithObservability(
+		map[string]ProviderConfig{
+			"svc": {BaseURL: srv.URL, Timeout: 5 * time.Second, Endpoints: makeEndpoints(map[string]string{"ep": "/ep"})},
+		},
+		testClientFactory,
+		nil, // nil obsConfig
+		10*1024*1024,
+	)
+	deps := []runtime.ProviderDep{{Provider: "svc", Endpoint: "ep"}}
+	results, err := agg.Fetch(context.Background(), deps)
+	if err != nil {
+		t.Fatalf("Fetch with nil obsConfig: %v", err)
+	}
+	if string(results["svc.ep"]) != `{"ok":true}` {
+		t.Errorf("unexpected result %q", results["svc.ep"])
+	}
+}
+
+// TestNewWithObservability_NilCallbacks verifies that observability with nil callbacks does not panic.
+func TestNewWithObservability_NilCallbacks(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	obs := &ObservabilityConfig{
+		Logger:              zerolog.Nop(),
+		RecordUpstreamCall:  nil,
+		RecordUpstreamError: nil,
+		RecordAggregatorOp:  nil,
+	}
+	agg := NewWithObservability(
+		map[string]ProviderConfig{
+			"svc": {BaseURL: srv.URL, Timeout: 5 * time.Second, Endpoints: makeEndpoints(map[string]string{"ep": "/ep"})},
+		},
+		testClientFactory,
+		obs,
+		10*1024*1024,
+	)
+	deps := []runtime.ProviderDep{{Provider: "svc", Endpoint: "ep"}}
+	_, err := agg.Fetch(context.Background(), deps)
+	if err != nil {
+		t.Fatalf("Fetch with nil callbacks: %v", err)
+	}
+}
+
+// TestNewWithObservability_RecordUpstreamCallInvoked verifies that RecordUpstreamCall is invoked when set.
+func TestNewWithObservability_RecordUpstreamCallInvoked(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"x":1}`))
+	}))
+	defer srv.Close()
+
+	var calls []struct{ provider, endpoint, status string }
+	var mu sync.Mutex
+	obs := &ObservabilityConfig{
+		Logger: zerolog.Nop(),
+		RecordUpstreamCall: func(provider, endpoint string, _ time.Duration, status string) {
+			mu.Lock()
+			calls = append(calls, struct{ provider, endpoint, status string }{provider, endpoint, status})
+			mu.Unlock()
+		},
+	}
+	agg := NewWithObservability(
+		map[string]ProviderConfig{
+			"svc": {BaseURL: srv.URL, Timeout: 5 * time.Second, Endpoints: makeEndpoints(map[string]string{"ep": "/ep"})},
+		},
+		testClientFactory,
+		obs,
+		10*1024*1024,
+	)
+	deps := []runtime.ProviderDep{{Provider: "svc", Endpoint: "ep"}}
+	_, err := agg.Fetch(context.Background(), deps)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	mu.Lock()
+	n := len(calls)
+	mu.Unlock()
+	if n != 1 {
+		t.Errorf("RecordUpstreamCall called %d times, want 1", n)
+	}
+	if n >= 1 && (calls[0].provider != "svc" || calls[0].endpoint != "ep" || calls[0].status != "success") {
+		t.Errorf("RecordUpstreamCall(provider=%q, endpoint=%q, status=%q)", calls[0].provider, calls[0].endpoint, calls[0].status)
+	}
+}
+
+// TestGetProvidersReturnsCopy verifies that GetProviders returns a copy; mutating it does not affect the aggregator.
+func TestGetProvidersReturnsCopy(t *testing.T) {
+	cfg := ProviderConfig{
+		BaseURL:   "http://example.com",
+		Timeout:   5 * time.Second,
+		Endpoints: makeEndpoints(map[string]string{"ep": "/api"}),
+	}
+	agg := New(map[string]ProviderConfig{"svc": cfg}, testClientFactory)
+
+	got := agg.GetProviders()
+	if len(got) != 1 || got["svc"].BaseURL != "http://example.com" {
+		t.Fatalf("GetProviders() = %v", got)
+	}
+	got["svc"] = ProviderConfig{BaseURL: "http://mutated.com"}
+	got["extra"] = ProviderConfig{BaseURL: "http://extra.com"}
+
+	got2 := agg.GetProviders()
+	if len(got2) != 1 {
+		t.Errorf("GetProviders() after mutate: len = %d, want 1", len(got2))
+	}
+	if got2["svc"].BaseURL != "http://example.com" {
+		t.Errorf("GetProviders() copy was mutated; BaseURL = %q", got2["svc"].BaseURL)
 	}
 }

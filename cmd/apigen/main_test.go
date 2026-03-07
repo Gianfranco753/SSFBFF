@@ -457,6 +457,42 @@ func TestGenerateConfigRoutesWithValidation(t *testing.T) {
 	}
 }
 
+// TestGenerateConfigRoutesRedirectAnd204 verifies that generated route handlers include
+// redirect (3xx + Location) and 204 No Content handling for custom responses.
+func TestGenerateConfigRoutesRedirectAnd204(t *testing.T) {
+	routes := []configRoute{
+		{Method: "Get", Path: "/redirect", FuncName: "TransformRedirect"},
+		{Method: "Delete", Path: "/item", FuncName: "TransformDelete"},
+	}
+
+	src, err := generateConfigRoutes(routes, "main", "example.com/pkg/generated")
+	if err != nil {
+		t.Fatalf("generateConfigRoutes error: %v", err)
+	}
+
+	code := string(src)
+	redirectHandling := []string{
+		"resp.StatusCode >= 300 && resp.StatusCode < 400",
+		"resp.Headers[\"Location\"]",
+		"c.Set(\"Location\"",
+		"c.Redirect()",
+	}
+	for _, s := range redirectHandling {
+		if !strings.Contains(code, s) {
+			t.Errorf("generated code missing redirect handling %q\n\n%s", s, code)
+		}
+	}
+	noContentHandling := []string{
+		"resp.StatusCode == 204",
+		"c.Status(204).Send(nil)",
+	}
+	for _, s := range noContentHandling {
+		if !strings.Contains(code, s) {
+			t.Errorf("generated code missing 204 handling %q\n\n%s", s, code)
+		}
+	}
+}
+
 func floatPtr(f float64) *float64 {
 	return &f
 }
