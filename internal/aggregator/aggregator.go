@@ -212,6 +212,9 @@ func (a *Aggregator) GetProviders() map[string]ProviderConfig {
 // Returns the resolved path, or an error if any placeholder has no corresponding param.
 // Placeholder names must match the route's path parameter names (e.g. OpenAPI :order_id → {order_id}).
 func substitutePathParams(path string, params map[string]string) (string, error) {
+	if !strings.Contains(path, "{") {
+		return path, nil
+	}
 	if pathParamPlaceholder.FindString(path) == "" {
 		return path, nil
 	}

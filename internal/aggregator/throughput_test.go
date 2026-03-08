@@ -186,6 +186,38 @@ func BenchmarkThroughputSingleProvider(b *testing.B) {
 	})
 }
 
+// BenchmarkThroughputPathParams tests throughput when the endpoint path has a placeholder
+// (e.g. /posts/{order_id}) and params are passed to Fetch. Guards the path-params hot path.
+func BenchmarkThroughputPathParams(b *testing.B) {
+	srv := createMockServer(mockServerConfig{
+		responseDelay: 10 * time.Millisecond,
+		responseBody:  `{"result":"ok"}`,
+	})
+	defer srv.Close()
+
+	agg := New(map[string]ProviderConfig{
+		"svc": {
+			BaseURL:   srv.URL,
+			Timeout:   5 * time.Second,
+			Endpoints: makeEndpoints(map[string]string{"post": "/posts/{order_id}"}),
+		},
+	}, testClientFactory)
+
+	dep := runtime.ProviderDep{Provider: "svc", Endpoint: "post"}
+	params := map[string]string{"order_id": "42"}
+	ctx := context.Background()
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_, err := agg.Fetch(ctx, []runtime.ProviderDep{dep}, params)
+			if err != nil {
+				b.Errorf("Fetch failed: %v", err)
+			}
+		}
+	})
+}
+
 // BenchmarkThroughputMultipleProviders tests throughput with multiple providers.
 func BenchmarkThroughputMultipleProviders(b *testing.B) {
 	srv := createMockServer(mockServerConfig{
