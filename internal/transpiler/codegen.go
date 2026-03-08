@@ -357,6 +357,17 @@ func (em *exprEmitter) emit(e *Expr) string {
 	case "requestValue":
 		return em.emitRequestValue(e)
 
+	case "fetchAtPath":
+		depKey := e.FetchProvider + "." + e.FetchEndpoint
+		pathArgs := ""
+		for _, seg := range e.FetchPath {
+			pathArgs += ", " + strconv.Quote(seg)
+		}
+		em.counter++
+		varName := "fetchAtPath_" + strconv.Itoa(em.counter)
+		em.w("%s%s := runtime.LookupJSON(results[%q]%s)\n", em.indent, varName, depKey, pathArgs)
+		return varName
+
 	case "array":
 		items := make([]string, len(e.FuncArgs))
 		for i, item := range e.FuncArgs {

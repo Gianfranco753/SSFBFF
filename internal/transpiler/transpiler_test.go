@@ -2435,6 +2435,35 @@ func TestAnalyzeFetchCallsRootExprPrimitive(t *testing.T) {
 	}
 }
 
+// TestAnalyzeFetchCallsRootExprFetchField verifies that $fetch("provider", "endpoint").field
+// produces a RootExpr of kind fetchAtPath with the correct dep and path.
+func TestAnalyzeFetchCallsRootExprFetchField(t *testing.T) {
+	expr := `$fetch("orders_service", "data").id`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformGetId")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+	if plan.RootExpr == nil {
+		t.Fatal("RootExpr should be set")
+	}
+	if plan.RootExpr.Kind != "fetchAtPath" {
+		t.Errorf("RootExpr.Kind = %q, want fetchAtPath", plan.RootExpr.Kind)
+	}
+	if plan.RootExpr.FetchProvider != "orders_service" || plan.RootExpr.FetchEndpoint != "data" {
+		t.Errorf("FetchProvider = %q FetchEndpoint = %q, want orders_service data", plan.RootExpr.FetchProvider, plan.RootExpr.FetchEndpoint)
+	}
+	if len(plan.RootExpr.FetchPath) != 1 || plan.RootExpr.FetchPath[0] != "id" {
+		t.Errorf("FetchPath = %v, want [id]", plan.RootExpr.FetchPath)
+	}
+	if len(plan.Deps) != 1 || plan.Deps[0].Provider != "orders_service" || plan.Deps[0].Endpoint != "data" {
+		t.Errorf("Deps = %v, want single orders_service.data", plan.Deps)
+	}
+}
+
 // TestAnalyzeFetchCallsBlockLastObject verifies that a block whose last expression is an object
 // still produces an object plan (no RootExpr), preserving existing behaviour.
 func TestAnalyzeFetchCallsBlockLastObject(t *testing.T) {

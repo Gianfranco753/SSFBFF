@@ -60,7 +60,7 @@ type OutputField struct {
 // arithmetic, comparisons, boolean logic, string concatenation, conditionals,
 // and variable bindings. Used internally by fetchFilter mode.
 type Expr struct {
-	Kind   string // "field","arrayField","literal","funcCall","binary","unary","conditional","assign","varRef","requestValue","error","response","arrayMap"
+	Kind   string // "field","arrayField","literal","funcCall","binary","unary","conditional","assign","varRef","requestValue","error","response","arrayMap","fetchAtPath"
 	GoType string // inferred Go type: "float64","string","bool","any"
 
 	// Kind="field": reference to an input struct field.
@@ -98,6 +98,11 @@ type Expr struct {
 	RequestSource string   // "header","cookie","query","param","path","method","body","serviceParam"
 	RequestArg    string   // for header/cookie/query/param: key name
 	RequestPath   []string // for body/serviceParam: trailing path segments
+
+	// Kind="fetchAtPath": value from a pre-fetched provider/endpoint at a JSON path (root expr: $fetch("p","e").a.b).
+	FetchProvider string   // provider name
+	FetchEndpoint string   // endpoint name
+	FetchPath     []string // path segments after the endpoint (e.g. ["data","id"])
 
 	// Kind="error": signals an HTTP error should be returned.
 	StatusCode   int    // HTTP status code
@@ -402,6 +407,20 @@ func analyzeExpr(node jparse.Node, fc *fieldCollector) (*Expr, error) {
 						return nil, fmt.Errorf("expected name in path after function call, got %T", step)
 					}
 					trailingPath = append(trailingPath, name.Value)
+				}
+				// $fetch("provider", "endpoint").path... → fetchAtPath expr (root-expr only).
+				if v, ok := fnCall.Func.(*jparse.VariableNode); ok && v.Name == "fetch" && len(fnCall.Args) >= 2 {
+					if p, ok1 := fnCall.Args[0].(*jparse.StringNode); ok1 && p != nil {
+						if e, ok2 := fnCall.Args[1].(*jparse.StringNode); ok2 && e != nil {
+							return &Expr{
+								Kind:          "fetchAtPath",
+								FetchProvider: p.Value,
+								FetchEndpoint: e.Value,
+								FetchPath:     trailingPath,
+								GoType:        "any",
+							}, nil
+						}
+					}
 				}
 				return analyzeContextExprCall(fnCall, trailingPath)
 			}
