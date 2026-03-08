@@ -151,9 +151,9 @@ var (
 
 func main() {
 	logger := initLogger()
-	
+
 	// Initialize async logging worker early so all logging is asynchronous
-	initAsyncLogging(logger)
+	initAsyncLogging()
 
 	// Initialize OpenTelemetry first so the instrumented transport and Fiber
 	// middleware can register spans under the correct global TracerProvider.
@@ -186,13 +186,13 @@ func main() {
 	// This provides go_goroutines, go_memstats_*, and other Go runtime metrics
 	// Use Register instead of MustRegister to avoid panic if already registered
 	// (e.g., by the OpenTelemetry Prometheus exporter)
-		if err := prometheusRegistry.Register(collectors.NewGoCollector()); err != nil {
-			// Collector may already be registered, which is fine - ignore duplicate registration errors
-			errStr := err.Error()
-			if !strings.Contains(errStr, "duplicate") && !strings.Contains(errStr, "already registered") {
-				logWarn(ctx, logger, "failed to register Go collector", func(e *zerolog.Event) { e.Err(err) })
-			}
+	if err := prometheusRegistry.Register(collectors.NewGoCollector()); err != nil {
+		// Collector may already be registered, which is fine - ignore duplicate registration errors
+		errStr := err.Error()
+		if !strings.Contains(errStr, "duplicate") && !strings.Contains(errStr, "already registered") {
+			logWarn(ctx, logger, "failed to register Go collector", func(e *zerolog.Event) { e.Err(err) })
 		}
+	}
 
 	meterProvider := metric.NewMeterProvider(
 		metric.WithReader(promExporter),
@@ -211,7 +211,7 @@ func main() {
 	if getCachedEnableDocs() {
 		var loadErr error
 		cachedOpenAPISpecOnce.Do(func() {
-			cachedOpenAPISpecHTML, loadErr = loadOpenAPISpecHTML(dataDir, logger)
+			cachedOpenAPISpecHTML, loadErr = loadOpenAPISpecHTML(dataDir)
 			if loadErr != nil {
 				logError(ctx, logger, "failed to load OpenAPI spec for docs",
 					func(e *zerolog.Event) { e.Err(loadErr) })
@@ -287,7 +287,7 @@ func main() {
 			return &bytes.Buffer{}
 		},
 	}
-	
+
 	app := fiber.New(fiber.Config{
 		JSONEncoder: func(v any) ([]byte, error) { return jsonv2.Marshal(v) },
 		JSONDecoder: func(data []byte, v any) error { return jsonv2.Unmarshal(data, v) },
@@ -311,7 +311,7 @@ func main() {
 			buf := errorResponsePool.Get().(*bytes.Buffer)
 			buf.Reset()
 			defer errorResponsePool.Put(buf)
-			
+
 			// Build JSON response using jsontext.Encoder for consistent, efficient encoding
 			enc := jsontext.NewEncoder(buf)
 			enc.WriteToken(jsontext.BeginObject)
@@ -322,7 +322,7 @@ func main() {
 			enc.WriteToken(jsontext.String("code"))
 			enc.WriteToken(jsontext.String(errorCode))
 			enc.WriteToken(jsontext.EndObject)
-			
+
 			c.Set("Content-Type", "application/json")
 			return c.Status(code).Send(buf.Bytes())
 		},
@@ -469,7 +469,7 @@ func main() {
 	// When prefork is enabled, app.Listen() manages child processes.
 	// The parent process blocks to manage children, so we run it in a goroutine
 	// to allow the main function to handle shutdown signals.
-		go func() {
+	go func() {
 		defer func() {
 			if r := recover(); r != nil {
 				logError(ctx, logger, "panic in server goroutine",
@@ -536,7 +536,7 @@ func main() {
 	logInfo(shutdownCtx, logger, "waiting for in-flight requests")
 	maxWaitTime := 5 * time.Second
 	defaultWaitTime := 1 * time.Second
-	
+
 	deadline2, hasDeadline2 := shutdownCtx.Deadline()
 	var waitTime time.Duration
 	if hasDeadline2 {
@@ -556,7 +556,7 @@ func main() {
 		// No deadline set (shouldn't happen with WithTimeout, but handle gracefully)
 		waitTime = defaultWaitTime
 	}
-	
+
 	if waitTime > 0 {
 		select {
 		case <-shutdownCtx.Done():
@@ -587,7 +587,7 @@ func main() {
 
 // loadOpenAPISpecHTML loads the OpenAPI spec, converts it to JSON, and builds the HTML template.
 // This is called once at startup and cached for the /docs endpoint.
-func loadOpenAPISpecHTML(dataDir string, logger zerolog.Logger) ([]byte, error) {
+func loadOpenAPISpecHTML(dataDir string) ([]byte, error) {
 	openAPIPath := filepath.Join(dataDir, "openapi.yaml")
 	specData, err := os.ReadFile(openAPIPath)
 	if err != nil {

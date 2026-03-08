@@ -100,14 +100,14 @@ type Expr struct {
 	RequestPath   []string // for body/serviceParam: trailing path segments
 
 	// Kind="error": signals an HTTP error should be returned.
-	StatusCode  int    // HTTP status code
+	StatusCode   int    // HTTP status code
 	ErrorMessage string // Error message
-	ErrorCode   string // Optional error code for programmatic handling
+	ErrorCode    string // Optional error code for programmatic handling
 
 	// Kind="response": signals a full HTTP response should be returned.
-	ResponseStatusCode int                // HTTP status code
-	ResponseBodyExpr    *Expr              // Expression for response body
-	ResponseHeaders     map[string]*Expr   // Custom headers (optional)
+	ResponseStatusCode int              // HTTP status code
+	ResponseBodyExpr   *Expr            // Expression for response body
+	ResponseHeaders    map[string]*Expr // Custom headers (optional)
 
 	// Kind="lambda": user-defined function ($plot := function($x) { ... }).
 	LambdaParams   []string // parameter names (without $)
@@ -567,31 +567,33 @@ func analyzeExpr(node jparse.Node, fc *fieldCollector) (*Expr, error) {
 		// $string ~> $substringBefore(?, '.') means x -> substringBefore(string(x), '.').
 		ctxArg := &Expr{Kind: "varRef", VarName: "_x", GoType: "any"}
 		var firstArg *Expr
-		if lhs.Kind == "builtinRef" {
+		switch lhs.Kind {
+		case "builtinRef":
 			firstArg = &Expr{Kind: "funcCall", FuncName: lhs.FuncName, FuncArgs: []*Expr{ctxArg}, GoType: "any"}
-		} else if lhs.Kind == "lambda" {
+		case "lambda":
 			firstArg = invokeLambda(lhs, ctxArg)
-		} else {
+		default:
 			firstArg = lhs
 		}
 		var body *Expr
 		switch rhs := n.RHS.(type) {
 		case *jparse.VariableNode:
-			if lhs.Kind == "builtinRef" {
+			switch lhs.Kind {
+			case "builtinRef":
 				body = &Expr{
 					Kind:     "funcCall",
 					FuncName: rhs.Name,
 					FuncArgs: []*Expr{{Kind: "funcCall", FuncName: lhs.FuncName, FuncArgs: []*Expr{ctxArg}, GoType: "any"}},
 					GoType:   inferFuncReturnType(rhs.Name),
 				}
-			} else if lhs.Kind == "lambda" {
+			case "lambda":
 				body = &Expr{
 					Kind:     "funcCall",
 					FuncName: rhs.Name,
 					FuncArgs: []*Expr{invokeLambda(lhs, ctxArg)},
 					GoType:   inferFuncReturnType(rhs.Name),
 				}
-			} else {
+			default:
 				body = &Expr{
 					Kind:     "funcCall",
 					FuncName: rhs.Name,
@@ -884,10 +886,10 @@ func analyzeExpr(node jparse.Node, fc *fieldCollector) (*Expr, error) {
 				return nil, fmt.Errorf("$httpResponse() body: %w", err)
 			}
 			expr := &Expr{
-				Kind:                 "response",
-				ResponseStatusCode:   int(statusCodeNode.Value),
-				ResponseBodyExpr:     bodyExpr,
-				GoType:               "any",
+				Kind:               "response",
+				ResponseStatusCode: int(statusCodeNode.Value),
+				ResponseBodyExpr:   bodyExpr,
+				GoType:             "any",
 			}
 			if len(n.Args) == 3 {
 				headersObj, ok := n.Args[2].(*jparse.ObjectNode)
@@ -1287,7 +1289,7 @@ type ProviderPlan struct {
 	NeedsRequest bool               // true if any field or fetch config uses request functions
 
 	// When set, the response body is the value of RootExpr (after evaluating RootBindings), not an object built from Fields.
-	RootExpr     *Expr  // single expression whose value is the entire response body
+	RootExpr     *Expr   // single expression whose value is the entire response body
 	RootBindings []*Expr // variable bindings evaluated in order before RootExpr (assign expressions)
 
 	// When set, the response body is an array from mapping a projection over [StartExpr..EndExpr] (range + array map pattern).
@@ -1329,8 +1331,8 @@ type ProviderField struct {
 
 	// Kind="service": value comes from another generated transform pipeline.
 	// JSONPath is reused for the path into the service result.
-	ServiceName      string
-	ServiceResultKey string
+	ServiceName       string
+	ServiceResultKey  string
 	ServiceParamsExpr *Expr
 
 	// Kind="header"/"cookie"/"query"/"param": value from $request().headers.X etc.
@@ -1346,13 +1348,13 @@ type ProviderField struct {
 	StaticValue string
 
 	// Kind="error": signals an HTTP error should be returned.
-	StatusCode  int    // HTTP status code
+	StatusCode   int    // HTTP status code
 	ErrorMessage string // Error message
-	ErrorCode   string // Optional error code for programmatic handling
+	ErrorCode    string // Optional error code for programmatic handling
 
 	// Kind="response": signals a full HTTP response should be returned.
-	BodyExpr *Expr                // Expression for response body
-	Headers  map[string]*Expr     // Custom headers (optional)
+	BodyExpr *Expr            // Expression for response body
+	Headers  map[string]*Expr // Custom headers (optional)
 
 	// Kind="expr": complex expression (conditionals, etc.) that needs evaluation
 	ValueExpr *Expr // The expression to evaluate
@@ -1660,8 +1662,8 @@ func HasFetchCalls(root jparse.Node) bool {
 			}
 		}
 	case *jparse.FunctionCallNode:
-			if v, ok := n.Func.(*jparse.VariableNode); ok {
-				if v.Name == "fetch" || v.Name == "request" || v.Name == "params" || v.Name == "service" || v.Name == "httpError" || v.Name == "httpResponse" {
+		if v, ok := n.Func.(*jparse.VariableNode); ok {
+			if v.Name == "fetch" || v.Name == "request" || v.Name == "params" || v.Name == "service" || v.Name == "httpError" || v.Name == "httpResponse" {
 				return true
 			}
 		}
@@ -2140,8 +2142,9 @@ func analyzeFunctionCall(fnCall *jparse.FunctionCallNode, trailingPath []string)
 
 // analyzeRequestPath maps $request() trailing path segments to a ProviderField.
 // e.g. ["headers", "Authorization"] → Kind="header", Arg="Authorization"
-//      ["path"]                     → Kind="path"
-//      ["body", "user", "name"]     → Kind="body", BodyPath=["user","name"]
+//
+//	["path"]                     → Kind="path"
+//	["body", "user", "name"]     → Kind="body", BodyPath=["user","name"]
 func analyzeRequestPath(path []string) (ProviderField, error) {
 	if len(path) == 0 {
 		return ProviderField{}, fmt.Errorf("$request() requires a category (e.g. $request().headers.Name)")
@@ -2741,24 +2744,6 @@ func extractSingleName(node jparse.Node) (string, error) {
 		return extractName(p.Steps[0])
 	}
 	return extractName(node)
-}
-
-func extractPath(node jparse.Node) ([]string, error) {
-	switch n := node.(type) {
-	case *jparse.PathNode:
-		var parts []string
-		for _, step := range n.Steps {
-			name, err := extractName(step)
-			if err != nil {
-				return nil, err
-			}
-			parts = append(parts, name)
-		}
-		return parts, nil
-	case *jparse.NameNode:
-		return []string{n.Value}, nil
-	}
-	return nil, fmt.Errorf("expected a path, got %T (%s)", node, node)
 }
 
 func extractVariableName(node jparse.Node) (string, error) {

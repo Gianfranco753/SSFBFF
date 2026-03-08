@@ -27,18 +27,17 @@ type metricUpdate struct {
 }
 
 type metricsBatcher struct {
-	updates      chan metricUpdate
-	batchSize    int
+	updates       chan metricUpdate
+	batchSize     int
 	batchInterval time.Duration
-	ctx          context.Context
-	cancel       context.CancelFunc
-	wg           sync.WaitGroup
-	enabled      bool
+	ctx           context.Context
+	cancel        context.CancelFunc
+	wg            sync.WaitGroup
+	enabled       bool
 }
 
 var (
 	globalBatcher     *metricsBatcher
-	batcherInitOnce   sync.Once
 	batcherEnabled    bool
 	metricsSampleRate float64
 	sampleCounter     atomic.Uint64
@@ -53,7 +52,7 @@ func initMetricsBatcher() {
 	batchSize := getCachedMetricsBatchSize()
 	batchInterval := getCachedMetricsBatchInterval()
 	metricsSampleRate = getCachedMetricsSampleRate()
-	
+
 	// Channel size: use configured value, or default to 10x batch size for high throughput
 	channelSize := getCachedMetricsBatcherChannelSize()
 	if channelSize == 0 {

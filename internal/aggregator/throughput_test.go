@@ -10,13 +10,16 @@
 //   - Error handling under load
 //
 // Run benchmarks:
-//   go test -tags=goexperiment.jsonv2 -bench=BenchmarkThroughput -benchmem ./internal/aggregator
+//
+//	go test -tags=goexperiment.jsonv2 -bench=BenchmarkThroughput -benchmem ./internal/aggregator
 //
 // Run throughput tests:
-//   go test -tags=goexperiment.jsonv2 -v -run=TestThroughput ./internal/aggregator
+//
+//	go test -tags=goexperiment.jsonv2 -v -run=TestThroughput ./internal/aggregator
 //
 // Run all throughput tests with detailed output:
-//   go test -tags=goexperiment.jsonv2 -v -run=TestThroughput -timeout=5m ./internal/aggregator
+//
+//	go test -tags=goexperiment.jsonv2 -v -run=TestThroughput -timeout=5m ./internal/aggregator
 package aggregator
 
 import (
@@ -64,18 +67,6 @@ func (m *throughputMetrics) record(latency time.Duration, success bool) {
 		m.maxLatency = latency
 	}
 	m.latencies = append(m.latencies, latency)
-}
-
-func (m *throughputMetrics) reset() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.totalRequests = 0
-	m.successfulRequests = 0
-	m.failedRequests = 0
-	m.totalLatency = 0
-	m.minLatency = 0
-	m.maxLatency = 0
-	m.latencies = m.latencies[:0]
 }
 
 func (m *throughputMetrics) avgLatency() time.Duration {
@@ -344,8 +335,8 @@ func TestThroughputConcurrentLoad(t *testing.T) {
 		{
 			name:                 "high_concurrency_many_providers",
 			numProviders:         10,
-			numConcurrent:        50,  // Reduced from 100 to avoid overwhelming the server
-			requestsPerGoroutine: 10,  // Reduced from 20
+			numConcurrent:        50,                    // Reduced from 100 to avoid overwhelming the server
+			requestsPerGoroutine: 10,                    // Reduced from 20
 			responseDelay:        10 * time.Millisecond, // Reduced from 15ms
 			responseSize:         4096,
 		},
@@ -382,7 +373,7 @@ func TestThroughputConcurrentLoad(t *testing.T) {
 
 			errorCounts := make(map[string]int)
 			var errorMu sync.Mutex
-			
+
 			for i := 0; i < tt.numConcurrent; i++ {
 				go func() {
 					defer wg.Done()
@@ -393,7 +384,7 @@ func TestThroughputConcurrentLoad(t *testing.T) {
 						latency := time.Since(reqStart)
 						success := err == nil
 						metrics.record(latency, success)
-						
+
 						if !success && err != nil {
 							errorMu.Lock()
 							errorCounts[err.Error()]++
@@ -420,7 +411,7 @@ func TestThroughputConcurrentLoad(t *testing.T) {
 			t.Logf("Throughput: %.2f req/s", throughput)
 			t.Logf("Latency - Avg: %v, Min: %v, Max: %v", avgLatency, metrics.minLatency, metrics.maxLatency)
 			t.Logf("Latency - P50: %v, P95: %v, P99: %v", p50, p95, p99)
-			
+
 			if len(errorCounts) > 0 {
 				t.Logf("Error breakdown:")
 				for errMsg, count := range errorCounts {

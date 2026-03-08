@@ -18,26 +18,26 @@ import (
 // We store the logger and a function that builds the event so we can recreate it
 // in the worker goroutine with the proper trace context.
 type logEntry struct {
-	logger    zerolog.Logger
-	level     zerolog.Level
-	fields    map[string]interface{}
-	msg       string
-	ctx       context.Context
+	logger     zerolog.Logger
+	level      zerolog.Level
+	fields     map[string]interface{}
+	msg        string
+	ctx        context.Context
 	buildEvent func(zerolog.Logger) *zerolog.Event
 }
 
 var (
 	errorLoggingEnabled = getCachedEnableErrorLogging()
 	logChan             chan *logEntry
-	logWorkerOnce        sync.Once
-	logWorkerWg          sync.WaitGroup
-	logChanClosed        bool
-	logChanMu            sync.Mutex
+	logWorkerOnce       sync.Once
+	logWorkerWg         sync.WaitGroup
+	logChanClosed       bool
+	logChanMu           sync.Mutex
 )
 
 // initAsyncLogging initializes the async logging worker.
 // All logging is asynchronous to avoid blocking the request path.
-func initAsyncLogging(logger zerolog.Logger) {
+func initAsyncLogging() {
 	logWorkerOnce.Do(func() {
 		bufferSize := getCachedAsyncLoggingBufferSize()
 		logChan = make(chan *logEntry, bufferSize)
@@ -50,7 +50,7 @@ func initAsyncLogging(logger zerolog.Logger) {
 				// since we're in a different goroutine and need to preserve the trace context.
 				span := trace.SpanFromContext(entry.ctx)
 				var event *zerolog.Event
-				
+
 				if entry.buildEvent != nil {
 					event = entry.buildEvent(entry.logger)
 				} else {
@@ -76,14 +76,14 @@ func initAsyncLogging(logger zerolog.Logger) {
 						event = event.Interface(k, v)
 					}
 				}
-				
+
 				// Manually add trace context for async logging
 				if span.SpanContext().IsValid() {
 					event = event.
 						Str("trace_id", span.SpanContext().TraceID().String()).
 						Str("span_id", span.SpanContext().SpanID().String())
 				}
-				
+
 				event.Msg(entry.msg)
 			}
 		}()
@@ -101,7 +101,7 @@ func logAsync(level zerolog.Level, buildEvent func(zerolog.Logger) *zerolog.Even
 
 	if logChan == nil {
 		// Worker not initialized yet, initialize it
-		initAsyncLogging(logger)
+		initAsyncLogging()
 		// After initialization, logChan should be set, but if it's still nil, fall back to sync
 		if logChan == nil {
 			// Fallback: log synchronously with trace context
@@ -262,7 +262,7 @@ func otelWithTraceIDMiddleware() fiber.Handler {
 
 // getEndpointTemplate returns the route template path for metrics.
 // It first checks c.Locals("route_template"), falling back to c.Path() if not set.
-// This ensures metrics use static template paths (e.g., "/users/{id}") 
+// This ensures metrics use static template paths (e.g., "/users/{id}")
 // instead of dynamic resolved paths (e.g., "/users/123").
 func getEndpointTemplate(c fiber.Ctx) string {
 	if template := c.Locals("route_template"); template != nil {
@@ -277,14 +277,14 @@ func getEndpointTemplate(c fiber.Ctx) string {
 // panicRecoveryMiddleware recovers from panics, logs them with context, and returns 500 errors.
 // Note: trace_id and span_id are automatically injected into logs in the async worker, so we don't need request_id.
 func panicRecoveryMiddleware(logger zerolog.Logger) fiber.Handler {
-	
+
 	// Use sync.Pool for error response buffers to avoid allocations
 	errorResponsePool := sync.Pool{
 		New: func() interface{} {
 			return &bytes.Buffer{}
 		},
 	}
-	
+
 	return func(c fiber.Ctx) error {
 		defer func() {
 			if r := recover(); r != nil {
@@ -294,22 +294,22 @@ func panicRecoveryMiddleware(logger zerolog.Logger) fiber.Handler {
 						Str("method", c.Method()).
 						Interface("panic", r)
 				}
-				
+
 				logAsync(zerolog.ErrorLevel, buildEvent, "panic recovered", c.Context(), logger)
-				
+
 				recordHTTPError(getEndpointTemplate(c), c.Method(), fiber.StatusInternalServerError)
-				
+
 				// Use sync.Pool buffer instead of fiber.Map to avoid allocation
 				buf := errorResponsePool.Get().(*bytes.Buffer)
 				buf.Reset()
 				defer errorResponsePool.Put(buf)
-				
+
 				buf.WriteString(`{"error":"Internal Server Error","status":500,"code":"INTERNAL_ERROR"}`)
 				c.Set("Content-Type", "application/json")
 				_ = c.Status(fiber.StatusInternalServerError).Send(buf.Bytes())
 			}
 		}()
-		
+
 		return c.Next()
 	}
 }
@@ -321,11 +321,11 @@ func errorHandlerMiddleware(logger zerolog.Logger) fiber.Handler {
 		err := c.Next()
 		if err != nil {
 			statusCode := fiber.StatusInternalServerError
-			
+
 			if e, ok := err.(*fiber.Error); ok {
 				statusCode = e.Code
 			}
-			
+
 			if statusCode >= 400 {
 				buildEvent := func(l zerolog.Logger) *zerolog.Event {
 					return l.Error().
@@ -334,13 +334,13 @@ func errorHandlerMiddleware(logger zerolog.Logger) fiber.Handler {
 						Int("status_code", statusCode).
 						Err(err)
 				}
-				
+
 				logAsync(zerolog.ErrorLevel, buildEvent, "request error", c.Context(), logger)
-				
+
 				recordHTTPError(getEndpointTemplate(c), c.Method(), statusCode)
 			}
 		}
-		
+
 		return err
 	}
 }

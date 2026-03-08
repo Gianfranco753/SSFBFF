@@ -167,7 +167,8 @@ func generateParameterConstraints(varName string, schema SchemaInfo, indent stri
 	var buf strings.Builder
 	c := schema.Constraints
 
-	if schema.Type == "string" {
+	switch schema.Type {
+	case "string":
 		if c.MinLength != nil {
 			buf.WriteString(fmt.Sprintf("%sif len(%s) < %d {\n", indent, varName, *c.MinLength))
 			buf.WriteString(fmt.Sprintf("%s\treturn fmt.Errorf(\"field '%s' must be at least %d characters\")\n", indent, fieldName, *c.MinLength))
@@ -206,7 +207,7 @@ func generateParameterConstraints(varName string, schema SchemaInfo, indent stri
 			buf.WriteString(fmt.Sprintf("%s\treturn fmt.Errorf(\"field '%s' must be a valid email address\")\n", indent, fieldName))
 			buf.WriteString(fmt.Sprintf("%s}\n", indent))
 		}
-	} else if schema.Type == "integer" || schema.Type == "number" {
+	case "integer", "number":
 		if c.Minimum != nil {
 			comp := "float64(" + varName + ")"
 			if schema.Type == "integer" {

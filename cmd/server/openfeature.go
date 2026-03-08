@@ -13,8 +13,8 @@ import (
 
 // openFeatureConfig holds OpenFeature configuration
 type openFeatureConfig struct {
-	enabled bool
-	client  *openfeature.Client
+	enabled  bool
+	client   *openfeature.Client
 	cacheTTL time.Duration
 }
 
@@ -87,8 +87,8 @@ func setupOpenFeatureEventHandlers(provider openfeature.FeatureProvider) {
 	// Register global event handlers for provider configuration changes
 	configChangeCallback := func(details openfeature.EventDetails) {
 		handleOpenFeatureEvent(openfeature.Event{
-			ProviderName: details.ProviderName,
-			EventType:    openfeature.ProviderConfigChange,
+			ProviderName:         details.ProviderName,
+			EventType:            openfeature.ProviderConfigChange,
 			ProviderEventDetails: details.ProviderEventDetails,
 		})
 	}
@@ -98,7 +98,7 @@ func setupOpenFeatureEventHandlers(provider openfeature.FeatureProvider) {
 
 // handleOpenFeatureEvent processes OpenFeature events and invalidates cache for changed flags.
 func handleOpenFeatureEvent(event openfeature.Event) {
-	if event.ProviderEventDetails.FlagChanges == nil || len(event.ProviderEventDetails.FlagChanges) == 0 {
+	if len(event.ProviderEventDetails.FlagChanges) == 0 {
 		return
 	}
 
@@ -122,7 +122,7 @@ func evaluateFlagString(ctx context.Context, flagKey string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	
+
 	return value, true
 }
 
