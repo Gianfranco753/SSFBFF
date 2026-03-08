@@ -69,6 +69,7 @@ var (
 		// Health check configuration
 		healthCheckTimeout          time.Duration
 		healthCheckFailureThreshold int
+		readySkipUpstreamCheck      bool
 
 		// Slow request configuration
 		slowRequestThreshold time.Duration
@@ -173,6 +174,7 @@ func initEnvCache() {
 	// Health check configuration
 	envCache.healthCheckTimeout = getEnvDuration("HEALTH_CHECK_TIMEOUT", 500*time.Millisecond)
 	envCache.healthCheckFailureThreshold = getEnvInt("HEALTH_CHECK_FAILURE_THRESHOLD", 0)
+	envCache.readySkipUpstreamCheck = getEnvBool("READY_SKIP_UPSTREAM_CHECK", false)
 
 	// Slow request configuration
 	envCache.slowRequestThreshold = getEnvDuration("SLOW_REQUEST_THRESHOLD", 1*time.Second)
@@ -474,6 +476,11 @@ func getCachedHealthCheckFailureThreshold() int {
 	return getCachedFlagInt("HEALTH_CHECK_FAILURE_THRESHOLD", envCache.healthCheckFailureThreshold)
 }
 
+func getCachedReadySkipUpstreamCheck() bool {
+	ensureCacheInitialized()
+	return getCachedFlagBool("READY_SKIP_UPSTREAM_CHECK", envCache.readySkipUpstreamCheck)
+}
+
 func getCachedSlowRequestThreshold() time.Duration {
 	ensureCacheInitialized()
 	return getCachedFlagDuration("SLOW_REQUEST_THRESHOLD", envCache.slowRequestThreshold)
@@ -665,6 +672,7 @@ func resetEnvCacheForTesting() {
 	envCache.useTraceIDAsRequestID = false
 	envCache.healthCheckTimeout = 0
 	envCache.healthCheckFailureThreshold = 0
+	envCache.readySkipUpstreamCheck = false
 	envCache.slowRequestThreshold = 0
 	envCache.enableDocs = false
 	envCache.maxResponseBodySize = 0

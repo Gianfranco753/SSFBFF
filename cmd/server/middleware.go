@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -218,10 +219,21 @@ func shutdownAsyncLogging(timeout time.Duration) bool {
 
 // otelWithTraceIDMiddleware combines OpenTelemetry instrumentation with trace ID extraction.
 // This reduces middleware overhead by combining two related operations into one.
-// When OTEL_SDK_DISABLED=true or OTEL_TRACES_EXPORTER=none, returns a no-op middleware.
+// When OTel is disabled or no OTLP endpoint is configured, returns a no-op middleware so route matching is not affected.
 func otelWithTraceIDMiddleware() fiber.Handler {
 	// If OTel is completely disabled, return no-op
 	if getCachedOtelSDKDisabled() || getCachedOtelTracesExporter() == "none" {
+		return func(c fiber.Ctx) error {
+			return c.Next()
+		}
+	}
+	// When no OTLP endpoint is configured, tracing init already uses a noop; use no-op middleware too
+	// so the contrib otel middleware does not run (it can break route matching when no exporter is configured).
+	otelEndpoint := getCachedOtelExporterOTLPTracesEndpoint()
+	if otelEndpoint == "" {
+		otelEndpoint = getCachedOtelExporterOTLPEndpoint()
+	}
+	if strings.TrimSpace(otelEndpoint) == "" {
 		return func(c fiber.Ctx) error {
 			return c.Next()
 		}
@@ -288,16 +300,21 @@ func panicRecoveryMiddleware(logger zerolog.Logger) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		defer func() {
 			if r := recover(); r != nil {
+				// Capture values from c before async logging; c must not be used inside the closure
+				// because the closure runs in another goroutine after the request ends and c is recycled.
+				endpoint := getEndpointTemplate(c)
+				method := c.Method()
+				panicVal := r
 				buildEvent := func(l zerolog.Logger) *zerolog.Event {
 					return l.Error().
-						Str("endpoint", getEndpointTemplate(c)).
-						Str("method", c.Method()).
-						Interface("panic", r)
+						Str("endpoint", endpoint).
+						Str("method", method).
+						Interface("panic", panicVal)
 				}
 
 				logAsync(zerolog.ErrorLevel, buildEvent, "panic recovered", c.Context(), logger)
 
-				recordHTTPError(getEndpointTemplate(c), c.Method(), fiber.StatusInternalServerError)
+				recordHTTPError(endpoint, method, fiber.StatusInternalServerError)
 
 				// Use sync.Pool buffer instead of fiber.Map to avoid allocation
 				buf := errorResponsePool.Get().(*bytes.Buffer)
@@ -327,17 +344,21 @@ func errorHandlerMiddleware(logger zerolog.Logger) fiber.Handler {
 			}
 
 			if statusCode >= 400 {
+				// Capture values from c before async logging; c must not be used inside the closure
+				// because the closure runs in another goroutine after the request ends and c is recycled.
+				endpoint := getEndpointTemplate(c)
+				method := c.Method()
 				buildEvent := func(l zerolog.Logger) *zerolog.Event {
 					return l.Error().
-						Str("endpoint", getEndpointTemplate(c)).
-						Str("method", c.Method()).
+						Str("endpoint", endpoint).
+						Str("method", method).
 						Int("status_code", statusCode).
 						Err(err)
 				}
 
 				logAsync(zerolog.ErrorLevel, buildEvent, "request error", c.Context(), logger)
 
-				recordHTTPError(getEndpointTemplate(c), c.Method(), statusCode)
+				recordHTTPError(endpoint, method, statusCode)
 			}
 		}
 

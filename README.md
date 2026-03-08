@@ -10,19 +10,27 @@ A code-generation pipeline that compiles [JSONata](https://jsonata.org/) express
 
 ```bash
 # 1. Generate all code (transforms + routes)
+# If using the example data (no top-level data/), create generate.go from examples/data first:
+./scripts/generate-generate-go.sh --data-dir examples/data
 GOEXPERIMENT=jsonv2 go generate ./internal/generated/
 
 # 2. Start the server
-GOEXPERIMENT=jsonv2 go run ./cmd/server/
+# DATA_DIR must point to a directory containing openapi.yaml and providers/
+DATA_DIR=examples/data GOEXPERIMENT=jsonv2 go run ./cmd/server/
 
-# 3. Test
+# 3. Test built-in endpoints
 curl http://localhost:3000/health
 curl http://localhost:3000/ready
-curl http://localhost:3000/dashboard
+curl http://localhost:3000/metrics
+# OpenAPI and proxy routes require upstreams to be running; without them you get 502.
+curl http://localhost:3000/dashboard   # needs user/bank (or mocks)
 curl http://localhost:3000/api/v1/orders
 
-# 4. View API documentation
-# Open http://localhost:3000/docs in your browser
+# 4. View API documentation (set ENABLE_DOCS=true to serve /docs)
+ENABLE_DOCS=true curl -s http://localhost:3000/docs | head -1
+
+# Smoke test (built-in endpoints only; uses READY_SKIP_UPSTREAM_CHECK so /ready passes without upstreams)
+./scripts/smoke-test.sh
 ```
 
 ## How It Works
@@ -912,6 +920,8 @@ The `/ready` endpoint performs health checks on all required (non-optional) upst
 - Each provider is checked individually with a short timeout (configurable via `HEALTH_CHECK_TIMEOUT`)
 - Overall health is determined by comparing failure count against `HEALTH_CHECK_FAILURE_THRESHOLD`
 - Health check duration is recorded in the `health_check_duration_seconds` metric
+
+**Local development:** If upstreams are not running, `/ready` returns 503. Set `READY_SKIP_UPSTREAM_CHECK=true` to report ready without probing upstreams (server listening only).
 
 ## Graceful Shutdown
 

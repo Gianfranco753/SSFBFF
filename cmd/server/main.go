@@ -127,6 +127,22 @@ func initLogger() zerolog.Logger {
 	return logger
 }
 
+// errorCodeFromStatus maps HTTP status to API error code for fiber.Error responses.
+func errorCodeFromStatus(status int) string {
+	switch {
+	case status == 400:
+		return rt.ErrorCodeValidationError
+	case status == 404:
+		return rt.ErrorCodeInvalidRequest
+	case status == 502:
+		return rt.ErrorCodeBadGateway
+	case status == 503:
+		return rt.ErrorCodeUpstreamUnavailable
+	default:
+		return rt.ErrorCodeInternalError
+	}
+}
+
 // serverReady tracks whether the server has finished initialization and is listening.
 // It's set to true after the server starts listening in the goroutine.
 var (
@@ -299,8 +315,7 @@ func main() {
 			if e, ok := err.(*fiber.Error); ok {
 				code = e.Code
 				message = e.Message
-				// Try to extract error code from message or classify based on status
-				errorCode = rt.ClassifyError(err)
+				errorCode = errorCodeFromStatus(code)
 			} else {
 				// Sanitize error message and classify error code
 				message = rt.SanitizeError(err)
@@ -351,10 +366,7 @@ func main() {
 	// Add error handler middleware
 	app.Use(errorHandlerMiddleware(logger))
 
-	// For proxy routes, we still need a client. Use a default one.
-	defaultClient := createProviderClient(aggregator.ProviderConfig{})
-	RegisterRoutes(app, agg, defaultClient)
-
+	// Register built-in routes first so they take precedence over generated wildcards (e.g. /proxy/*).
 	app.Get("/health", func(c fiber.Ctx) error {
 		return c.SendString("ok")
 	})
@@ -430,6 +442,14 @@ func main() {
 			})
 		}
 
+		// When READY_SKIP_UPSTREAM_CHECK=true (e.g. local dev), report ready without probing upstreams.
+		if getCachedReadySkipUpstreamCheck() {
+			return c.JSON(fiber.Map{
+				"healthy": true,
+				"reason":  "READY_SKIP_UPSTREAM_CHECK enabled",
+			})
+		}
+
 		// Check upstream service availability
 		startTime := time.Now()
 		healthStatus := checkUpstreamHealth(serverAggregator)
@@ -462,6 +482,10 @@ func main() {
 			return c.Send(cachedOpenAPISpecHTML)
 		})
 	}
+
+	// OpenAPI and proxy routes (generated). For proxy routes we use a default client.
+	defaultClient := createProviderClient(aggregator.ProviderConfig{})
+	RegisterRoutes(app, agg, defaultClient)
 
 	addr := listenAddr()
 	logInfo(ctx, logger, "BFF server starting", func(e *zerolog.Event) { e.Str("address", addr) })
