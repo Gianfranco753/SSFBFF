@@ -268,6 +268,8 @@ endpoints:
 
 **Timeout precedence**: Endpoint-level timeout > Provider-level timeout > Global default (10s)
 
+**Path templates**: Endpoint paths may contain placeholders like `{order_id}`. When a route has path parameters (e.g. OpenAPI path `/api/v1/orders/:order_id`), the BFF passes them into the aggregator and substitutes each placeholder with the value from the request (e.g. `params["order_id"]`). Placeholder names in the provider path must match the route's path parameter names. Example: `data: /posts/{order_id}` so that `GET /api/v1/orders/42` requests `https://example.com/posts/42`. No change to JSONata is required; the same `$fetch("provider", "endpoint")` works.
+
 **Request-Scoped Caching**: The `use_cache: true` option enables per-request caching for `$fetch()` calls. When multiple services or expressions call `$fetch("provider", "endpoint")` with the same configuration within the same client request, the cached response is reused instead of making duplicate HTTP calls. This is particularly useful for:
 
 - Idempotent GET requests that are called multiple times in the same request
@@ -278,7 +280,7 @@ endpoints:
 - **Zero overhead when disabled** (default): `use_cache: false` adds no performance cost
 - **Lock-free cache reads**: Uses `sync.Map` for high-concurrency scenarios (650k+ RPS)
 - **Per-request scope**: Cache is automatically cleared after each request completes
-- **Cache key includes**: provider, endpoint, HTTP method, headers, and body hash (ensures different configs get different cache entries)
+- **Cache key includes**: provider, endpoint, HTTP method, headers, body hash, and (when the path has placeholders) the resolved URL (ensures different configs and path-param values get different cache entries)
 
 Cache only stores successful responses (status < 400) and respects the endpoint's `use_cache` setting.
 

@@ -922,7 +922,7 @@ func generateFetchFilter(plan *ProviderPlan, packageName, sourceFile, expression
 	depKey := field.Provider + "." + field.Endpoint
 	w("func Execute%s(ctx context.Context, agg *aggregator.Aggregator, req runtime.RequestContext) (*runtime.Response, error) {\n", baseName)
 	w("\tdeps := []runtime.ProviderDep{{Provider: %q, Endpoint: %q}}\n", field.Provider, field.Endpoint)
-	w("\tresults, err := agg.Fetch(ctx, deps)\n")
+	w("\tresults, err := agg.Fetch(ctx, deps, req.Params)\n")
 	w("\tif err != nil {\n")
 	w("\t\treturn nil, fmt.Errorf(\"%s: fetch: %%w\", err)\n", baseName)
 	w("\t}\n\n")
@@ -1594,7 +1594,7 @@ func writeExecuteFunc(w func(string, ...any), plan *ProviderPlan) {
 
 	if hasDeps {
 		w("\tdeps := %sDeps(req)\n", plan.FuncName)
-		w("\tresults, err := agg.Fetch(ctx, deps)\n")
+		w("\tresults, err := agg.Fetch(ctx, deps, req.Params)\n")
 		w("\tif err != nil {\n")
 		w("\t\treturn nil, fmt.Errorf(\"%s: fetch: %%w\", err)\n", baseName)
 		w("\t}\n\n")

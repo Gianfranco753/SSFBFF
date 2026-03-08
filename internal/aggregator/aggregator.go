@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +23,10 @@ import (
 	"github.com/rs/zerolog"
 	"golang.org/x/sync/errgroup"
 )
+
+// pathParamPlaceholder matches {param_name} in endpoint paths. Placeholder names
+// must match the route's path parameter names (e.g. OpenAPI path :order_id → {order_id}).
+var pathParamPlaceholder = regexp.MustCompile(`\{([^}]+)\}`)
 
 // fetchCacheKey is a private type for context key to avoid collisions.
 type fetchCacheKey struct{}
@@ -203,10 +208,36 @@ func (a *Aggregator) GetProviders() map[string]ProviderConfig {
 	return result
 }
 
+// substitutePathParams replaces {name} placeholders in path with values from params.
+// Returns the resolved path, or an error if any placeholder has no corresponding param.
+// Placeholder names must match the route's path parameter names (e.g. OpenAPI :order_id → {order_id}).
+func substitutePathParams(path string, params map[string]string) (string, error) {
+	if pathParamPlaceholder.FindString(path) == "" {
+		return path, nil
+	}
+	if params == nil {
+		params = make(map[string]string)
+	}
+	var missing []string
+	resolved := pathParamPlaceholder.ReplaceAllStringFunc(path, func(placeholder string) string {
+		name := placeholder[1 : len(placeholder)-1]
+		if v, ok := params[name]; ok {
+			return v
+		}
+		missing = append(missing, name)
+		return placeholder
+	})
+	if len(missing) > 0 {
+		return "", fmt.Errorf("missing path parameter %q for endpoint", missing[0])
+	}
+	return resolved, nil
+}
+
 // Fetch calls all endpoints listed in deps concurrently and returns their raw
 // JSON bodies keyed by "provider.endpoint". Each call respects the provider's
-// configured timeout.
-func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map[string][]byte, error) {
+// configured timeout. params is optional; when the provider path contains
+// placeholders like {order_id}, params must supply the values (e.g. from the route).
+func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep, params map[string]string) (map[string][]byte, error) {
 	startTime := time.Now()
 	// Pre-allocate results map with all keys initialized to nil.
 	// Each goroutine writes to a unique key (dep.Key() is unique per dependency),
@@ -219,13 +250,13 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 
 	g, gctx := errgroup.WithContext(ctx)
 
-		for _, dep := range deps {
+	for _, dep := range deps {
 		dep := dep // capture loop variable
 		g.Go(func() error {
 			// Compute result key once (reused in all code paths)
 			resultKey := dep.Key()
-			
-			url, timeout, endpointCfg, optional, err := a.resolveURL(dep)
+
+			url, timeout, endpointCfg, optional, err := a.resolveURL(dep, params)
 			if err != nil {
 				a.logWithContext(gctx, zerolog.ErrorLevel, "failed to resolve upstream URL",
 					func(e *zerolog.Event) {
@@ -243,10 +274,11 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 				return err
 			}
 
-			// Compute cache key once if caching is enabled (reused later for storage)
+			// Compute cache key once if caching is enabled (reused later for storage).
+			// Include resolved URL so path-parameterized endpoints cache per-URL.
 			var cacheKey string
 			if endpointCfg.UseCache {
-				cacheKey = dep.CacheKey()
+				cacheKey = dep.CacheKey() + ":" + url
 			}
 
 			// Check cache if enabled (early return for zero overhead when disabled)
@@ -352,9 +384,10 @@ func (a *Aggregator) Fetch(ctx context.Context, deps []runtime.ProviderDep) (map
 }
 
 // resolveURL builds the full URL for a dep and returns the endpoint-specific timeout,
-// endpoint config, and whether the provider is optional. Timeout precedence: endpoint > provider > global default.
-// Default timeouts were already applied at startup in New().
-func (a *Aggregator) resolveURL(dep runtime.ProviderDep) (url string, timeout time.Duration, endpointCfg EndpointConfig, optional bool, err error) {
+// endpoint config, and whether the provider is optional. When the endpoint path
+// contains placeholders like {order_id}, params is used to substitute them; missing
+// params cause an error. Timeout precedence: endpoint > provider > global default.
+func (a *Aggregator) resolveURL(dep runtime.ProviderDep, params map[string]string) (resolvedURL string, timeout time.Duration, endpointCfg EndpointConfig, optional bool, err error) {
 	prov, ok := a.providers[dep.Provider]
 	if !ok {
 		// Sanitize error - don't expose provider name to client
@@ -384,7 +417,12 @@ func (a *Aggregator) resolveURL(dep runtime.ProviderDep) (url string, timeout ti
 		timeout = 10 * time.Second
 	}
 
-	return prov.BaseURL + endpointCfg.Path, timeout, endpointCfg, prov.Optional, nil
+	rawPath := prov.BaseURL + endpointCfg.Path
+	resolvedPath, err := substitutePathParams(rawPath, params)
+	if err != nil {
+		return "", 0, EndpointConfig{}, prov.Optional, err
+	}
+	return resolvedPath, timeout, endpointCfg, prov.Optional, nil
 }
 
 // classifyUpstreamError determines the error type based on status code.

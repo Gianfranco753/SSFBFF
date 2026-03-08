@@ -168,6 +168,15 @@ func parseSpec(path, jsonataDir string) ([]configRoute, error) {
 			// Parse request schema from OpenAPI operation
 			requestSchema := parseRequestSchema(op, components)
 
+			// Populate Params for path-param routes so the aggregator can substitute
+			// placeholders in provider URLs (e.g. /posts/{order_id}) even when the
+			// JSONata does not reference $request().params.
+			if requestSchema != nil && len(requestSchema.Path) > 0 {
+				rk.Params = true
+			} else if strings.Contains(urlPath, ":") {
+				rk.Params = true
+			}
+
 			// Parse x-slow-request-threshold extension (duration format: "500ms", "2s", etc.)
 			var slowRequestThreshold time.Duration
 			if thresholdStr, ok := op["x-slow-request-threshold"].(string); ok && thresholdStr != "" {

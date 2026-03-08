@@ -1004,7 +1004,7 @@ func TestGenerateExecuteFunc(t *testing.T) {
 	mustContain := []string{
 		"func ExecuteDashboard(ctx context.Context, agg *aggregator.Aggregator, req runtime.RequestContext)",
 		"TransformDashboardDeps(req)",
-		"agg.Fetch(ctx, deps)",
+		"agg.Fetch(ctx, deps, req.Params)",
 		"errgroup.WithContext(ctx)",
 		"childReq := req",
 		"childReq.ServiceParams = nil",

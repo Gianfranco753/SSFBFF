@@ -61,7 +61,7 @@ func TestFetchParallel(t *testing.T) {
 		{Provider: "bank_svc", Endpoint: "accounts"},
 	}
 
-	results, err := agg.Fetch(context.Background(), deps)
+	results, err := agg.Fetch(context.Background(), deps, nil)
 	if err != nil {
 		t.Fatalf("Fetch error: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestFetchWithMethod(t *testing.T) {
 		},
 	}
 
-	results, err := agg.Fetch(context.Background(), deps)
+	results, err := agg.Fetch(context.Background(), deps, nil)
 	if err != nil {
 		t.Fatalf("Fetch error: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestFetchUnknownProvider(t *testing.T) {
 	agg := New(map[string]ProviderConfig{}, testClientFactory)
 
 	deps := []runtime.ProviderDep{{Provider: "missing", Endpoint: "ep"}}
-	_, err := agg.Fetch(context.Background(), deps)
+	_, err := agg.Fetch(context.Background(), deps, nil)
 	if err == nil {
 		t.Fatal("expected error for unknown provider")
 	}
@@ -125,7 +125,7 @@ func TestFetchUnknownEndpoint(t *testing.T) {
 	}, testClientFactory)
 
 	deps := []runtime.ProviderDep{{Provider: "svc", Endpoint: "missing"}}
-	_, err := agg.Fetch(context.Background(), deps)
+	_, err := agg.Fetch(context.Background(), deps, nil)
 	if err == nil {
 		t.Fatal("expected error for unknown endpoint")
 	}
@@ -147,7 +147,7 @@ func TestFetchOptionalProviderFailure(t *testing.T) {
 	}, testClientFactory)
 
 	deps := []runtime.ProviderDep{{Provider: "optional_svc", Endpoint: "ep"}}
-	results, err := agg.Fetch(context.Background(), deps)
+	results, err := agg.Fetch(context.Background(), deps, nil)
 	if err != nil {
 		t.Fatalf("optional provider should not return error, got: %v", err)
 	}
@@ -172,7 +172,7 @@ func TestFetchRequiredProviderFailure(t *testing.T) {
 	}, testClientFactory)
 
 	deps := []runtime.ProviderDep{{Provider: "required_svc", Endpoint: "ep"}}
-	_, err := agg.Fetch(context.Background(), deps)
+	_, err := agg.Fetch(context.Background(), deps, nil)
 	if err == nil {
 		t.Fatal("required provider failure should return error")
 	}
@@ -190,7 +190,7 @@ func TestFetchContextCancellation(t *testing.T) {
 	}, testClientFactory)
 
 	deps := []runtime.ProviderDep{{Provider: "slow_svc", Endpoint: "ep"}}
-	_, err := agg.Fetch(context.Background(), deps)
+	_, err := agg.Fetch(context.Background(), deps, nil)
 	if err == nil {
 		t.Fatal("expected timeout error")
 	}
@@ -203,12 +203,70 @@ func TestFetchDefaultTimeout(t *testing.T) {
 
 	// Default timeout is now applied at startup in New(), so resolveURL returns it directly.
 	dep := runtime.ProviderDep{Provider: "svc", Endpoint: "ep"}
-	_, timeout, _, _, err := agg.resolveURL(dep)
+	_, timeout, _, _, err := agg.resolveURL(dep, nil)
 	if err != nil {
 		t.Fatalf("resolveURL error: %v", err)
 	}
 	if timeout != 10*time.Second {
 		t.Errorf("default timeout = %v, want 10s", timeout)
+	}
+}
+
+func TestFetchWithPathParams(t *testing.T) {
+	var pathSeen string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pathSeen = r.URL.Path
+		w.Write([]byte(`{"id":1}`))
+	}))
+	defer srv.Close()
+
+	agg := New(map[string]ProviderConfig{
+		"svc": {BaseURL: srv.URL, Timeout: 5 * time.Second, Endpoints: makeEndpoints(map[string]string{"post": "/posts/{order_id}"})},
+	}, testClientFactory)
+
+	deps := []runtime.ProviderDep{{Provider: "svc", Endpoint: "post"}}
+	params := map[string]string{"order_id": "42"}
+	results, err := agg.Fetch(context.Background(), deps, params)
+	if err != nil {
+		t.Fatalf("Fetch error: %v", err)
+	}
+	if got := string(results["svc.post"]); got != `{"id":1}` {
+		t.Errorf("results[svc.post] = %q, want %q", got, `{"id":1}`)
+	}
+	if pathSeen != "/posts/42" {
+		t.Errorf("request path = %q, want /posts/42", pathSeen)
+	}
+}
+
+func TestFetchWithPathParamsMissingParam(t *testing.T) {
+	agg := New(map[string]ProviderConfig{
+		"svc": {BaseURL: "http://localhost", Timeout: 5 * time.Second, Endpoints: makeEndpoints(map[string]string{"post": "/posts/{order_id}"})},
+	}, testClientFactory)
+
+	deps := []runtime.ProviderDep{{Provider: "svc", Endpoint: "post"}}
+	_, err := agg.Fetch(context.Background(), deps, nil)
+	if err == nil {
+		t.Fatal("expected error when path has placeholder but params is nil")
+	}
+	if !strings.Contains(err.Error(), "missing path parameter") {
+		t.Errorf("error = %v, want message containing 'missing path parameter'", err)
+	}
+}
+
+func TestFetchWithPathParamsBackwardCompatNilParams(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	agg := New(map[string]ProviderConfig{
+		"svc": {BaseURL: srv.URL, Timeout: 5 * time.Second, Endpoints: makeEndpoints(map[string]string{"ep": "/static"})},
+	}, testClientFactory)
+
+	deps := []runtime.ProviderDep{{Provider: "svc", Endpoint: "ep"}}
+	_, err := agg.Fetch(context.Background(), deps, nil)
+	if err != nil {
+		t.Fatalf("Fetch with nil params and static path should succeed: %v", err)
 	}
 }
 
@@ -333,7 +391,7 @@ func TestFetchCacheHit(t *testing.T) {
 	dep := runtime.ProviderDep{Provider: "user_svc", Endpoint: "profile"}
 
 	// First call - cache miss, should make HTTP request
-	results1, err := agg.Fetch(ctx, []runtime.ProviderDep{dep})
+	results1, err := agg.Fetch(ctx, []runtime.ProviderDep{dep}, nil)
 	if err != nil {
 		t.Fatalf("Fetch error: %v", err)
 	}
@@ -345,7 +403,7 @@ func TestFetchCacheHit(t *testing.T) {
 	}
 
 	// Second call with same dep - cache hit, should NOT make HTTP request
-	results2, err := agg.Fetch(ctx, []runtime.ProviderDep{dep})
+	results2, err := agg.Fetch(ctx, []runtime.ProviderDep{dep}, nil)
 	if err != nil {
 		t.Fatalf("Fetch error: %v", err)
 	}
@@ -382,7 +440,7 @@ func TestFetchCacheMissWhenDisabled(t *testing.T) {
 	dep := runtime.ProviderDep{Provider: "user_svc", Endpoint: "profile"}
 
 	// First call
-	_, err := agg.Fetch(ctx, []runtime.ProviderDep{dep})
+	_, err := agg.Fetch(ctx, []runtime.ProviderDep{dep}, nil)
 	if err != nil {
 		t.Fatalf("Fetch error: %v", err)
 	}
@@ -391,7 +449,7 @@ func TestFetchCacheMissWhenDisabled(t *testing.T) {
 	}
 
 	// Second call - cache disabled, should make another HTTP request
-	_, err = agg.Fetch(ctx, []runtime.ProviderDep{dep})
+	_, err = agg.Fetch(ctx, []runtime.ProviderDep{dep}, nil)
 	if err != nil {
 		t.Fatalf("Fetch error: %v", err)
 	}
@@ -426,7 +484,7 @@ func TestFetchCacheKeyUniqueness(t *testing.T) {
 	dep1 := runtime.ProviderDep{Provider: "svc", Endpoint: "ep", Method: "GET"}
 	dep2 := runtime.ProviderDep{Provider: "svc", Endpoint: "ep", Method: "POST"}
 
-	_, err := agg.Fetch(ctx, []runtime.ProviderDep{dep1})
+	_, err := agg.Fetch(ctx, []runtime.ProviderDep{dep1}, nil)
 	if err != nil {
 		t.Fatalf("Fetch error: %v", err)
 	}
@@ -434,7 +492,7 @@ func TestFetchCacheKeyUniqueness(t *testing.T) {
 		t.Errorf("expected 1 HTTP call, got %d", callCount)
 	}
 
-	_, err = agg.Fetch(ctx, []runtime.ProviderDep{dep2})
+	_, err = agg.Fetch(ctx, []runtime.ProviderDep{dep2}, nil)
 	if err != nil {
 		t.Fatalf("Fetch error: %v", err)
 	}
@@ -443,7 +501,7 @@ func TestFetchCacheKeyUniqueness(t *testing.T) {
 	}
 
 	// Same method should hit cache
-	_, err = agg.Fetch(ctx, []runtime.ProviderDep{dep1})
+	_, err = agg.Fetch(ctx, []runtime.ProviderDep{dep1}, nil)
 	if err != nil {
 		t.Fatalf("Fetch error: %v", err)
 	}
@@ -476,7 +534,7 @@ func TestFetchCacheRequestScoping(t *testing.T) {
 	ctx1 := context.Background()
 	cache1 := &FetchCache{}
 	ctx1 = WithFetchCache(ctx1, cache1)
-	_, err := agg.Fetch(ctx1, []runtime.ProviderDep{dep})
+	_, err := agg.Fetch(ctx1, []runtime.ProviderDep{dep}, nil)
 	if err != nil {
 		t.Fatalf("Fetch error: %v", err)
 	}
@@ -488,7 +546,7 @@ func TestFetchCacheRequestScoping(t *testing.T) {
 	ctx2 := context.Background()
 	cache2 := &FetchCache{}
 	ctx2 = WithFetchCache(ctx2, cache2)
-	_, err = agg.Fetch(ctx2, []runtime.ProviderDep{dep})
+	_, err = agg.Fetch(ctx2, []runtime.ProviderDep{dep}, nil)
 	if err != nil {
 		t.Fatalf("Fetch error: %v", err)
 	}
@@ -528,7 +586,7 @@ func TestFetchCacheConcurrentAccess(t *testing.T) {
 	errs := make([]error, 10)
 
 	for i := 0; i < 10; i++ {
-		results[i], errs[i] = agg.Fetch(ctx, []runtime.ProviderDep{dep})
+		results[i], errs[i] = agg.Fetch(ctx, []runtime.ProviderDep{dep}, nil)
 	}
 
 	// All should succeed
@@ -582,7 +640,7 @@ func TestFetchCacheOnlyStoresSuccess(t *testing.T) {
 	dep := runtime.ProviderDep{Provider: "user_svc", Endpoint: "profile"}
 
 	// First call - fails, should not be cached
-	_, err := agg.Fetch(ctx, []runtime.ProviderDep{dep})
+	_, err := agg.Fetch(ctx, []runtime.ProviderDep{dep}, nil)
 	if err == nil {
 		t.Fatal("expected error for failed request")
 	}
@@ -591,7 +649,7 @@ func TestFetchCacheOnlyStoresSuccess(t *testing.T) {
 	}
 
 	// Second call - should make another HTTP request (first one wasn't cached)
-	results, err := agg.Fetch(ctx, []runtime.ProviderDep{dep})
+	results, err := agg.Fetch(ctx, []runtime.ProviderDep{dep}, nil)
 	if err != nil {
 		t.Fatalf("Fetch error: %v", err)
 	}
@@ -619,7 +677,7 @@ func TestNewWithObservability_NilConfig(t *testing.T) {
 		10*1024*1024,
 	)
 	deps := []runtime.ProviderDep{{Provider: "svc", Endpoint: "ep"}}
-	results, err := agg.Fetch(context.Background(), deps)
+	results, err := agg.Fetch(context.Background(), deps, nil)
 	if err != nil {
 		t.Fatalf("Fetch with nil obsConfig: %v", err)
 	}
@@ -650,7 +708,7 @@ func TestNewWithObservability_NilCallbacks(t *testing.T) {
 		10*1024*1024,
 	)
 	deps := []runtime.ProviderDep{{Provider: "svc", Endpoint: "ep"}}
-	_, err := agg.Fetch(context.Background(), deps)
+	_, err := agg.Fetch(context.Background(), deps, nil)
 	if err != nil {
 		t.Fatalf("Fetch with nil callbacks: %v", err)
 	}
@@ -682,7 +740,7 @@ func TestNewWithObservability_RecordUpstreamCallInvoked(t *testing.T) {
 		10*1024*1024,
 	)
 	deps := []runtime.ProviderDep{{Provider: "svc", Endpoint: "ep"}}
-	_, err := agg.Fetch(context.Background(), deps)
+	_, err := agg.Fetch(context.Background(), deps, nil)
 	if err != nil {
 		t.Fatalf("Fetch: %v", err)
 	}

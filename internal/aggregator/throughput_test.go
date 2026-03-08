@@ -178,7 +178,7 @@ func BenchmarkThroughputSingleProvider(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			_, err := agg.Fetch(ctx, []runtime.ProviderDep{dep})
+			_, err := agg.Fetch(ctx, []runtime.ProviderDep{dep}, nil)
 			if err != nil {
 				b.Errorf("Fetch failed: %v", err)
 			}
@@ -234,7 +234,7 @@ func BenchmarkThroughputMultipleProviders(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			_, err := agg.Fetch(ctx, deps)
+			_, err := agg.Fetch(ctx, deps, nil)
 			if err != nil {
 				b.Errorf("Fetch failed: %v", err)
 			}
@@ -268,7 +268,7 @@ func BenchmarkThroughputWithCache(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			_, err := agg.Fetch(ctx, []runtime.ProviderDep{dep})
+			_, err := agg.Fetch(ctx, []runtime.ProviderDep{dep}, nil)
 			if err != nil {
 				b.Errorf("Fetch failed: %v", err)
 			}
@@ -298,7 +298,7 @@ func BenchmarkThroughputLargeResponse(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			_, err := agg.Fetch(ctx, []runtime.ProviderDep{dep})
+			_, err := agg.Fetch(ctx, []runtime.ProviderDep{dep}, nil)
 			if err != nil {
 				b.Errorf("Fetch failed: %v", err)
 			}
@@ -380,7 +380,7 @@ func TestThroughputConcurrentLoad(t *testing.T) {
 					ctx := context.Background()
 					for j := 0; j < tt.requestsPerGoroutine; j++ {
 						reqStart := time.Now()
-						_, err := agg.Fetch(ctx, deps)
+						_, err := agg.Fetch(ctx, deps, nil)
 						latency := time.Since(reqStart)
 						success := err == nil
 						metrics.record(latency, success)
@@ -461,7 +461,7 @@ func TestThroughputCachePerformance(t *testing.T) {
 	ctxNoCache := context.Background()
 	startNoCache := time.Now()
 	for i := 0; i < numRequests; i++ {
-		_, err := agg.Fetch(ctxNoCache, []runtime.ProviderDep{dep})
+		_, err := agg.Fetch(ctxNoCache, []runtime.ProviderDep{dep}, nil)
 		if err != nil {
 			t.Fatalf("Fetch failed: %v", err)
 		}
@@ -474,14 +474,14 @@ func TestThroughputCachePerformance(t *testing.T) {
 	ctxWithCache = WithFetchCache(ctxWithCache, cache)
 
 	// First request populates cache
-	_, err := agg.Fetch(ctxWithCache, []runtime.ProviderDep{dep})
+	_, err := agg.Fetch(ctxWithCache, []runtime.ProviderDep{dep}, nil)
 	if err != nil {
 		t.Fatalf("First fetch failed: %v", err)
 	}
 
 	startWithCache := time.Now()
 	for i := 0; i < numRequests-1; i++ {
-		_, err := agg.Fetch(ctxWithCache, []runtime.ProviderDep{dep})
+		_, err := agg.Fetch(ctxWithCache, []runtime.ProviderDep{dep}, nil)
 		if err != nil {
 			t.Fatalf("Fetch failed: %v", err)
 		}
@@ -535,7 +535,7 @@ func TestThroughputVaryingResponseSizes(t *testing.T) {
 
 			start := time.Now()
 			for i := 0; i < numRequests; i++ {
-				_, err := agg.Fetch(ctx, []runtime.ProviderDep{dep})
+				_, err := agg.Fetch(ctx, []runtime.ProviderDep{dep}, nil)
 				if err != nil {
 					t.Fatalf("Fetch failed: %v", err)
 				}
@@ -575,7 +575,7 @@ func TestThroughputErrorHandling(t *testing.T) {
 
 	for i := 0; i < numRequests; i++ {
 		reqStart := time.Now()
-		_, err := agg.Fetch(ctx, []runtime.ProviderDep{dep})
+		_, err := agg.Fetch(ctx, []runtime.ProviderDep{dep}, nil)
 		latency := time.Since(reqStart)
 		metrics.record(latency, err == nil)
 	}

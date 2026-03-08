@@ -79,7 +79,7 @@ func checkUpstreamHealth(agg *aggregator.Aggregator) HealthStatus {
 			Provider: name,
 			Endpoint: endpointName,
 		}
-		_, err := agg.Fetch(ctx, []runtime.ProviderDep{testDep})
+		_, err := agg.Fetch(ctx, []runtime.ProviderDep{testDep}, nil)
 		cancel()
 
 		if err != nil {
