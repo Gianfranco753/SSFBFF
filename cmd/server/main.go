@@ -159,6 +159,9 @@ var prometheusRegistry *prometheus.Registry
 // serverAggregator holds the aggregator instance for readiness checks.
 var serverAggregator *aggregator.Aggregator
 
+// inFlightWg counts requests currently being handled so shutdown can wait for them to drain.
+var inFlightWg sync.WaitGroup
+
 // cachedOpenAPISpecHTML holds the cached HTML for the /docs endpoint.
 var (
 	cachedOpenAPISpecHTML []byte
@@ -352,7 +355,13 @@ func main() {
 		IdleTimeout:  idleTimeout,
 	})
 
-	// Add panic recovery middleware first (outermost)
+	// In-flight tracking first (outermost) so every request is counted until handler returns.
+	app.Use(func(c fiber.Ctx) error {
+		inFlightWg.Add(1)
+		defer inFlightWg.Done()
+		return c.Next()
+	})
+	// Panic recovery so recovered handlers still decrement in-flight when they return.
 	app.Use(panicRecoveryMiddleware(logger))
 
 	// Combined OpenTelemetry instrumentation and trace ID extraction.
@@ -554,9 +563,7 @@ func main() {
 		logError(shutdownCtx, logger, "HTTP server shutdown error", func(e *zerolog.Event) { e.Err(err) })
 	}
 
-	// Step 2: Wait for in-flight aggregator requests
-	// The aggregator uses context cancellation, so in-flight requests will be cancelled
-	// when shutdownCtx is cancelled. We give them a moment to finish.
+	// Step 2: Wait for in-flight requests to drain (exit as soon as count hits zero, or after timeout).
 	logInfo(shutdownCtx, logger, "waiting for in-flight requests")
 	maxWaitTime := 5 * time.Second
 	defaultWaitTime := 1 * time.Second
@@ -582,11 +589,9 @@ func main() {
 	}
 
 	if waitTime > 0 {
-		select {
-		case <-shutdownCtx.Done():
+		completed := waitInFlightWithTimeout(shutdownCtx, &inFlightWg, waitTime)
+		if !completed {
 			logWarn(shutdownCtx, logger, "shutdown timeout reached while waiting for in-flight requests")
-		case <-time.After(waitTime):
-			// Wait completed
 		}
 	}
 
@@ -607,6 +612,24 @@ func main() {
 	shutdownDuration := time.Since(shutdownStart)
 	recordShutdownDuration(shutdownDuration)
 	logInfo(shutdownCtx, logger, "server stopped", func(e *zerolog.Event) { e.Dur("duration", shutdownDuration) })
+}
+
+// waitInFlightWithTimeout waits for wg to reach zero or for timeout/context cancellation.
+// Returns true if the WaitGroup completed first, false if timeout or context cancelled.
+func waitInFlightWithTimeout(ctx context.Context, wg *sync.WaitGroup, timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // loadOpenAPISpecHTML loads the OpenAPI spec, converts it to JSON, and builds the HTML template.

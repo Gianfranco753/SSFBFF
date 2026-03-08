@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -71,4 +72,36 @@ func TestShutdownAsyncLogging_Timeout(t *testing.T) {
 	success := shutdownAsyncLogging(100 * time.Millisecond)
 	// Should timeout (return false) or complete (return true) - either is acceptable
 	_ = success
+}
+
+func TestWaitInFlightWithTimeout_ZeroCount(t *testing.T) {
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	// wg has zero count; Wait() returns immediately
+	completed := waitInFlightWithTimeout(ctx, &wg, 1*time.Second)
+	if !completed {
+		t.Error("expected true when WaitGroup already at zero")
+	}
+}
+
+func TestWaitInFlightWithTimeout_Timeout(t *testing.T) {
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	// Never call Done(); wait should time out
+	completed := waitInFlightWithTimeout(ctx, &wg, 50*time.Millisecond)
+	if completed {
+		t.Error("expected false when WaitGroup never completes within timeout")
+	}
+}
+
+func TestWaitInFlightWithTimeout_ContextCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	completed := waitInFlightWithTimeout(ctx, &wg, 1*time.Second)
+	if completed {
+		t.Error("expected false when context is already cancelled")
+	}
 }
