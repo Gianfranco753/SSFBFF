@@ -63,10 +63,14 @@ Uses `$fetch()` to declare upstream dependencies. All calls run in parallel at r
 
 ### Fetch with filtering
 
-You can filter and project fetched data using the pattern `$fetch("provider", "endpoint")[filter].{projection}`:
+You can filter and project fetched data using the pattern `$fetch("provider", "endpoint")[filter].{projection}`. Projection only (no filter) is also supported: `$fetch("provider", "endpoint").{projection}`.
 
 ```jsonata
 $fetch("orders_service", "data")[price > 100].{id: order_id, total: $sum(items.price)}
+```
+
+```jsonata
+$fetch("orders_service", "data").{id: userId, title: title}
 ```
 
 ### Range + array map
@@ -96,7 +100,8 @@ With bindings for the range bounds:
 
 - ❌ **Invalid**: `$fetch("provider", "endpoint")` (completely bare fetch without any transformation)
 - ✅ **Valid**: `$fetch("provider", "endpoint").field` (field access is transformation)
-- ✅ **Valid**: `$fetch("provider", "endpoint")[filter].{projection}` (has filter/projection)
+- ✅ **Valid**: `$fetch("provider", "endpoint").{projection}` (projection only, no filter)
+- ✅ **Valid**: `$fetch("provider", "endpoint")[filter].{projection}` (has filter and projection)
 - ✅ **Valid**: `{"data": $fetch("provider", "endpoint").field}` (inside object literal, mapping data)
 - ✅ **Valid**: `[1, 2, 3]` or `( $x := 1; [ $x, 2, 3 ] )` — top-level array (response body is the array)
 - ✅ **Valid**: `[0..24].{index: $}` — range + array map (response body is array of objects)
@@ -1617,6 +1622,7 @@ The remaining gaps are mainly higher-order functions and regex functions. The co
 | Feature | Example |
 |---|---|
 | `$fetch(provider, endpoint)` | `$fetch("user_service", "profile").name` |
+| `$fetch()` with projection only | `$fetch("svc", "ep").{id: id, title: title}` |
 | `$fetch()` with config | `$fetch("svc", "ep", {"method": "POST"}).val` |
 | `$request()` context | `$request().headers.Authorization` |
 | `$service(name, params?)` composition | `$service("get_user", {"auth": $request().headers.Authorization}).name` |

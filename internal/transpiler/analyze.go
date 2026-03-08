@@ -1880,15 +1880,28 @@ func tryAnalyzeFetchFilter(root jparse.Node, funcName string) (ProviderField, bo
 		return ProviderField{}, false
 	}
 
-	// First step must be a PredicateNode whose Expr is a $fetch() call.
-	pred, ok := path.Steps[0].(*jparse.PredicateNode)
-	if !ok {
+	var pred *jparse.PredicateNode
+	var fnCall *jparse.FunctionCallNode
+
+	// Accept either $fetch(...)[filter].{proj} (PredicateNode) or $fetch(...).{proj} (no filter).
+	if p, ok := path.Steps[0].(*jparse.PredicateNode); ok {
+		pred = p
+		var okCall bool
+		fnCall, okCall = pred.Expr.(*jparse.FunctionCallNode)
+		if !okCall {
+			return ProviderField{}, false
+		}
+	} else if fn, ok := path.Steps[0].(*jparse.FunctionCallNode); ok {
+		_, isObj := path.Steps[1].(*jparse.ObjectNode)
+		if !isObj {
+			return ProviderField{}, false
+		}
+		fnCall = fn
+		pred = &jparse.PredicateNode{Expr: fnCall, Filters: nil}
+	} else {
 		return ProviderField{}, false
 	}
-	fnCall, ok := pred.Expr.(*jparse.FunctionCallNode)
-	if !ok {
-		return ProviderField{}, false
-	}
+
 	fnVar, ok := fnCall.Func.(*jparse.VariableNode)
 	if !ok || fnVar.Name != "fetch" {
 		return ProviderField{}, false

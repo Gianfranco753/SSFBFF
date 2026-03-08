@@ -1428,6 +1428,72 @@ func TestAnalyzeFetchFilter(t *testing.T) {
 	}
 }
 
+// TestAnalyzeFetchFilterProjectionOnly verifies that $fetch(p,e).{proj} (no filter)
+// is recognized as fetchFilter with empty Filters.
+func TestAnalyzeFetchFilterProjectionOnly(t *testing.T) {
+	expr := `$fetch("orders_service", "data").{id: userId, title: title}`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformOrders")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+
+	if len(plan.Fields) != 1 {
+		t.Fatalf("Fields count = %d, want 1", len(plan.Fields))
+	}
+	field := plan.Fields[0]
+	if field.Kind != "fetchFilter" {
+		t.Errorf("Kind = %q, want fetchFilter", field.Kind)
+	}
+	if field.Provider != "orders_service" || field.Endpoint != "data" {
+		t.Errorf("Provider = %q Endpoint = %q, want orders_service data", field.Provider, field.Endpoint)
+	}
+	if field.FilterPlan == nil {
+		t.Fatal("FilterPlan should not be nil")
+	}
+	if len(field.FilterPlan.Filters) != 0 {
+		t.Errorf("FilterPlan.Filters count = %d, want 0 (projection only)", len(field.FilterPlan.Filters))
+	}
+	if len(field.FilterPlan.OutputFields) != 2 {
+		t.Fatalf("FilterPlan.OutputFields count = %d, want 2", len(field.FilterPlan.OutputFields))
+	}
+	names := make(map[string]bool)
+	for _, of := range field.FilterPlan.OutputFields {
+		names[of.JSONName] = true
+	}
+	if !names["id"] || !names["title"] {
+		t.Errorf("OutputFields = %v, want id and title", names)
+	}
+}
+
+// TestGenerateFetchFilterProjectionOnlyCode verifies that GenerateProvider for
+// $fetch(p,e).{proj} (no filter) produces compilable code.
+func TestGenerateFetchFilterProjectionOnlyCode(t *testing.T) {
+	expr := `$fetch("orders_service", "data").{id: userId, title: title}`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformOrders")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+	src, err := transpiler.GenerateProvider(plan, "testpkg", "orders.jsonata", expr)
+	if err != nil {
+		t.Fatalf("generate error: %v", err)
+	}
+	code := string(src)
+	for _, s := range []string{"package testpkg", "TransformOrders", "OrdersResult", "ExecuteOrders", `Provider: "orders_service"`, `Endpoint: "data"`} {
+		if !strings.Contains(code, s) {
+			t.Errorf("generated code missing %q", s)
+		}
+	}
+}
+
 // TestGenerateFetchFilterCode verifies that GenerateProvider for a fetchFilter plan
 // emits both the streaming filter function (TransformOrders) and the Execute wrapper.
 func TestGenerateFetchFilterCode(t *testing.T) {
