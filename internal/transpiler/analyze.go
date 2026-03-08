@@ -1890,9 +1890,11 @@ func collectPlanRefsFromAST(plan *ProviderPlan, node jparse.Node) {
 //   - Step 1: ObjectNode{...}
 //
 // To reuse the existing Analyze logic, we substitute a NameNode(endpoint) for
-// the $fetch call. This tells Analyze to expect the upstream response to be a
-// JSON object with the endpoint name as the root key — e.g. $fetch("svc", "data")
-// expects the upstream to return {"data": [...]}.
+// the $fetch call. The upstream response can be any valid JSON: a root-level
+// array is accepted and treated as the array to filter/project; an object with
+// the endpoint name as a key (e.g. {"data": [...]}) is supported for backward
+// compatibility; a scalar (number, string, boolean, null) at root yields an
+// empty result set (no error) in the array pipeline.
 func tryAnalyzeFetchFilter(root jparse.Node, funcName string) (ProviderField, bool) {
 	path, ok := root.(*jparse.PathNode)
 	if !ok || len(path.Steps) < 2 {

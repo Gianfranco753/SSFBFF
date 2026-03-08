@@ -376,6 +376,29 @@ func TestAnalyzeFetchConfig(t *testing.T) {
 	}
 }
 
+// TestGenerateProviderFetchValuePassThrough verifies that when $fetch is used
+// as a value (no path), the generated code uses jsontext.Value() so scalars
+// and any JSON are passed through to the client.
+func TestGenerateProviderFetchValuePassThrough(t *testing.T) {
+	expr := `{"value": $fetch("p1", "e1")}`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformValue")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+	src, err := transpiler.GenerateProvider(plan, "testpkg", "value.jsonata", expr)
+	if err != nil {
+		t.Fatalf("generate error: %v", err)
+	}
+	code := string(src)
+	if !strings.Contains(code, `jsontext.Value(results["p1.e1"])`) {
+		t.Errorf("generated code should use jsontext.Value for no-path fetch so scalars pass through; got:\n%s", code)
+	}
+}
+
 // TestGenerateProviderWithRequestFunctions verifies that generated code for
 // $request() references req.Headers, req.Path, etc.
 func TestGenerateProviderWithRequestFunctions(t *testing.T) {
@@ -1631,6 +1654,166 @@ func main() {
 		t.Fatalf("generated code did not PASS:\n%s", output)
 	}
 	t.Logf("generated code output:\n%s", output)
+}
+
+// TestFetchFilterArrayRootAndScalarRoot verifies that the transform accepts
+// array-at-root and scalar-at-root: array is processed like object-with-key,
+// scalar returns empty slice with no error.
+func TestFetchFilterArrayRootAndScalarRoot(t *testing.T) {
+	expr := `$fetch("orders_service", "data")[price > 100].{id: order_id, total: $sum(items.price)}`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformOrders")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+	src, err := transpiler.GenerateProvider(plan, "main", "orders.jsonata", expr)
+	if err != nil {
+		t.Fatalf("generate error: %v", err)
+	}
+	dir := t.TempDir()
+	copyRuntimePackage(t, dir)
+	copyAggregatorPackage(t, dir)
+	harness := `//go:build goexperiment.jsonv2
+
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+)
+
+func main() {
+	// Array at root: same elements as object-with-data would have.
+	arrayInput := []byte(` + "`" + `[
+		{"order_id": "A1", "price": 50,  "items": [{"price": 10}]},
+		{"order_id": "A2", "price": 200, "items": [{"price": 30}, {"price": 40}, {"price": 50}]},
+		{"order_id": "A3", "price": 150, "items": [{"price": 100}]}
+	]` + "`" + `)
+	results, err := TransformOrders(arrayInput)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "array root error: %v\n", err)
+		os.Exit(1)
+	}
+	if len(results) != 2 {
+		fmt.Fprintf(os.Stderr, "array root: expected 2 results, got %d\n", len(results))
+		os.Exit(1)
+	}
+	out, _ := json.Marshal(results)
+	fmt.Println("array:", string(out))
+
+	// Scalar at root: empty slice, no error.
+	for _, scalar := range []string{"42", "true", "null"} {
+		results, err := TransformOrders([]byte(scalar))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "scalar %s error: %v\n", scalar, err)
+			os.Exit(1)
+		}
+		if len(results) != 0 {
+			fmt.Fprintf(os.Stderr, "scalar %s: expected 0 results, got %d\n", scalar, len(results))
+			os.Exit(1)
+		}
+	}
+	fmt.Println("PASS")
+}
+`
+	writeTestFiles(t, dir, src, harness)
+	modCmd := exec.Command("go", "mod", "tidy")
+	modCmd.Dir = dir
+	modCmd.Env = append(os.Environ(), "GOEXPERIMENT=jsonv2")
+	if err := modCmd.Run(); err != nil {
+		t.Fatalf("go mod tidy: %v", err)
+	}
+	cmd := exec.Command("go", "run", ".")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GOEXPERIMENT=jsonv2")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "PASS") {
+		t.Fatalf("expected PASS in output:\n%s", output)
+	}
+}
+
+// TestFetchFilterSingleObjectProjectionEndToEnd verifies that when the provider
+// returns a single object (no "data" key) and the expression is projection-only,
+// the transform returns one projected object.
+func TestFetchFilterSingleObjectProjectionEndToEnd(t *testing.T) {
+	expr := `$fetch("orders_service", "data").{id: userId, title: title}`
+	ast, err := jparse.Parse(expr)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	plan, err := transpiler.AnalyzeFetchCalls(ast, "TransformOrders")
+	if err != nil {
+		t.Fatalf("analyze error: %v", err)
+	}
+	src, err := transpiler.GenerateProvider(plan, "main", "orders.jsonata", expr)
+	if err != nil {
+		t.Fatalf("generate error: %v", err)
+	}
+	dir := t.TempDir()
+	copyRuntimePackage(t, dir)
+	copyAggregatorPackage(t, dir)
+	harness := `//go:build goexperiment.jsonv2
+
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+)
+
+func main() {
+	// Single object at root (no "data" key).
+	input := []byte(` + "`" + `{"userId": 1, "id": 1, "title": "tit", "body": "bod"}` + "`" + `)
+	results, err := TransformOrders(input)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	if len(results) != 1 {
+		fmt.Fprintf(os.Stderr, "expected 1 result, got %d\n", len(results))
+		os.Exit(1)
+	}
+	if results[0].ID != float64(1) && results[0].ID != 1 {
+		fmt.Fprintf(os.Stderr, "expected id=1, got %v\n", results[0].ID)
+		os.Exit(1)
+	}
+	if results[0].Title != "tit" {
+		fmt.Fprintf(os.Stderr, "expected title=tit, got %q\n", results[0].Title)
+		os.Exit(1)
+	}
+	out, _ := json.Marshal(results[0])
+	fmt.Println(string(out))
+	fmt.Println("PASS")
+}
+`
+	writeTestFiles(t, dir, src, harness)
+	modCmd := exec.Command("go", "mod", "tidy")
+	modCmd.Dir = dir
+	modCmd.Env = append(os.Environ(), "GOEXPERIMENT=jsonv2")
+	if err := modCmd.Run(); err != nil {
+		t.Fatalf("go mod tidy: %v", err)
+	}
+	cmd := exec.Command("go", "run", ".")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GOEXPERIMENT=jsonv2")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "PASS") {
+		t.Fatalf("expected PASS in output:\n%s", output)
+	}
+	if !strings.Contains(string(output), `"id":1`) || !strings.Contains(string(output), `"title":"tit"`) {
+		t.Errorf("expected single projected object in output:\n%s", output)
+	}
 }
 
 // --- range map ([a..b].{key: value}) tests ---

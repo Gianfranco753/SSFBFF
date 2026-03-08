@@ -73,6 +73,8 @@ $fetch("orders_service", "data")[price > 100].{id: order_id, total: $sum(items.p
 $fetch("orders_service", "data").{id: userId, title: title}
 ```
 
+**Provider response shape**: Upstream responses can be any valid JSON. When `$fetch` is used as a value (e.g. `{"value": $fetch("p","e")}`), that value is passed through to the client (e.g. provider returns `1` → client gets `{"value": 1}`). When `$fetch` is used with projection only and the provider returns a single object, the BFF returns one projected object (e.g. `{"id": 1, "title": "tit"}`), not an array. When `$fetch` is used in an array pipeline with a filter, a root-level array or an object with the endpoint key holding an array is processed; a scalar at root yields an empty list (no error).
+
 ### Range + array map
 
 You can return an array built from a numeric range in two ways:

@@ -61,91 +61,148 @@ func writeTransformFunc(buf *bytes.Buffer, w func(string, ...any), plan *QueryPl
 	elemType := prefix + "Element"
 	outType := plan.OutputName
 	hasSort := len(plan.SortTerms) > 0
+	projectionOnly := len(plan.Filters) == 0
+	emSingleKey := &exprEmitter{w: w, indent: "\t\t\t", elemVar: "elem", funcVarNames: collectFuncVarNames(plan.Bindings)}
+	emRootObj := &exprEmitter{w: w, indent: "\t\t", elemVar: "elem", funcVarNames: collectFuncVarNames(plan.Bindings)}
 
 	w("func %s(data []byte) ([]%s, error) {\n", plan.FuncName, outType)
 	w("\tdec := jsontext.NewDecoder(bytes.NewReader(data))\n\n")
 
-	// Navigate into the root object.
+	// Root can be '[', '{', or a scalar; branch so we only iterate when we have an array.
 	w("\ttok, err := dec.ReadToken()\n")
 	w("\tif err != nil {\n")
 	w("\t\treturn nil, fmt.Errorf(\"reading root: %%w\", err)\n")
 	w("\t}\n")
-	w("\tif tok.Kind() != '{' {\n")
-	w("\t\treturn nil, fmt.Errorf(\"expected JSON object at root, got %%v\", tok.Kind())\n")
+	w("\tswitch tok.Kind() {\n")
+	w("\tcase '[':\n")
+	w("\t\t// Decoder already consumed '['; next token is first element or ']'.\n")
+	w("\t\tbreak\n")
+	w("\tcase '{':\n")
+	w("\t\tfoundArray := false\n")
+	w("\t\tfor dec.PeekKind() != '}' {\n")
+	w("\t\t\tnameTok, err := dec.ReadToken()\n")
+	w("\t\t\tif err != nil {\n")
+	w("\t\t\t\treturn nil, fmt.Errorf(\"reading field name: %%w\", err)\n")
+	w("\t\t\t}\n\n")
+	w("\t\t\tif nameTok.String() != %q {\n", plan.RootField)
+	w("\t\t\t\tif err := dec.SkipValue(); err != nil {\n")
+	w("\t\t\t\t\treturn nil, fmt.Errorf(\"skipping field: %%w\", err)\n")
+	w("\t\t\t\t}\n")
+	w("\t\t\t\tcontinue\n")
+	w("\t\t\t}\n\n")
+	w("\t\t\tarrTok, err := dec.ReadToken()\n")
+	w("\t\t\tif err != nil {\n")
+	w("\t\t\t\treturn nil, fmt.Errorf(\"reading array start: %%w\", err)\n")
+	w("\t\t\t}\n")
+	w("\t\t\tif arrTok.Kind() == '[' {\n")
+	w("\t\t\t\tfoundArray = true\n")
+	w("\t\t\t\tbreak\n")
+	w("\t\t\t}\n")
+	w("\t\t\tif arrTok.Kind() == '{' {\n")
+	w("\t\t\t\tvar elem %s\n", elemType)
+	w("\t\t\t\tif err := jsonv2.UnmarshalDecode(dec, &elem); err != nil {\n")
+	w("\t\t\t\t\treturn nil, fmt.Errorf(\"reading single object: %%w\", err)\n")
+	w("\t\t\t\t}\n")
+	// Emit bindings and one projected result for single object under key.
+	for _, b := range plan.Bindings {
+		emSingleKey.emit(b)
+	}
+	if len(plan.Bindings) > 0 {
+		w("\t\t\t\t\n")
+	}
+	singleKeyExprs := make([]string, len(plan.OutputFields))
+	for i, out := range plan.OutputFields {
+		singleKeyExprs[i] = emSingleKey.emit(out.Value)
+	}
+	w("\t\t\t\treturn []%s{%s{\n", outType, outType)
+	for i, out := range plan.OutputFields {
+		w("\t\t\t\t\t%s: %s,\n", out.GoName, singleKeyExprs[i])
+	}
+	w("\t\t\t\t}}, nil\n")
+	w("\t\t\t}\n")
+	w("\t\t\treturn nil, nil\n")
+	w("\t\t}\n")
+	w("\t\tif !foundArray {\n")
+	if projectionOnly {
+		w("\t\tdec2 := jsontext.NewDecoder(bytes.NewReader(data))\n")
+		w("\t\tvar elem %s\n", elemType)
+		w("\t\tif err := jsonv2.UnmarshalDecode(dec2, &elem); err != nil {\n")
+		w("\t\t\treturn nil, fmt.Errorf(\"reading root object: %%w\", err)\n")
+		w("\t\t}\n")
+		for _, b := range plan.Bindings {
+			emRootObj.emit(b)
+		}
+		if len(plan.Bindings) > 0 {
+			w("\t\t\n")
+		}
+		rootObjExprs := make([]string, len(plan.OutputFields))
+		for i, out := range plan.OutputFields {
+			rootObjExprs[i] = emRootObj.emit(out.Value)
+		}
+		w("\t\treturn []%s{%s{\n", outType, outType)
+		for i, out := range plan.OutputFields {
+			w("\t\t\t%s: %s,\n", out.GoName, rootObjExprs[i])
+		}
+		w("\t\t}}, nil\n")
+		w("\t\t}\n")
+	} else {
+		w("\t\t\treturn nil, nil\n")
+		w("\t\t}\n")
+	}
+	w("\t\tbreak\n")
+	w("\tdefault:\n")
+	w("\t\treturn nil, nil\n")
 	w("\t}\n\n")
 
 	w("\tvar results []%s\n\n", outType)
 
-	// Stream through top-level fields looking for the target array.
-	w("\tfor dec.PeekKind() != '}' {\n")
-	w("\t\tnameTok, err := dec.ReadToken()\n")
-	w("\t\tif err != nil {\n")
-	w("\t\t\treturn nil, fmt.Errorf(\"reading field name: %%w\", err)\n")
-	w("\t\t}\n\n")
-
-	w("\t\tif nameTok.String() != %q {\n", plan.RootField)
-	w("\t\t\tif err := dec.SkipValue(); err != nil {\n")
-	w("\t\t\t\treturn nil, fmt.Errorf(\"skipping field: %%w\", err)\n")
-	w("\t\t\t}\n")
-	w("\t\t\tcontinue\n")
-	w("\t\t}\n\n")
-
-	// Found the target array — consume '['.
-	w("\t\tarrTok, err := dec.ReadToken()\n")
-	w("\t\tif err != nil {\n")
-	w("\t\t\treturn nil, fmt.Errorf(\"reading array start: %%w\", err)\n")
-	w("\t\t}\n")
-	w("\t\tif arrTok.Kind() != '[' {\n")
-	w("\t\t\treturn nil, fmt.Errorf(\"expected array for %s, got %%v\", arrTok.Kind())\n", plan.RootField)
-	w("\t\t}\n\n")
-
 	if hasSort {
 		// Sort mode: buffer all elements, sort, then filter+project.
-		w("\t\tvar allElems []%s\n", elemType)
-		w("\t\tfor dec.PeekKind() != ']' {\n")
-		w("\t\t\tvar elem %s\n", elemType)
-		w("\t\t\tif err := jsonv2.UnmarshalDecode(dec, &elem); err != nil {\n")
-		w("\t\t\t\treturn nil, fmt.Errorf(\"reading element: %%w\", err)\n")
-		w("\t\t\t}\n")
-		w("\t\t\tallElems = append(allElems, elem)\n")
+		w("\tvar allElems []%s\n", elemType)
+		w("\tfor dec.PeekKind() != ']' {\n")
+		w("\t\tvar elem %s\n", elemType)
+		w("\t\tif err := jsonv2.UnmarshalDecode(dec, &elem); err != nil {\n")
+		w("\t\t\treturn nil, fmt.Errorf(\"reading element: %%w\", err)\n")
 		w("\t\t}\n")
-		w("\t\tif _, err := dec.ReadToken(); err != nil {\n")
-		w("\t\t\treturn nil, fmt.Errorf(\"reading array end: %%w\", err)\n")
-		w("\t\t}\n\n")
+		w("\t\tallElems = append(allElems, elem)\n")
+		w("\t}\n")
+		w("\tif _, err := dec.ReadToken(); err != nil {\n")
+		w("\t\treturn nil, fmt.Errorf(\"reading array end: %%w\", err)\n")
+		w("\t}\n\n")
 
 		// Emit sort.
-		w("\t\tslices.SortFunc(allElems, func(a, b %s) int {\n", elemType)
+		w("\tslices.SortFunc(allElems, func(a, b %s) int {\n", elemType)
 		for _, st := range plan.SortTerms {
 			if st.Descending {
-				w("\t\t\tif a.%s > b.%s { return -1 }\n", st.GoName, st.GoName)
-				w("\t\t\tif a.%s < b.%s { return 1 }\n", st.GoName, st.GoName)
+				w("\t\tif a.%s > b.%s { return -1 }\n", st.GoName, st.GoName)
+				w("\t\tif a.%s < b.%s { return 1 }\n", st.GoName, st.GoName)
 			} else {
-				w("\t\t\tif a.%s < b.%s { return -1 }\n", st.GoName, st.GoName)
-				w("\t\t\tif a.%s > b.%s { return 1 }\n", st.GoName, st.GoName)
+				w("\t\tif a.%s < b.%s { return -1 }\n", st.GoName, st.GoName)
+				w("\t\tif a.%s > b.%s { return 1 }\n", st.GoName, st.GoName)
 			}
 		}
-		w("\t\t\treturn 0\n")
-		w("\t\t})\n\n")
+		w("\t\treturn 0\n")
+		w("\t})\n\n")
 
 		// Iterate sorted elements.
 		if plan.HasIndexFilter {
-			w("\t\tfor elemIdx, elem := range allElems {\n")
+			w("\tfor elemIdx, elem := range allElems {\n")
 		} else {
-			w("\t\tfor _, elem := range allElems {\n")
+			w("\tfor _, elem := range allElems {\n")
 		}
 	} else {
 		// Streaming mode: process each element as it's decoded.
 		if plan.HasIndexFilter {
-			w("\t\telemIdx := 0\n")
+			w("\telemIdx := 0\n")
 		}
-		w("\t\tfor dec.PeekKind() != ']' {\n")
-		w("\t\t\tvar elem %s\n", elemType)
-		w("\t\t\tif err := jsonv2.UnmarshalDecode(dec, &elem); err != nil {\n")
-		w("\t\t\t\treturn nil, fmt.Errorf(\"reading element: %%w\", err)\n")
-		w("\t\t\t}\n\n")
+		w("\tfor dec.PeekKind() != ']' {\n")
+		w("\t\tvar elem %s\n", elemType)
+		w("\t\tif err := jsonv2.UnmarshalDecode(dec, &elem); err != nil {\n")
+		w("\t\t\treturn nil, fmt.Errorf(\"reading element: %%w\", err)\n")
+		w("\t\t}\n\n")
 	}
 
-	em := &exprEmitter{w: w, indent: "\t\t\t", elemVar: "elem", funcVarNames: collectFuncVarNames(plan.Bindings)}
+	em := &exprEmitter{w: w, indent: "\t\t", elemVar: "elem", funcVarNames: collectFuncVarNames(plan.Bindings)}
 
 	// Apply filters.
 	if len(plan.Filters) > 0 {
@@ -154,13 +211,13 @@ func writeTransformFunc(buf *bytes.Buffer, w func(string, ...any), plan *QueryPl
 			conditions[i] = em.emit(f)
 		}
 		allConditions := strings.Join(conditions, " && ")
-		w("\t\t\tpassesFilter := %s\n", allConditions)
-		w("\t\t\tif !passesFilter {\n")
+		w("\t\tpassesFilter := %s\n", allConditions)
+		w("\t\tif !passesFilter {\n")
 		if !hasSort && plan.HasIndexFilter {
-			w("\t\t\t\telemIdx++\n")
+			w("\t\t\telemIdx++\n")
 		}
-		w("\t\t\t\tcontinue\n")
-		w("\t\t\t}\n\n")
+		w("\t\t\tcontinue\n")
+		w("\t\t}\n\n")
 	}
 
 	// Emit variable bindings ($x := expr) before the output struct.
@@ -178,23 +235,22 @@ func writeTransformFunc(buf *bytes.Buffer, w func(string, ...any), plan *QueryPl
 	}
 
 	// Build the output struct.
-	w("\t\t\tresults = append(results, %s{\n", outType)
+	w("\t\tresults = append(results, %s{\n", outType)
 	for i, out := range plan.OutputFields {
-		w("\t\t\t\t%s: %s,\n", out.GoName, outputExprs[i])
+		w("\t\t\t%s: %s,\n", out.GoName, outputExprs[i])
 	}
-	w("\t\t\t})\n")
+	w("\t\t})\n")
 	if !hasSort && plan.HasIndexFilter {
-		w("\t\t\telemIdx++\n")
+		w("\t\telemIdx++\n")
 	}
-	w("\t\t}\n\n")
+	w("\t}\n\n")
 
 	if !hasSort {
 		// Consume ']'.
-		w("\t\tif _, err := dec.ReadToken(); err != nil {\n")
-		w("\t\t\treturn nil, fmt.Errorf(\"reading array end: %%w\", err)\n")
-		w("\t\t}\n")
+		w("\tif _, err := dec.ReadToken(); err != nil {\n")
+		w("\t\treturn nil, fmt.Errorf(\"reading array end: %%w\", err)\n")
+		w("\t}\n")
 	}
-	w("\t}\n\n")
 
 	w("\treturn results, nil\n")
 	w("}\n")
@@ -874,7 +930,17 @@ func generateFetchFilter(plan *ProviderPlan, packageName, sourceFile, expression
 	w("\tif err != nil {\n")
 	w("\t\treturn nil, err\n")
 	w("\t}\n\n")
-	w("\tout, err := jsonv2.Marshal(items)\n")
+	// Projection-only with single object: return that object as body, not array of one.
+	if len(qp.Filters) == 0 {
+		w("\tvar out []byte\n")
+		w("\tif len(items) == 1 {\n")
+		w("\t\tout, err = jsonv2.Marshal(items[0])\n")
+		w("\t} else {\n")
+		w("\t\tout, err = jsonv2.Marshal(items)\n")
+		w("\t}\n")
+	} else {
+		w("\tout, err := jsonv2.Marshal(items)\n")
+	}
 	w("\tif err != nil {\n")
 	w("\t\treturn nil, fmt.Errorf(\"%s: marshal: %%w\", err)\n", baseName)
 	w("\t}\n")
@@ -1449,7 +1515,7 @@ func writeProviderTransformFunc(w func(string, ...any), plan *ProviderPlan, hasD
 				w("\t}\n")
 				w("\tenc.WriteValue(%s)\n\n", varName)
 			} else {
-				w("\tenc.WriteValue(results[%q])\n\n", depKey)
+				w("\tenc.WriteValue(jsontext.Value(results[%q]))\n\n", depKey)
 			}
 
 		case "header", "cookie", "query", "param":
@@ -1497,7 +1563,7 @@ func writeProviderTransformFunc(w func(string, ...any), plan *ProviderPlan, hasD
 				w("\t}\n")
 				w("\tenc.WriteValue(%s)\n\n", varName)
 			} else {
-				w("\tenc.WriteValue(results[%q])\n\n", svcKey)
+				w("\tenc.WriteValue(jsontext.Value(results[%q]))\n\n", svcKey)
 			}
 
 		case "static":
