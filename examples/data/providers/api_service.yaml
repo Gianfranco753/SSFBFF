@@ -1,0 +1,17 @@
+# Example provider using spec-style options: host, path, headers, query,
+# connection_timeout, redirections_max. Use either host+path or base_url.
+host: http://api.example.com
+path: /v1
+timeout: 5s
+connection_timeout: 500ms
+redirections_max: 5
+headers:
+  X-Api-Version: "1"
+  Accept: application/json
+query:
+  format: json
+endpoints:
+  profile: /api/profile
+  data:
+    path: /api/data/{id}
+    timeout: 10s

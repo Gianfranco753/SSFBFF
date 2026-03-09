@@ -65,8 +65,11 @@ func createProviderTransport(cfg aggregator.ProviderConfig) *http.Transport {
 
 	// Connection pool tuning for high throughput - use cached values
 	idleTimeout := getCachedIdleConnTimeout()
-	dialTimeout := getCachedDialTimeout()
 	keepAlive := getCachedKeepAlive()
+	dialTimeout := getCachedDialTimeout()
+	if cfg.ConnectionTimeout > 0 {
+		dialTimeout = cfg.ConnectionTimeout
+	}
 
 	return &http.Transport{
 		Proxy:               getCachedProxyFunc(),
@@ -95,10 +98,20 @@ func createProviderClient(cfg aggregator.ProviderConfig) *http.Client {
 		otelhttp.WithPropagators(upstreamPropagator()),
 	)
 
-	return &http.Client{
+	client := &http.Client{
 		Timeout:   30 * time.Second, // Client-level timeout (should be >= provider timeout)
 		Transport: instrumentedTransport,
 	}
+	if cfg.RedirectionsMax > 0 {
+		max := cfg.RedirectionsMax
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			if len(via) >= max {
+				return http.ErrUseLastResponse
+			}
+			return nil
+		}
+	}
+	return client
 }
 
 // initLogger configures and returns a zerolog logger.
@@ -475,21 +488,26 @@ func main() {
 		return c.SendString("ok")
 	})
 
-	// Scalar documentation endpoint (enabled via ENABLE_DOCS env var)
-	// Uses cached HTML loaded at startup to avoid file I/O on every request
-	if getCachedEnableDocs() {
-		app.Get("/docs", func(c fiber.Ctx) error {
-			if len(cachedOpenAPISpecHTML) == 0 {
-				logError(c.Context(), logger, "OpenAPI spec HTML not loaded",
-					func(e *zerolog.Event) {})
-				return c.Status(500).JSON(fiber.Map{
-					"error": "API documentation not available",
-				})
-			}
-			c.Set("Content-Type", "text/html; charset=utf-8")
-			return c.Send(cachedOpenAPISpecHTML)
-		})
-	}
+	// /docs always registered so clients get a clear response instead of 404.
+	// When ENABLE_DOCS is false, returns 503 with a message; when true, serves cached OpenAPI HTML.
+	app.Get("/docs", func(c fiber.Ctx) error {
+		if !getCachedEnableDocs() {
+			return c.Status(503).JSON(fiber.Map{
+				"error":  "Documentation is disabled. Set ENABLE_DOCS=true to enable.",
+				"status": 503,
+				"code":   "SERVICE_UNAVAILABLE",
+			})
+		}
+		if len(cachedOpenAPISpecHTML) == 0 {
+			logError(c.Context(), logger, "OpenAPI spec HTML not loaded",
+				func(e *zerolog.Event) {})
+			return c.Status(500).JSON(fiber.Map{
+				"error": "API documentation not available",
+			})
+		}
+		c.Set("Content-Type", "text/html; charset=utf-8")
+		return c.Send(cachedOpenAPISpecHTML)
+	})
 
 	// OpenAPI and proxy routes (generated). For proxy routes we use a default client.
 	defaultClient := createProviderClient(aggregator.ProviderConfig{})

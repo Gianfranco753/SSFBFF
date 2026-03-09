@@ -287,13 +287,23 @@ func TestValidateProviderConfig(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "empty base_url",
+			name: "valid host and path",
+			cfg: ProviderConfig{
+				Host:      "http://example.com",
+				Path:      "/v1",
+				Timeout:   5 * time.Second,
+				Endpoints: makeEndpoints(map[string]string{"ep": "/api/ep"}),
+			},
+			wantErr: false,
+		},
+		{
+			name: "missing host and base_url",
 			cfg: ProviderConfig{
 				BaseURL:   "",
 				Endpoints: makeEndpoints(map[string]string{"ep": "/api/ep"}),
 			},
 			wantErr: true,
-			errMsg:  "base_url is required",
+			errMsg:  "either host or base_url is required",
 		},
 		{
 			name: "invalid base_url",
@@ -345,6 +355,46 @@ func TestValidateProviderConfig(t *testing.T) {
 			wantErr: true,
 			errMsg:  "timeout cannot be negative",
 		},
+		{
+			name: "timeout below minimum",
+			cfg: ProviderConfig{
+				BaseURL:   "http://example.com",
+				Timeout:   500 * time.Microsecond, // 0.5 ms
+				Endpoints: makeEndpoints(map[string]string{"ep": "/api/ep"}),
+			},
+			wantErr: true,
+			errMsg:  "timeout must be between 1 and 300000 ms",
+		},
+		{
+			name: "timeout above maximum",
+			cfg: ProviderConfig{
+				BaseURL:   "http://example.com",
+				Timeout:   301 * time.Second,
+				Endpoints: makeEndpoints(map[string]string{"ep": "/api/ep"}),
+			},
+			wantErr: true,
+			errMsg:  "timeout must be between 1 and 300000 ms",
+		},
+		{
+			name: "connection_timeout out of range",
+			cfg: ProviderConfig{
+				BaseURL:           "http://example.com",
+				ConnectionTimeout: 400 * time.Second,
+				Endpoints:         makeEndpoints(map[string]string{"ep": "/api/ep"}),
+			},
+			wantErr: true,
+			errMsg:  "connection_timeout must be between 1 and 300000 ms",
+		},
+		{
+			name: "redirections_max negative",
+			cfg: ProviderConfig{
+				BaseURL:         "http://example.com",
+				RedirectionsMax: -1,
+				Endpoints:       makeEndpoints(map[string]string{"ep": "/api/ep"}),
+			},
+			wantErr: true,
+			errMsg:  "redirections_max cannot be negative",
+		},
 	}
 
 	for _, tt := range tests {
@@ -363,6 +413,81 @@ func TestValidateProviderConfig(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestResolveURLWithQuery(t *testing.T) {
+	agg := New(map[string]ProviderConfig{
+		"svc": {
+			BaseURL:   "http://example.com",
+			Timeout:   5 * time.Second,
+			Query:     map[string]string{"format": "json", "v": "1"},
+			Endpoints: makeEndpoints(map[string]string{"ep": "/api/ep"}),
+		},
+	}, testClientFactory)
+
+	dep := runtime.ProviderDep{Provider: "svc", Endpoint: "ep"}
+	resolved, _, _, _, err := agg.resolveURL(dep, nil)
+	if err != nil {
+		t.Fatalf("resolveURL error: %v", err)
+	}
+	if !strings.Contains(resolved, "format=json") || !strings.Contains(resolved, "v=1") {
+		t.Errorf("resolved URL %q should contain default query params format=json and v=1", resolved)
+	}
+}
+
+func TestResolveURLHostAndPath(t *testing.T) {
+	agg := New(map[string]ProviderConfig{
+		"svc": {
+			Host:      "http://api.example.com",
+			Path:      "/v1",
+			Timeout:   5 * time.Second,
+			Endpoints: makeEndpoints(map[string]string{"ep": "/api/ep"}),
+		},
+	}, testClientFactory)
+
+	dep := runtime.ProviderDep{Provider: "svc", Endpoint: "ep"}
+	resolved, _, _, _, err := agg.resolveURL(dep, nil)
+	if err != nil {
+		t.Fatalf("resolveURL error: %v", err)
+	}
+	want := "http://api.example.com/v1/api/ep"
+	if resolved != want {
+		t.Errorf("resolved URL = %q, want %q", resolved, want)
+	}
+}
+
+func TestDoRequestProviderHeaders(t *testing.T) {
+	var seenHeader string
+	var seenOverride string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenHeader = r.Header.Get("X-Provider-Header")
+		seenOverride = r.Header.Get("X-Override")
+		w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	agg := New(map[string]ProviderConfig{
+		"svc": {
+			BaseURL: srv.URL,
+			Timeout: 5 * time.Second,
+			Headers: map[string]string{"X-Provider-Header": "from-provider", "X-Override": "provider-value"},
+			Endpoints: makeEndpoints(map[string]string{"ep": "/ep"}),
+		},
+	}, testClientFactory)
+
+	deps := []runtime.ProviderDep{
+		{Provider: "svc", Endpoint: "ep", Headers: map[string]string{"X-Override": "request-override"}},
+	}
+	_, err := agg.Fetch(context.Background(), deps, nil)
+	if err != nil {
+		t.Fatalf("Fetch error: %v", err)
+	}
+	if seenHeader != "from-provider" {
+		t.Errorf("X-Provider-Header = %q, want from-provider", seenHeader)
+	}
+	if seenOverride != "request-override" {
+		t.Errorf("X-Override (request should override provider) = %q, want request-override", seenOverride)
 	}
 }
 

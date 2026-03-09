@@ -243,30 +243,66 @@ Each route specifies the target `url` where requests should be forwarded. The UR
 
 ### `data/providers/*.yaml`
 
-Each provider configuration supports per-endpoint timeouts, connection pool tuning, and request-scoped caching:
+Each provider is config-driven: base URL, paths, headers, timeouts, and connection options come from YAML. The BFF has no database; it only orchestrates calls to these upstreams. Config is loaded once at startup and is read-only at runtime.
+
+**Provider configuration reference**
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `host` | string | Base URL origin (e.g. `https://api.example.com`). Required in spec; use **either** `host` or `base_url`. |
+| `path` | string | Base path prefix (e.g. `/v1`). Final URL = (host+path or base_url) + endpoint path. |
+| `base_url` | string | Full base URL. Legacy; use `host`+`path` or this. Optional when `host` is set. |
+| `headers` | map (string→string) | Default headers added to every request. Request-level headers override these. |
+| `query` | map (string→string) | Default query parameters added to every request URL. |
+| `timeout` | duration | Provider-level default request timeout. When set, must be 1–300000 ms (1 ms to 300 s). |
+| `connection_timeout` | duration | Dial/connection timeout. When set, must be 1–300000 ms. Falls back to `DIAL_TIMEOUT` env when unset. |
+| `redirections_max` | int | Max redirects to follow; 0 = default client behaviour (10). |
+| `max_idle_conns_per_host` | int | Overrides `MAX_IDLE_CONNS_PER_HOST` env. Pool option (connections per host). |
+| `max_conns_per_host` | int | Overrides `MAX_CONNS_PER_HOST` env. Pool option. |
+| `optional` | bool | If true, fetch failure stores `null` instead of aborting (graceful degradation). |
+| `endpoints` | map | Endpoint name → path or `{path, timeout?, use_cache?}`. At least one required. |
+
+Pipelining and `request_per_client_max` are not supported (Go `net/http` client behaviour).
+
+Example using `host` and `path` (spec style):
+
+```yaml
+# data/providers/user_service.yaml
+host: http://user-svc:8080
+path: /v1
+timeout: 5s
+connection_timeout: 500ms
+redirections_max: 5
+headers:
+  X-Api-Version: "1"
+query:
+  format: json
+endpoints:
+  profile: /api/profile
+  slow_query:
+    path: /api/slow
+    timeout: 30s
+```
+
+Example using `base_url` (backward compatible):
 
 ```yaml
 # data/providers/user_service.yaml
 base_url: http://user-svc:8080
-timeout: 5s  # Provider-level default timeout
-max_idle_conns_per_host: 1000  # Optional, overrides MAX_IDLE_CONNS_PER_HOST env var
-max_conns_per_host: 2000  # Optional, overrides MAX_CONNS_PER_HOST env var
+timeout: 5s
+max_idle_conns_per_host: 1000
+max_conns_per_host: 2000
 endpoints:
-  # Simple string format (backward compatible)
   profile: /api/profile
-  
-  # Object format with per-endpoint timeout override
   slow_query:
     path: /api/slow
-    timeout: 30s  # Override for slow endpoint
-  
-  # Object format with caching enabled
+    timeout: 30s
   cached_endpoint:
     path: /api/cached
-    use_cache: true  # Enable request-scoped caching for this endpoint
+    use_cache: true
 ```
 
-**Timeout precedence**: Endpoint-level timeout > Provider-level timeout > Global default (10s)
+**Timeout precedence**: Endpoint-level timeout > Provider-level timeout > Global default (10s). All timeouts (provider, endpoint, connection_timeout) when set must be in the range 1–300000 ms.
 
 **Path templates**: Endpoint paths may contain placeholders like `{order_id}`. When a route has path parameters (e.g. OpenAPI path `/api/v1/orders/:order_id`), the BFF passes them into the aggregator and substitutes each placeholder with the value from the request (e.g. `params["order_id"]`). Placeholder names in the provider path must match the route's path parameter names. Example: `data: /posts/{order_id}` so that `GET /api/v1/orders/42` requests `https://example.com/posts/42`. No change to JSONata is required; the same `$fetch("provider", "endpoint")` works.
 
@@ -297,7 +333,7 @@ endpoints:
 
 **Connection Pool Configuration**: Each provider gets its own isolated HTTP client with a dedicated connection pool. This prevents one slow provider from exhausting connections needed by others. Pool sizes can be configured per-provider in YAML or globally via environment variables.
 
-**Configuration Validation**: Provider configurations are validated at startup. Invalid configurations (malformed URLs, negative timeouts, empty endpoints, etc.) cause the server to fail with descriptive error messages. This ensures configuration errors are caught early rather than at runtime.
+**Configuration Validation**: Provider configurations are validated at startup. You must set either `host` or `base_url`; timeouts (when set) must be between 1 and 300000 ms; at least one endpoint with non-empty path is required. Invalid or out-of-range values cause the server to fail with descriptive error messages so misconfiguration is caught early.
 
 ## Adding a New Endpoint
 

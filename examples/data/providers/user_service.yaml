@@ -1,5 +1,7 @@
+# Legacy style: base_url. Alternatively use host + path (see api_service.yaml).
 base_url: http://user-svc:8080
 timeout: 5s
+# Optional: headers, query, connection_timeout, redirections_max (see README).
 endpoints:
   # Simple string format (backward compatible)
   profile: /api/profile

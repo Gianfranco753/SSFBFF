@@ -4,9 +4,13 @@ package main
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/gcossani/ssfbff/internal/aggregator"
 	"github.com/rs/zerolog"
@@ -65,6 +69,86 @@ endpoints:
 	}
 }
 
+func TestLoadProvidersWithNewOptions(t *testing.T) {
+	dir := t.TempDir()
+
+	yamlWithNewOptions := `host: https://api.example.com
+path: /v1
+timeout: 5s
+connection_timeout: 500ms
+redirections_max: 3
+headers:
+  X-Api-Version: "1"
+  Accept: application/json
+query:
+  format: json
+endpoints:
+  ep: /api/ep
+`
+	os.WriteFile(filepath.Join(dir, "api_service.yaml"), []byte(yamlWithNewOptions), 0o644)
+
+	providers, err := loadProviders(dir)
+	if err != nil {
+		t.Fatalf("loadProviders error: %v", err)
+	}
+
+	cfg, ok := providers["api_service"]
+	if !ok {
+		t.Fatal("missing api_service provider")
+	}
+	if cfg.Host != "https://api.example.com" {
+		t.Errorf("host = %q", cfg.Host)
+	}
+	if cfg.Path != "/v1" {
+		t.Errorf("path = %q", cfg.Path)
+	}
+	if cfg.ConnectionTimeout != 500*time.Millisecond {
+		t.Errorf("connection_timeout = %v", cfg.ConnectionTimeout)
+	}
+	if cfg.RedirectionsMax != 3 {
+		t.Errorf("redirections_max = %d", cfg.RedirectionsMax)
+	}
+	if cfg.Headers["X-Api-Version"] != "1" || cfg.Headers["Accept"] != "application/json" {
+		t.Errorf("headers = %v", cfg.Headers)
+	}
+	if cfg.Query["format"] != "json" {
+		t.Errorf("query = %v", cfg.Query)
+	}
+}
+
+func TestLoadProvidersInvalidConfig(t *testing.T) {
+	dir := t.TempDir()
+
+	// Missing both host and base_url
+	os.WriteFile(filepath.Join(dir, "bad.yaml"), []byte(`
+endpoints:
+  ep: /ep
+`), 0o644)
+	_, err := loadProviders(dir)
+	if err == nil {
+		t.Fatal("expected error when both host and base_url are missing")
+	}
+	if !strings.Contains(err.Error(), "either host or base_url is required") {
+		t.Errorf("error = %v", err)
+	}
+
+	// Timeout out of range
+	os.Remove(filepath.Join(dir, "bad.yaml"))
+	os.WriteFile(filepath.Join(dir, "bad.yaml"), []byte(`
+base_url: http://example.com
+timeout: 400s
+endpoints:
+  ep: /ep
+`), 0o644)
+	_, err = loadProviders(dir)
+	if err == nil {
+		t.Fatal("expected error when timeout exceeds 300s")
+	}
+	if !strings.Contains(err.Error(), "timeout must be between") {
+		t.Errorf("error = %v", err)
+	}
+}
+
 func TestLoadProvidersEmptyDir(t *testing.T) {
 	dir := t.TempDir()
 	providers, err := loadProviders(dir)
@@ -117,6 +201,39 @@ func TestProviderTransportProxySupport(t *testing.T) {
 	transport := createProviderTransport(aggregator.ProviderConfig{})
 	if transport.Proxy == nil {
 		t.Error("createProviderTransport() should return a transport with Proxy function set")
+	}
+}
+
+func TestProviderClientRedirectionsMax(t *testing.T) {
+	// Server: / redirects to /final, /final returns 200.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			http.Redirect(w, r, "/final", http.StatusFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	cfg := aggregator.ProviderConfig{
+		BaseURL:         srv.URL,
+		RedirectionsMax:  1,
+		Timeout:          5 * time.Second,
+		Endpoints:        map[string]aggregator.EndpointConfig{"ep": {Path: "/"}},
+	}
+	client := createProviderClient(cfg)
+
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL+"/", nil)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("client.Do: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// With RedirectionsMax=1 we follow one redirect; the response is the redirect (302), not the final 200.
+	if resp.StatusCode != http.StatusFound {
+		t.Errorf("status = %d, want 302 (redirect) when redirections_max=1", resp.StatusCode)
 	}
 }
 

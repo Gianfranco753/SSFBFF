@@ -28,6 +28,12 @@ import (
 // must match the route's path parameter names (e.g. OpenAPI path :order_id → {order_id}).
 var pathParamPlaceholder = regexp.MustCompile(`\{([^}]+)\}`)
 
+// Timeout bounds per spec: 1 ms to 300000 ms (300 s).
+const (
+	minTimeoutMs = 1
+	maxTimeoutMs = 300000
+)
+
 // fetchCacheKey is a private type for context key to avoid collisions.
 type fetchCacheKey struct{}
 
@@ -82,13 +88,23 @@ func (e *EndpointConfig) UnmarshalYAML(unmarshal func(interface{}) error) error 
 // ProviderConfig describes a single upstream service. When Optional is true,
 // a fetch failure stores null instead of stopping the request — this supports
 // graceful degradation for non-critical services.
+//
+// Base URL can be set either via host+path (spec style) or base_url (legacy).
+// When Host is set, resolved base = Host + Path; otherwise base = BaseURL with optional Path.
+// After validation, BaseURL is normalized to the resolved base for internal use.
 type ProviderConfig struct {
-	BaseURL              string                      `yaml:"base_url"`
-	Timeout              time.Duration               `yaml:"timeout"` // Provider-level default
-	Endpoints            map[string]EndpointConfig   `yaml:"endpoints"` // name -> endpoint config
-	Optional             bool                        `yaml:"optional"`
-	MaxIdleConnsPerHost  int                         `yaml:"max_idle_conns_per_host"` // Optional, overrides env default
-	MaxConnsPerHost      int                         `yaml:"max_conns_per_host"`     // Optional, overrides env default
+	Host                 string                    `yaml:"host"`                   // Origin e.g. https://api.example.com (alternative to base_url)
+	Path                 string                    `yaml:"path"`                   // Base path prefix e.g. /v1
+	BaseURL              string                    `yaml:"base_url"`                // Full base URL (legacy; use host+path or this)
+	Headers              map[string]string         `yaml:"headers"`                 // Default headers added to every request
+	Query                map[string]string         `yaml:"query"`                   // Default query parameters added to every request
+	Timeout              time.Duration            `yaml:"timeout"`                  // Provider-level default (1–300000 ms when set)
+	ConnectionTimeout    time.Duration            `yaml:"connection_timeout"`       // Dial/connection timeout (1–300000 ms when set)
+	RedirectionsMax      int                       `yaml:"redirections_max"`         // Max redirects; 0 = default client behaviour
+	Endpoints            map[string]EndpointConfig `yaml:"endpoints"`               // name -> endpoint config
+	Optional             bool                      `yaml:"optional"`
+	MaxIdleConnsPerHost  int                       `yaml:"max_idle_conns_per_host"` // Optional, overrides env default
+	MaxConnsPerHost      int                       `yaml:"max_conns_per_host"`      // Optional, overrides env default
 }
 
 // Aggregator holds provider configs and per-provider HTTP clients. It is safe for
@@ -108,23 +124,56 @@ type Aggregator struct {
 }
 
 // ValidateProviderConfig validates a provider configuration and returns an error if invalid.
-// It checks that base_url is a valid URL, timeouts are non-negative, and at least one
-// endpoint is defined with a non-empty path.
+// Requires either host or base_url; timeouts (when set) must be in 1–300000 ms;
+// at least one endpoint with non-empty path.
 func ValidateProviderConfig(name string, cfg ProviderConfig) error {
-	if cfg.BaseURL == "" {
-		return fmt.Errorf("provider %q: base_url is required", name)
+	hasHost := strings.TrimSpace(cfg.Host) != ""
+	hasBaseURL := strings.TrimSpace(cfg.BaseURL) != ""
+
+	if !hasHost && !hasBaseURL {
+		return fmt.Errorf("provider %q: either host or base_url is required", name)
 	}
 
-	parsedURL, err := url.Parse(cfg.BaseURL)
-	if err != nil {
-		return fmt.Errorf("provider %q: invalid base_url %q: %w", name, cfg.BaseURL, err)
+	if hasHost {
+		parsed, err := url.Parse(cfg.Host)
+		if err != nil {
+			return fmt.Errorf("provider %q: invalid host %q: %w", name, cfg.Host, err)
+		}
+		if parsed.Scheme == "" || parsed.Host == "" {
+			return fmt.Errorf("provider %q: host %q must include scheme and host", name, cfg.Host)
+		}
 	}
-	if parsedURL.Scheme == "" || parsedURL.Host == "" {
-		return fmt.Errorf("provider %q: base_url %q must include scheme and host", name, cfg.BaseURL)
+
+	if hasBaseURL {
+		parsedURL, err := url.Parse(cfg.BaseURL)
+		if err != nil {
+			return fmt.Errorf("provider %q: invalid base_url %q: %w", name, cfg.BaseURL, err)
+		}
+		if parsedURL.Scheme == "" || parsedURL.Host == "" {
+			return fmt.Errorf("provider %q: base_url %q must include scheme and host", name, cfg.BaseURL)
+		}
 	}
 
 	if cfg.Timeout < 0 {
 		return fmt.Errorf("provider %q: timeout cannot be negative (got %v)", name, cfg.Timeout)
+	}
+	if cfg.Timeout > 0 {
+		if ms := cfg.Timeout.Milliseconds(); ms < minTimeoutMs || ms > maxTimeoutMs {
+			return fmt.Errorf("provider %q: timeout must be between %d and %d ms (got %d ms)", name, minTimeoutMs, maxTimeoutMs, ms)
+		}
+	}
+
+	if cfg.ConnectionTimeout < 0 {
+		return fmt.Errorf("provider %q: connection_timeout cannot be negative (got %v)", name, cfg.ConnectionTimeout)
+	}
+	if cfg.ConnectionTimeout > 0 {
+		if ms := cfg.ConnectionTimeout.Milliseconds(); ms < minTimeoutMs || ms > maxTimeoutMs {
+			return fmt.Errorf("provider %q: connection_timeout must be between %d and %d ms (got %d ms)", name, minTimeoutMs, maxTimeoutMs, ms)
+		}
+	}
+
+	if cfg.RedirectionsMax < 0 {
+		return fmt.Errorf("provider %q: redirections_max cannot be negative (got %d)", name, cfg.RedirectionsMax)
 	}
 
 	if len(cfg.Endpoints) == 0 {
@@ -137,6 +186,11 @@ func ValidateProviderConfig(name string, cfg ProviderConfig) error {
 		}
 		if endpointCfg.Timeout < 0 {
 			return fmt.Errorf("provider %q: endpoint %q timeout cannot be negative (got %v)", name, endpointName, endpointCfg.Timeout)
+		}
+		if endpointCfg.Timeout > 0 {
+			if ms := endpointCfg.Timeout.Milliseconds(); ms < minTimeoutMs || ms > maxTimeoutMs {
+				return fmt.Errorf("provider %q: endpoint %q timeout must be between %d and %d ms (got %d ms)", name, endpointName, minTimeoutMs, maxTimeoutMs, ms)
+			}
 		}
 	}
 
@@ -165,8 +219,19 @@ func NewWithObservability(providers map[string]ProviderConfig, createClient func
 			panic(fmt.Sprintf("invalid provider config for %q: %v", name, err))
 		}
 
-		// Normalize: strip trailing slash so endpoint paths join cleanly.
-		prov.BaseURL = strings.TrimRight(prov.BaseURL, "/")
+		// Resolve base URL: host+path or base_url (+ optional path).
+		if strings.TrimSpace(prov.Host) != "" {
+			base := strings.TrimRight(prov.Host, "/")
+			if p := strings.Trim(prov.Path, "/"); p != "" {
+				base = base + "/" + p
+			}
+			prov.BaseURL = base
+		} else {
+			prov.BaseURL = strings.TrimRight(prov.BaseURL, "/")
+			if p := strings.Trim(prov.Path, "/"); p != "" {
+				prov.BaseURL = prov.BaseURL + "/" + p
+			}
+		}
 		// Apply default timeout once.
 		if prov.Timeout == 0 {
 			prov.Timeout = 10 * time.Second
@@ -425,6 +490,21 @@ func (a *Aggregator) resolveURL(dep runtime.ProviderDep, params map[string]strin
 	if err != nil {
 		return "", 0, EndpointConfig{}, prov.Optional, err
 	}
+
+	// Append default query params when configured.
+	if len(prov.Query) > 0 {
+		parsed, err := url.Parse(resolvedPath)
+		if err != nil {
+			return "", 0, EndpointConfig{}, prov.Optional, fmt.Errorf("invalid resolved URL: %w", err)
+		}
+		q := parsed.Query()
+		for k, v := range prov.Query {
+			q.Set(k, v)
+		}
+		parsed.RawQuery = q.Encode()
+		resolvedPath = parsed.String()
+	}
+
 	return resolvedPath, timeout, endpointCfg, prov.Optional, nil
 }
 
@@ -525,6 +605,12 @@ func (a *Aggregator) doRequest(ctx context.Context, dep runtime.ProviderDep, url
 		return nil, 0, fmt.Errorf("failed to create request: %s", sanitizedErr)
 	}
 
+	// Provider default headers first, then request-level headers (so dep overrides).
+	if prov, ok := a.providers[dep.Provider]; ok && len(prov.Headers) > 0 {
+		for k, v := range prov.Headers {
+			req.Header.Set(k, v)
+		}
+	}
 	for k, v := range dep.Headers {
 		req.Header.Set(k, v)
 	}
