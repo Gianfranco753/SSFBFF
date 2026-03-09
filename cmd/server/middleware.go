@@ -217,9 +217,10 @@ func shutdownAsyncLogging(timeout time.Duration) bool {
 	}
 }
 
-// otelWithTraceIDMiddleware combines OpenTelemetry instrumentation with trace ID extraction.
-// This reduces middleware overhead by combining two related operations into one.
-// When OTel is disabled or no OTLP endpoint is configured, returns a no-op middleware so route matching is not affected.
+// otelWithTraceIDMiddleware returns the OpenTelemetry instrumentation handler.
+// When OTel is disabled or no OTLP endpoint is configured, returns a no-op so route matching is not affected.
+// Must be followed by traceIDExtractorMiddleware() when trace ID as request ID is desired; that middleware
+// calls Next() once, avoiding double Next() which caused 404 when the OTLP endpoint was set.
 func otelWithTraceIDMiddleware() fiber.Handler {
 	// If OTel is completely disabled, return no-op
 	if getCachedOtelSDKDisabled() || getCachedOtelTracesExporter() == "none" {
@@ -227,8 +228,8 @@ func otelWithTraceIDMiddleware() fiber.Handler {
 			return c.Next()
 		}
 	}
-	// When no OTLP endpoint is configured, tracing init already uses a noop; use no-op middleware too
-	// so the contrib otel middleware does not run (it can break route matching when no exporter is configured).
+	// When no OTLP endpoint is configured, use no-op middleware so the contrib otel middleware
+	// does not run (it can break route matching when no exporter is configured).
 	otelEndpoint := getCachedOtelExporterOTLPTracesEndpoint()
 	if otelEndpoint == "" {
 		otelEndpoint = getCachedOtelExporterOTLPEndpoint()
@@ -239,35 +240,35 @@ func otelWithTraceIDMiddleware() fiber.Handler {
 		}
 	}
 
-	useTraceIDAsRequestID := getCachedUseTraceIDAsRequestID()
-	tracingDisabled := getCachedOtelDisableTracing()
-
-	// Create OTel middleware
-	otelMiddleware := otelfiber.Middleware(
+	return otelfiber.Middleware(
 		otelfiber.WithPropagators(downstreamPropagator()),
 	)
+}
 
-	// If trace ID as request ID is disabled or tracing is disabled, just use OTel middleware
-	if !useTraceIDAsRequestID || tracingDisabled {
-		return otelMiddleware
+// traceIDExtractorMiddleware sets X-Request-ID from the current span when OTel is active and
+// useTraceIDAsRequestID is true, then calls Next() once. No-op otherwise.
+func traceIDExtractorMiddleware() fiber.Handler {
+	if getCachedOtelSDKDisabled() || getCachedOtelTracesExporter() == "none" {
+		return func(c fiber.Ctx) error { return c.Next() }
+	}
+	otelEndpoint := getCachedOtelExporterOTLPTracesEndpoint()
+	if otelEndpoint == "" {
+		otelEndpoint = getCachedOtelExporterOTLPEndpoint()
+	}
+	if strings.TrimSpace(otelEndpoint) == "" {
+		return func(c fiber.Ctx) error { return c.Next() }
+	}
+	if !getCachedUseTraceIDAsRequestID() || getCachedOtelDisableTracing() {
+		return func(c fiber.Ctx) error { return c.Next() }
 	}
 
-	// Combined middleware: OTel instrumentation + trace ID extraction
 	return func(c fiber.Ctx) error {
-		// Run OTel middleware first (creates span and extracts trace context)
-		if err := otelMiddleware(c); err != nil {
-			return err
-		}
-
-		// Extract trace ID and set as X-Request-ID if not already set
 		if requestID := c.Get("X-Request-ID"); requestID == "" {
 			span := trace.SpanFromContext(c.Context())
 			if span.SpanContext().IsValid() {
-				traceID := span.SpanContext().TraceID().String()
-				c.Set("X-Request-ID", traceID)
+				c.Set("X-Request-ID", span.SpanContext().TraceID().String())
 			}
 		}
-
 		return c.Next()
 	}
 }

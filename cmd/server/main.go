@@ -364,13 +364,12 @@ func main() {
 	// Panic recovery so recovered handlers still decrement in-flight when they return.
 	app.Use(panicRecoveryMiddleware(logger))
 
-	// Combined OpenTelemetry instrumentation and trace ID extraction.
-	// This middleware creates server spans, extracts W3C TraceContext/Baggage,
-	// and sets X-Request-ID header from the trace ID.
+	// OpenTelemetry instrumentation (server spans, W3C TraceContext/Baggage).
 	// When OTEL_SDK_DISABLED=true or OTEL_TRACES_EXPORTER=none, this is a no-op.
-	// When OTEL_DISABLE_TRACING=true, spans are still created but can be enabled
-	// per-request via x-enable-trace header (requires custom sampler implementation).
 	app.Use(otelWithTraceIDMiddleware())
+	// Trace ID as X-Request-ID; must run after OTel so span exists. Separate middleware
+	// so Next() is only called once (wrapping OTel and calling Next() again caused 404).
+	app.Use(traceIDExtractorMiddleware())
 
 	// Add error handler middleware
 	app.Use(errorHandlerMiddleware(logger))
